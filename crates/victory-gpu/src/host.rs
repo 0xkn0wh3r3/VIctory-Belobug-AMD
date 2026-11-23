@@ -294,6 +294,10 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    /// Memory handed out for the list's recording, kept until it is dropped
+    /// when the title reset the list while a submission of it was still to
+    /// run.
+    kept_uploads: Mutex<Vec<Vec<u8>>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
@@ -312,6 +316,14 @@ pub(crate) struct HostList {
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
+
+// SAFETY: D3D12 lists and allocators may be used from any thread, one at
+// a time: the title records a list on one thread at a time, and a
+// submission runs it after its recording ended (a reset while one is to
+// run moves recording to a new list). The rest is locked.
+unsafe impl Send for HostList {}
+// SAFETY: as above.
+unsafe impl Sync for HostList {}
 
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -477,6 +489,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
+                kept_uploads: Mutex::default(),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
@@ -855,6 +868,15 @@ impl HostList {
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
         times.truncate(n);
         times
+    }
+
+    /// Keeps `blocks` (memory handed out for the recording) until the list
+    /// is dropped.
+    pub(crate) fn keep_uploads(&self, blocks: Vec<Vec<u8>>) {
+        self.kept_uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(blocks);
     }
 
     pub(crate) fn close(&self) {
