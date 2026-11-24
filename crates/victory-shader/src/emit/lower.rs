@@ -1341,20 +1341,15 @@ impl<'a> Lower<'a> {
                 if index >= 2 {
                     return Val::Missing("barycentrics of a third interpolation mode");
                 }
-                let row = self
-                    .s
-                    .inputs
-                    .iter()
-                    .filter_map(|e| e.row.map(|r| r + 1))
-                    .max()
-                    .unwrap_or(0);
+                // A system value the validator wants unpacked (packing
+                // location -1), like other non-packed system values.
                 self.s.inputs.push(SigElement {
                     name: "SV_Barycentrics".into(),
                     index,
                     kind: 28,
                     comp: 9,
                     interp: mode,
-                    row: Some(row),
+                    row: None,
                     col: 0,
                     cols: 3,
                     usage: 0,
@@ -1364,9 +1359,10 @@ impl<'a> Lower<'a> {
             }
         };
         let e = &mut self.s.inputs[id];
-        if e.col != 0 || e.cols < 3 || e.row.is_none() {
+        if e.col != 0 || e.cols < 3 {
             return Val::Missing("a console barycentrics element without i and j");
         }
+        e.row = None;
         e.interp = mode;
         self.s.flags |= flags::BARYCENTRICS;
         self.load_any_input(id, index + 1)
