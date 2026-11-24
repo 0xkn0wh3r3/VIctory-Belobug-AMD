@@ -22,14 +22,59 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Incremented whenever any guarded block is opened (VEH guard fault or
-/// `writing`) or remapped/rewritten (`title_memory_remapped` /
-/// `title_memory_written`). While this stays unchanged, any range already
-/// guarded and copied at this epoch cannot have been modified by the title.
-static GUARD_EPOCH: AtomicU64 = AtomicU64::new(1);
+/// Per-64-MiB-region epoch table. Incremented for only the region(s) touched
+/// whenever a guarded block is opened (VEH guard fault or `writing`),
+/// remapped (`title_memory_remapped`), or rewritten (`title_memory_written`).
+/// While a span's region epoch stays unchanged, any range already guarded and
+/// copied at that epoch cannot have been modified by the title — and
+/// `copy_back` on one buffer no longer invalidates clean spans in other regions.
+const REGION_SHIFT: usize = 26; // 64 MiB per bucket
+const REGION_BUCKETS: usize = 1024;
+static REGION_EPOCHS: [AtomicU64; REGION_BUCKETS] =
+    [const { AtomicU64::new(1) }; REGION_BUCKETS];
 
-pub(crate) fn guard_epoch() -> u64 {
-    GUARD_EPOCH.load(Ordering::Acquire)
+#[inline]
+fn bump_region_epochs(start: usize, end: usize) {
+    if start >= end {
+        return;
+    }
+    let first = start >> REGION_SHIFT;
+    let last = (end - 1) >> REGION_SHIFT;
+    let count = last - first + 1;
+    if count >= REGION_BUCKETS {
+        for slot in &REGION_EPOCHS {
+            slot.fetch_add(1, Ordering::Release);
+        }
+    } else {
+        for r in first..=last {
+            REGION_EPOCHS[r & (REGION_BUCKETS - 1)].fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
+#[inline]
+pub(crate) fn region_epoch(start: usize, end: usize) -> u64 {
+    if start >= end {
+        return 0;
+    }
+    let first = start >> REGION_SHIFT;
+    let last = (end - 1) >> REGION_SHIFT;
+    let count = last - first + 1;
+    let mut hash = 0u64;
+    if count >= REGION_BUCKETS {
+        for slot in &REGION_EPOCHS {
+            hash = hash
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .wrapping_add(slot.load(Ordering::Acquire));
+        }
+    } else {
+        for r in first..=last {
+            hash = hash
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .wrapping_add(REGION_EPOCHS[r & (REGION_BUCKETS - 1)].load(Ordering::Acquire));
+        }
+    }
+    hash
 }
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
@@ -168,9 +213,35 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
-    // Fast path: `start` is itself a mapped view. If `start` is an unmapped
-    // hole (common in 2 GiB sparse shadows), jump past leading holes via
-    // `VirtualQuery` to find the first committed page in `[start, end)`.
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    // Fast path: if we already guard or recorded a hole at `first`, we already
+    // know this is a mapped view and can skip `QueryVirtualMemoryInformation`.
+    {
+        let mut g = guards();
+        if g.protected.contains(&first) || g.holes.contains(&first) {
+            let mut written = Vec::new();
+            let mut run: Option<usize> = None;
+            for block in first..=last {
+                let open = block < last && !g.clean.contains(&block) && !g.holes.contains(&block);
+                if open {
+                    if g.protected.contains(&block) {
+                        g.clean.insert(block);
+                        written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                    } else {
+                        run.get_or_insert(block);
+                        continue;
+                    }
+                }
+                if let Some(from) = run.take() {
+                    protect(&mut g, from, block, &mut written);
+                }
+            }
+            return Some(written);
+        }
+    }
+    // Slow path (first encounter): `start` is itself a mapped view, or if
+    // `start` is an unmapped hole (common in 2 GiB sparse shadows), jump past
+    // leading holes via `VirtualQuery` to find the first committed page.
     let probe = if mapped(start) {
         start
     } else {
@@ -181,7 +252,6 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut g = guards();
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     for block in first..=last {
         let open = block < last
             && !g.clean.contains(&block)
@@ -329,7 +399,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
     }
     if !blocks.is_empty() {
-        GUARD_EPOCH.fetch_add(1, Ordering::Release);
+        bump_region_epochs(start, end);
     }
     !blocks.is_empty()
 }
@@ -371,7 +441,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             g.clean.remove(&block);
         }
         if changed {
-            GUARD_EPOCH.fetch_add(1, Ordering::Release);
+            bump_region_epochs(at, end);
         }
     }
     crate::shadow::remapped(at as u64, end as u64);
@@ -391,7 +461,7 @@ pub fn title_memory_committed(at: usize, len: usize) {
 /// next use, not when their turn to be looked at comes.
 pub fn title_memory_written(at: usize, len: usize) {
     if len != 0 {
-        GUARD_EPOCH.fetch_add(1, Ordering::Release);
+        bump_region_epochs(at, at.saturating_add(len));
         crate::resource::textures_rewritten(at as u64, (at + len) as u64);
     }
 }

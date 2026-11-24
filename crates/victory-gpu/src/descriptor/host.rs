@@ -158,8 +158,12 @@ struct Bindless {
     uses: BTreeMap<u32, SlotUse>,
     /// Of them, those with work at each submission.
     busy: BTreeSet<u32>,
-    /// The released-view and placed-texture epochs `uses` was checked at.
-    checked: (u64, u64),
+    /// Subset of `uses` currently marked unmapped (checked on memory remap).
+    unmapped_slots: std::collections::HashSet<u32>,
+    /// Subset of `uses` holding a direct-memory window (checked for `is_dead`).
+    direct_slots: std::collections::HashSet<u32>,
+    /// The released-view, placed-texture, and memory-remap epochs `uses` was checked at.
+    checked: (u64, u64, u64),
     /// What submissions do for the slots, until they or what they view change.
     plan: Option<Arc<BindlessPlan>>,
     /// Placed-texture slots as last prepared at recording: view key,
@@ -197,7 +201,7 @@ struct Bindless {
 /// seconds.
 const SLOT_BUDGET_US: u64 = 20_000;
 /// Slots taken to make at once (the rest wait without being looked at).
-const SLOT_CHUNK: usize = 256;
+const SLOT_CHUNK: usize = 512;
 
 impl Bindless {
     /// The slot-making budget, refilled for the time passed since.
@@ -250,14 +254,17 @@ struct SlotUse {
 /// shows its new contents up to this many frames late through bindless
 /// access (tables still upload what their draws read). Hashing all of them
 /// at each submission cost seconds per frame while the world streams in.
-const RECHECK_FRAMES: u64 = 30;
+const RECHECK_FRAMES: u64 = 15;
 /// ... and at most this many of them per frame.
-const RECHECKS: u32 = 16;
+const RECHECKS: u32 = 32;
 
-/// Bumped when views go stale or title memory is mapped or unmapped: what
-/// bindless slots view may have changed though no slot was written (their
-/// views' generations are checked, all at once, at the next submission).
+/// Bumped when views go stale (a resource was released): their views'
+/// generations are checked, all at once, at the next submission.
 static VIEWED: AtomicU64 = AtomicU64::new(0);
+
+/// Bumped when title memory is mapped or unmapped: only unmapped and direct
+/// bindless slots need checking (no full `stale_views` scan over all slots).
+static MEMORY_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Title memory mapped or unmapped lately (start, end), and how many were.
 static MAPPED: Mutex<(VecDeque<(u64, u64)>, u64)> = Mutex::new((VecDeque::new(), 0));
@@ -274,7 +281,7 @@ pub(crate) fn bindless_memory_changed(start: u64, end: u64) {
         m.0.push_back((start, end));
         m.1 += 1;
     }
-    bindless_viewed_changed();
+    MEMORY_EPOCH.fetch_add(1, Ordering::Release);
 }
 
 /// The ranges mapped or unmapped since the first `seen`, sorted and merged
@@ -1023,6 +1030,8 @@ impl HostHeap {
     fn drop_bindless(&self, b: &mut Bindless, index: u32, entry: Option<(u32, u32)>) {
         b.uses.remove(&index);
         b.busy.remove(&index);
+        b.unmapped_slots.remove(&index);
+        b.direct_slots.remove(&index);
         b.recorded.remove(&index);
         if entry.is_none_or(|e| b.slots.get(&index) == Some(&e)) {
             b.slots.remove(&index);
@@ -1467,6 +1476,7 @@ impl HostHeap {
         let epochs = (
             VIEWED.load(Ordering::Acquire),
             crate::resource::placed_epoch(),
+            MEMORY_EPOCH.load(Ordering::Acquire),
         );
         // Asked before taking the heap's lock: the placed textures' lock is
         // taken first where both are held.
@@ -1479,7 +1489,7 @@ impl HostHeap {
         let (mut todo, check, remade) = {
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
             let b = &mut *b;
-            // Released views and evicted textures are looked for once a frame.
+            // Released views, evicted textures, and remapped memory are looked for once a frame.
             let look = b.looked[0] != frame && b.checked != epochs;
             let remake = b.full.1 && b.full.0 != frame;
             if b.dirty.is_empty()
@@ -1497,12 +1507,13 @@ impl HostHeap {
                 return Some(plan.clone());
             }
             let viewed = look && b.checked.0 != epochs.0;
+            let mem_changed = look && b.checked.2 != epochs.2;
             let live = if look { live.as_ref() } else { None };
             if look {
                 b.checked = epochs;
                 b.looked[0] = frame;
             }
-            let mapped = if viewed {
+            let mapped = if mem_changed || viewed {
                 let (ranges, seen) = mapped_since(b.mapped_seen);
                 b.mapped_seen = seen;
                 ranges
@@ -1516,24 +1527,32 @@ impl HostHeap {
             {
                 dirty.insert(i);
             }
-            let all = live.is_some() || viewed;
-            for (&i, u) in b.uses.iter().filter(|_| all) {
-                let evicted = live
-                    .zip(u.placed)
-                    .is_some_and(|(l, t)| !l.contains(&t));
-                let gone = viewed && u.direct.as_ref().is_some_and(|s| s.is_dead());
-                if gone {
-                    remade.push(i);
+            if let Some(l) = live {
+                for (&i, u) in &b.uses {
+                    if u.placed.is_some_and(|t| !l.contains(&t)) {
+                        dirty.insert(i);
+                    }
                 }
-                if evicted
-                    || gone
-                    || viewed
-                        && u.unmapped
+            }
+            if viewed || mem_changed {
+                for &i in &b.direct_slots {
+                    if b.uses
+                        .get(&i)
+                        .and_then(|u| u.direct.as_ref())
+                        .is_some_and(|s| s.is_dead())
+                    {
+                        remade.push(i);
+                        dirty.insert(i);
+                    }
+                }
+                for &i in &b.unmapped_slots {
+                    if let Some(u) = b.uses.get(&i)
                         && (cfg!(test)
                             || (i + frame as u32).is_multiple_of(64)
                             || mapped.as_ref().is_none_or(|m| meets(m, u.at)))
-                {
-                    dirty.insert(i);
+                    {
+                        dirty.insert(i);
+                    }
                 }
             }
             let check: Vec<(u32, (u32, u32))> = if viewed {
@@ -1562,24 +1581,31 @@ impl HostHeap {
         let mut made_any = false;
         let mut fresh = Vec::new();
         let mut fresh_reads = Vec::new();
+        let mut results: Vec<(u32, Option<((u32, u32), Option<SlotUse>)>)> =
+            Vec::with_capacity(todo.len());
+        let mut over: Option<u32> = None;
         let mut todo = todo.into_iter();
+        let mut count = 0usize;
         for (index, entry) in todo.by_ref() {
-            if started.elapsed().as_micros() as u64 > left {
+            if (count & 15) == 0 && started.elapsed().as_micros() as u64 > left {
                 // Over budget: the rest waits for the next submission.
-                self.bindless
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .dirty
-                    .insert(index);
+                over = Some(index);
                 break;
             }
+            count += 1;
             made_any = true;
             let made = entry.map(|e| (e, self.use_slot(index, e)));
-            let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+            results.push((index, made));
+        }
+        self.budget_spend(0, started.elapsed().as_micros() as u64);
+        let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+        for (index, made) in results {
             match made {
                 None => {
                     b.uses.remove(&index);
                     b.busy.remove(&index);
+                    b.unmapped_slots.remove(&index);
+                    b.direct_slots.remove(&index);
                 }
                 Some((_, Some(u))) => {
                     fresh.extend(u.bounce);
@@ -1594,13 +1620,24 @@ impl HostHeap {
                     } else {
                         b.busy.remove(&index);
                     }
+                    if u.unmapped {
+                        b.unmapped_slots.insert(index);
+                    } else {
+                        b.unmapped_slots.remove(&index);
+                    }
+                    if u.direct.is_some() {
+                        b.direct_slots.insert(index);
+                    } else {
+                        b.direct_slots.remove(&index);
+                    }
                     b.uses.insert(index, u);
                 }
                 Some((e, None)) => self.drop_bindless(&mut b, index, Some(e)),
             }
         }
-        self.budget_spend(0, started.elapsed().as_micros() as u64);
-        let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = over {
+            b.dirty.insert(index);
+        }
         b.dirty.extend(todo.map(|(i, _)| i));
         BACKLOG[0].store(b.dirty.len() as u64, Ordering::Relaxed);
         BACKLOG[1].store(b.record_pending.len() as u64, Ordering::Relaxed);

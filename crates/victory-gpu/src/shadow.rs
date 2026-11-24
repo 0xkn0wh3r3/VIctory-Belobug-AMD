@@ -48,9 +48,9 @@ pub(crate) struct Shadow {
     direct: Option<Direct>,
     /// Ranges that cannot be watched, with the frame they were copied in.
     unwatched: Mutex<std::collections::HashMap<(usize, usize), u64>>,
-    /// Ranges already guarded and copied at `guard_epoch` (O(1) fast path when
-    /// zero guard faults/remaps occurred since).
-    clean_spans: Mutex<(u64, std::collections::HashSet<(usize, usize)>)>,
+    /// Ranges already guarded and copied at `region_epoch(from, to)` (O(1) fast
+    /// path when no guard fault/remap/rewrite occurred in those 64 MiB regions).
+    clean_spans: Mutex<std::collections::HashMap<(usize, usize), u64>>,
     /// The buffer has memory only where it was brought up to date.
     sparse: Option<Sparse>,
 }
@@ -379,7 +379,7 @@ impl Shadow {
             // submission, title memory read only where the GPU wrote.
             // An unchanged page is never modified by copy-back, so later
             // overlapping ranges can skip it for the rest of the submission.
-            let mut title = None;
+            let mut title: Option<Vec<u8>> = None;
             let mut synced = Vec::new();
             let mut at = from;
             while at < to {
@@ -388,39 +388,53 @@ impl Shadow {
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
-                if unchanged.differs(start + at, host, old)
-                    && let title = &mut title.get_or_insert_with(|| vec![0u8; PAGE])[..n]
-                    && crate::host::read_into((start + at) as *const u8, title)
-                {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    if let Some((dirty_start, dirty_end)) = merge_gpu_writes(title, host, old) {
-                        let dirty_len = dirty_end - dirty_start;
-                        crate::watch::writing(start + at + dirty_start, dirty_len);
-                        crate::host::write_mapped(
-                            (start + at + dirty_start) as *mut u8,
-                            title[dirty_start..].as_ptr(),
-                            dirty_len,
-                        );
-                        written += dirty_len;
+                if unchanged.differs(start + at, host, old) {
+                    let buf = title.get_or_insert_with(|| {
+                        let mut v = pooled(PAGE);
+                        v.resize(PAGE, 0);
+                        v
+                    });
+                    let title_slice = &mut buf[..n];
+                    if crate::host::read_into((start + at) as *const u8, title_slice) {
+                        // Title memory with the GPU's bytes put in; the copy
+                        // takes the title's bytes in turn.
+                        if let Some((dirty_start, dirty_end)) =
+                            merge_gpu_writes(title_slice, host, old)
+                        {
+                            let dirty_len = dirty_end - dirty_start;
+                            crate::watch::writing(start + at + dirty_start, dirty_len);
+                            crate::host::write_mapped(
+                                (start + at + dirty_start) as *mut u8,
+                                title_slice[dirty_start..].as_ptr(),
+                                dirty_len,
+                            );
+                            written += dirty_len;
+                        }
+                        synced.push((start + at) / PAGE);
                     }
-                    synced.push((start + at) / PAGE);
                 }
                 at += n;
+            }
+            if let Some(buf) = title {
+                give_back(buf);
             }
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-            if first < last
-                && !synced.is_empty()
-                && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-                && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
-            {
-                let base = start / PAGE;
-                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
-                    copied[page - base] = now;
+            let mode = self.watched.load(Ordering::Relaxed);
+            if first < last && !synced.is_empty() && mode != NOT_WATCHED {
+                let res = if mode == WATCHED_GUARDED {
+                    crate::watch::writes_guarded(first * PAGE, last * PAGE)
+                } else {
+                    crate::watch::writes(first * PAGE, last * PAGE, true)
+                };
+                if let Some((now, _)) = res {
+                    let base = start / PAGE;
+                    let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
+                        copied[page - base] = now;
+                    }
                 }
             }
         }
@@ -491,10 +505,10 @@ impl Shadow {
     fn update_free(&self, from: usize, to: usize, lazy: bool) -> usize {
         let mode = self.watched.load(Ordering::Relaxed);
         if mode == WATCHED_GUARDED {
-            let ge = crate::watch::guard_epoch();
+            let ge = crate::watch::region_epoch(from, to);
             {
                 let spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
-                if spans.0 == ge && spans.1.contains(&(from, to)) {
+                if spans.get(&(from, to)) == Some(&ge) {
                     #[cfg(feature = "diagnostics")]
                     {
                         use crate::copystat::{C, add};
@@ -506,15 +520,12 @@ impl Shadow {
             }
             if let Some((now, written)) = crate::watch::writes_guarded(from, to) {
                 let copied = self.copy_stale(from, to, now, &written);
-                if crate::watch::guard_epoch() == ge {
+                if crate::watch::region_epoch(from, to) == ge {
                     let mut spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
-                    if spans.0 != ge {
-                        spans.0 = ge;
-                        spans.1.clear();
+                    if spans.len() >= 8192 {
+                        spans.clear();
                     }
-                    if spans.1.len() < 4096 {
-                        spans.1.insert((from, to));
-                    }
+                    spans.insert((from, to), ge);
                 }
                 #[cfg(feature = "diagnostics")]
                 {
@@ -538,19 +549,16 @@ impl Shadow {
                 }
                 return copied;
             }
-            let ge = crate::watch::guard_epoch();
+            let ge = crate::watch::region_epoch(from, to);
             if let Some((now, written)) = crate::watch::writes_guarded(from, to) {
                 self.watched.store(WATCHED_GUARDED, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
-                if crate::watch::guard_epoch() == ge {
+                if crate::watch::region_epoch(from, to) == ge {
                     let mut spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
-                    if spans.0 != ge {
-                        spans.0 = ge;
-                        spans.1.clear();
+                    if spans.len() >= 8192 {
+                        spans.clear();
                     }
-                    if spans.1.len() < 4096 {
-                        spans.1.insert((from, to));
-                    }
+                    spans.insert((from, to), ge);
                 }
                 #[cfg(feature = "diagnostics")]
                 {
@@ -1653,7 +1661,7 @@ impl Shadow {
         let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
         let start = self.start as usize;
         let mut written = 0;
-        let mut title = vec![0u8; PAGE];
+        let mut title: Option<Vec<u8>> = None;
         self.each_tile(s, address, address + len, |at, data, n| {
             let Some(old) = before.get_mut(&(((at - start) / PAGE) as u32)) else {
                 return;
@@ -1661,22 +1669,33 @@ impl Shadow {
             let old = &mut old[at % PAGE..at % PAGE + n];
             // SAFETY: the tile's mapping; only this thread writes it.
             let host = unsafe { std::slice::from_raw_parts_mut(data, n) };
-            if host == old || !crate::host::read_into(at as *const u8, &mut title[..n]) {
+            if host == old {
+                return;
+            }
+            let buf = title.get_or_insert_with(|| {
+                let mut v = pooled(PAGE);
+                v.resize(PAGE, 0);
+                v
+            });
+            if !crate::host::read_into(at as *const u8, &mut buf[..n]) {
                 return;
             }
             if let Some((dirty_start, dirty_end)) =
-                merge_gpu_writes_mut(&mut title[..n], host, old)
+                merge_gpu_writes_mut(&mut buf[..n], host, old)
             {
                 let dirty_len = dirty_end - dirty_start;
                 crate::watch::writing(at + dirty_start, dirty_len);
                 crate::host::write_mapped(
                     (at + dirty_start) as *mut u8,
-                    title[dirty_start..].as_ptr(),
+                    buf[dirty_start..].as_ptr(),
                     dirty_len,
                 );
                 written += dirty_len;
             }
         });
+        if let Some(buf) = title {
+            give_back(buf);
+        }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
         if pending.is_empty() {

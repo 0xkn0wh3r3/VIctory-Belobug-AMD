@@ -35,6 +35,18 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
 
+/// An asynchronous submission still running on the GPU: its staging textures
+/// and bindless plans stay alive until `fence` completes.
+struct InFlight {
+    fence: u64,
+    submission: u64,
+    _early_copies: Vec<(
+        std::sync::Arc<crate::texture::Staging>,
+        std::sync::Arc<crate::resource::HostTexture>,
+    )>,
+    _plans: Vec<std::sync::Arc<crate::descriptor::host::BindlessPlan>>,
+}
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
@@ -44,6 +56,8 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    /// Async submissions not yet retired, oldest first.
+    in_flight: Mutex<std::collections::VecDeque<InFlight>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -363,6 +377,7 @@ impl Host {
                 queue,
                 fence,
                 submitted: Mutex::new(0),
+                in_flight: Mutex::new(std::collections::VecDeque::new()),
                 event,
                 rtvs,
                 rtv_size,
@@ -573,6 +588,8 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Host fence value signalled by the last submission that ran this list.
+    last_fence: std::sync::atomic::AtomicU64,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -594,6 +611,12 @@ const STAMPS: u32 = 4096;
 
 impl Drop for HostList {
     fn drop(&mut self) {
+        let fence = self.last_fence.load(Ordering::Acquire);
+        if fence != 0
+            && let Some(h) = host()
+        {
+            h.wait_fence(fence);
+        }
         crate::memstat::sub(&crate::memstat::LISTS, 1);
         self.release_kept();
     }
@@ -884,6 +907,7 @@ impl Host {
                 queries: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                last_fence: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -892,11 +916,104 @@ impl Host {
         }
     }
 
-    /// Runs closed lists and waits for them.
+    /// Drops completed async submissions and buries objects retired before them.
+    fn reap_completed(&self) {
+        // SAFETY: a plain fence query.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        let mut last_sub = 0u64;
+        {
+            let mut q = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            while let Some(front) = q.front() {
+                if front.fence <= completed {
+                    last_sub = last_sub.max(front.submission);
+                    q.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
+        if last_sub != 0 {
+            FINISHED.fetch_max(last_sub, Ordering::AcqRel);
+            bury(last_sub);
+        }
+    }
+
+    /// Waits until the host GPU fence reaches at least `target`.
+    pub(crate) fn wait_fence(&self, target: u64) {
+        if target == 0 {
+            return;
+        }
+        // SAFETY: a plain fence query.
+        if unsafe { self.fence.GetCompletedValue() } >= target {
+            self.reap_completed();
+            return;
+        }
+        let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the fence and event are ours; guarded by `submitted`.
+        unsafe {
+            if self.fence.GetCompletedValue() < target {
+                if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
+                    tracing::warn!(error = %e, "host fence wait failed");
+                } else {
+                    WaitForSingleObject(self.event, INFINITE);
+                }
+            }
+        }
+        self.reap_completed();
+    }
+
+    /// Waits for all in-flight asynchronous submissions to complete.
+    pub(crate) fn wait_in_flight(&self) {
+        let target = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .back()
+            .map(|f| f.fence)
+            .unwrap_or(0);
+        if target != 0 {
+            self.wait_fence(target);
+        }
+    }
+
+    /// Waits for any in-flight async submission while `self.submitted` is already held.
+    fn drain_in_flight_locked(&self) {
+        let target = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .back()
+            .map(|f| f.fence)
+            .unwrap_or(0);
+        if target == 0 {
+            return;
+        }
+        // SAFETY: the fence and event are ours; caller holds `submitted`.
+        unsafe {
+            if self.fence.GetCompletedValue() < target {
+                let waited = std::time::Instant::now();
+                if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
+                    tracing::warn!(error = %e, "host async drain failed");
+                } else {
+                    WaitForSingleObject(self.event, INFINITE);
+                }
+                SUBMISSION_US[1].fetch_add(waited.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+        }
+        self.reap_completed();
+    }
+
+    /// Runs closed lists; waits synchronously when CPU copy-back, readbacks, or
+    /// bottom-of-pipe writes require GPU completion, or returns asynchronously
+    /// so CPU recording overlaps GPU execution.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // Wait for any previous async submission before mutating shared Shadow
+        // buffers in `prepare`. During the gap between submissions, the GPU
+        // ran in parallel with the title's CPU command-list recording.
+        self.drain_in_flight_locked();
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -939,10 +1056,21 @@ impl Host {
         let each = timing();
         #[cfg(not(feature = "diagnostics"))]
         let each = false;
+        let can_async = !cfg!(test)
+            && !each
+            && std::env::var_os("VICTORY_SYNC_GPU").is_none()
+            && batch.bindless_writes.is_empty()
+            && runs.iter().all(|list| {
+                let d = list.deferred();
+                d.readbacks.is_empty()
+                    && d.writes[d.early..].is_empty()
+                    && !d.copies.iter().any(|s| matches!(s, Step::GpuWrite(..)))
+            });
         if let Some(first) = first {
             // SAFETY: a closed list.
             unsafe { self.queue.ExecuteCommandLists(&[Some(first)]) };
         }
+        let mut async_signalled = false;
         for (i, group) in groups.iter().enumerate() {
             // Diagnostics: everything but the GPU's work, to look at the
             // order of the title's submissions.
@@ -958,12 +1086,25 @@ impl Host {
                 continue;
             }
             *submitted += 1;
+            let fence_val = *submitted;
+            if can_async {
+                // SAFETY: the fence is ours.
+                if let Err(e) = unsafe { self.queue.Signal(&self.fence, fence_val) } {
+                    tracing::warn!(error = %e, "host async submission not signalled");
+                } else {
+                    for list in runs {
+                        list.last_fence.store(fence_val, Ordering::Release);
+                    }
+                    async_signalled = true;
+                }
+                continue;
+            }
             // SAFETY: the fence and event are ours.
             unsafe {
                 let waited = self
                     .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                    .Signal(&self.fence, fence_val)
+                    .and_then(|()| self.fence.SetEventOnCompletion(fence_val, self.event));
                 match waited {
                     Ok(()) => {
                         WaitForSingleObject(self.event, INFINITE);
@@ -984,8 +1125,24 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        if async_signalled {
+            SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+            for list in runs {
+                list.deferred().early = 0;
+            }
+            self.in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(InFlight {
+                    fence: *submitted,
+                    submission: this_submission,
+                    _early_copies: early.copies,
+                    _plans: batch.plans,
+                });
+            return;
+        }
         drop(early);
-        FINISHED.store(this_submission, Ordering::Release);
+        FINISHED.fetch_max(this_submission, Ordering::AcqRel);
         bury(this_submission);
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
@@ -1439,9 +1596,14 @@ impl HostList {
         drop(kept);
     }
 
-    /// Only after the list's last submission finished (every one is waited
-    /// for).
+    /// Only after the list's last submission finished.
     pub(crate) fn reset(&self) {
+        let fence = self.last_fence.load(Ordering::Acquire);
+        if fence != 0
+            && let Some(h) = host()
+        {
+            h.wait_fence(fence);
+        }
         self.release_kept();
         *self.deferred() = Deferred::default();
         *self.work.lock().unwrap_or_else(|e| e.into_inner()) = 0;
@@ -2777,6 +2939,7 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        self.wait_in_flight();
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -2866,6 +3029,7 @@ impl Host {
         over: (&ID3D12Resource, u32),
         frame: u64,
     ) -> Option<()> {
+        self.wait_in_flight();
         // SAFETY: live resources.
         let (a, b) = unsafe { (scene.map(|s| s.0.GetDesc()), over.0.GetDesc()) };
         // The scene's size; with a smaller one (or none) the screen's.
