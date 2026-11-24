@@ -223,6 +223,23 @@ pub(crate) fn save_read_back(
 static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// What the frame whose targets are dumped runs, as recorded: list, text.
+static PASSES: std::sync::Mutex<Vec<(usize, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Notes a draw or dispatch of `list`.
+pub(crate) fn pass(list: &crate::host::HostList, text: impl FnOnce() -> String) {
+    if dump_on()
+        && std::env::var_os("VICTORY_DUMP_RAW").is_some()
+        && listed(crate::queue::presented() + 1)
+    {
+        let text = text();
+        PASSES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((std::ptr::from_ref(list) as usize, text));
+    }
+}
+
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
@@ -315,6 +332,14 @@ pub(crate) fn note_target(resource: crate::object::This) {
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
+    let passes = std::mem::take(&mut *PASSES.lock().unwrap_or_else(|e| e.into_inner()));
+    if let Some(folder) = folder()
+        && !passes.is_empty()
+    {
+        let text: Vec<String> = passes.iter().map(|(l, t)| format!("{l:x} {t}")).collect();
+        let _ = std::fs::write(folder.join("passes.txt"), text.join("
+"));
+    }
     let Some(host) = crate::host::host() else {
         return;
     };

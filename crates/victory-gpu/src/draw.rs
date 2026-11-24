@@ -703,7 +703,9 @@ impl State {
             return;
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true, false));
+        #[cfg(feature = "diagnostics")]
+        crate::capture::pass(list, || self.op_text(format!("dispatch {x}x{y}x{z}"), true, true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         list.count_work();
@@ -715,7 +717,7 @@ impl State {
     /// (with the view at that heap index, if one is), the host addresses
     /// of its root views and the views its tables name.
     #[cfg(feature = "diagnostics")]
-    fn op_text(&self, kind: String, compute: bool) -> String {
+    fn op_text(&self, kind: String, compute: bool, full: bool) -> String {
         use std::fmt::Write;
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return kind;
@@ -723,7 +725,7 @@ impl State {
         let mut text = format!("{kind} {}", p.name);
         // What it reads takes far longer to write down than the draw.
         static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*FULL.get_or_init(|| std::env::var_os("VICTORY_OP_TEXT").is_some()) {
+        if !full && !*FULL.get_or_init(|| std::env::var_os("VICTORY_OP_TEXT").is_some()) {
             return text;
         }
         let views = (self.heaps[0] != 0)
@@ -731,7 +733,7 @@ impl State {
             .flatten();
         for stage in &p.stages {
             let t = stage.translated();
-            let _ = write!(text, " | {}:", stage.shader.hash);
+            let _ = write!(text, " | {} {}:", stage.shader.name(), stage.shader.hash);
             for u in &t.host.user_data {
                 let v = self.user_value(compute, u.slot, u.root, u.dword);
                 let _ = write!(text, " u{}={v:#x}", u.index);
@@ -749,6 +751,9 @@ impl State {
             }
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
+        if !compute {
+            let _ = write!(text, " targets {:#x?} depth {:#x}", self.targets, self.depth);
+        }
         text
     }
 
@@ -766,7 +771,9 @@ impl State {
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
-                    list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    list.note_op(|| self.op_text(format!("mesh {x}"), false, false));
+        #[cfg(feature = "diagnostics")]
+        crate::capture::pass(list, || self.op_text(format!("mesh {x}"), false, true));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     list.count_work();
@@ -1047,7 +1054,9 @@ impl State {
                 (vertices, first)
             };
             #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false, false));
+        #[cfg(feature = "diagnostics")]
+        crate::capture::pass(list, || self.op_text(format!("draw {count}x{instances}"), false, true));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1142,7 +1151,9 @@ impl State {
         let ran = !rects && self.prepare(list, true);
         if ran {
             #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false, false));
+        #[cfg(feature = "diagnostics")]
+        crate::capture::pass(list, || self.op_text(format!("indexed {indices}x{instances}"), false, true));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1369,6 +1380,15 @@ impl State {
             self.op_text(
                 format!("indirect kind {kind} max {max} at {arguments:#x}"),
                 kind == DISPATCH,
+                false,
+            )
+        });
+        #[cfg(feature = "diagnostics")]
+        crate::capture::pass(list, || {
+            self.op_text(
+                format!("indirect kind {kind} max {max} at {arguments:#x}"),
+                kind == DISPATCH,
+                true,
             )
         });
         let arg_buffer = rect_args.as_ref().unwrap_or(&bounded);

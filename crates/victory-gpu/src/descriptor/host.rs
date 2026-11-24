@@ -2118,6 +2118,13 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     if view == 0 {
         return !typeless;
     }
+    // A 32-bit texture shaders write, read as shared-exponent colors.
+    if view == crate::resource::SHARED_EXPONENT
+        && family(own) == 39
+        && d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
+    {
+        return !unordered;
+    }
     // A packed 16-bit target made R8G8B8A8_UNORM on this GPU
     // (`resource::target_format`): views name the format it has.
     if view != own && crate::resource::target_format(view) == own {

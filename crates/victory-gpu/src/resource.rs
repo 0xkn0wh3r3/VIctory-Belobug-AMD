@@ -847,6 +847,132 @@ pub(crate) struct HostTexture {
     pub(crate) slot: Option<crate::texpool::Slot>,
     /// The title's largest mips it goes without ([`over_cap`]).
     pub(crate) skip: u32,
+    /// When a list last moved it to a state shaders or draws write in, in
+    /// order: of textures in the same memory, the last holds its contents.
+    pub(crate) written: std::sync::atomic::AtomicU64,
+}
+
+/// Textures the host GPU writes, by the title memory they are placed in.
+/// Titles read such memory through other views, with no resource object:
+/// Grand Theft Auto VI writes its HDR images as 32-bit integers and reads
+/// them as shared-exponent colors.
+#[cfg(windows)]
+static TARGETS: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Shared-exponent colors (R9G9B9E5), which 32-bit textures that shaders
+/// write may be read as.
+pub(crate) const SHARED_EXPONENT: u32 = 67;
+
+/// The written texture at `address` that a view described by `d` reads, the
+/// last written of several.
+#[cfg(windows)]
+fn target_at(address: u64, d: &ResourceDesc) -> Option<This> {
+    let targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+    targets
+        .get(&address)?
+        .iter()
+        .map(|&r| r as This)
+        .filter(|&r| {
+            let o = &resource(r).desc;
+            (o.dimension, o.width, o.height, o.depth_or_array_size, o.mip_levels)
+                == (d.dimension, d.width, d.height, d.depth_or_array_size, d.mip_levels)
+                && (family(o.format) == family(d.format)
+                    || d.format == SHARED_EXPONENT && (39..=43).contains(&o.format))
+        })
+        .max_by_key(|&r| {
+            resource(r)
+                .host
+                .as_ref()
+                .map_or(0, |h| h.written.load(std::sync::atomic::Ordering::Relaxed))
+        })
+}
+
+/// A list moves `texture` to `state`.
+#[cfg(windows)]
+pub(crate) fn note_written(resource_: This, state: u32) {
+    static CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    const RENDER_TARGET: u32 = 0x4;
+    const UNORDERED: u32 = 0x8;
+    if state & (RENDER_TARGET | UNORDERED) != 0
+        && let Some(h) = &resource(resource_).host
+    {
+        let now = CLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        h.written.store(now, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `desc` as a texture that 32-bit and shared-exponent views may be made of;
+/// in the common state.
+#[cfg(windows)]
+fn castable(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    desc: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+    clear: Option<*const windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_VALUE>,
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    use windows::core::Interface;
+    static DEVICE: std::sync::OnceLock<Option<ID3D12Device10>> = std::sync::OnceLock::new();
+    let device = DEVICE
+        .get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+            // SAFETY: a structure of the size the feature has.
+            unsafe {
+                device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS12,
+                        std::ptr::from_mut(&mut options).cast(),
+                        std::mem::size_of_val(&options) as u32,
+                    )
+                    .ok()?;
+            }
+            if !options.RelaxedFormatCastingSupported.as_bool() {
+                tracing::warn!("the host cannot read 32-bit textures as shared-exponent colors");
+                return None;
+            }
+            device.cast().ok()
+        })
+        .as_ref()?;
+    let desc = D3D12_RESOURCE_DESC1 {
+        Dimension: desc.Dimension,
+        Alignment: desc.Alignment,
+        Width: desc.Width,
+        Height: desc.Height,
+        DepthOrArraySize: desc.DepthOrArraySize,
+        MipLevels: desc.MipLevels,
+        Format: desc.Format,
+        SampleDesc: desc.SampleDesc,
+        Layout: desc.Layout,
+        Flags: desc.Flags,
+        ..Default::default()
+    };
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let formats = [
+        DXGI_FORMAT_R32_UINT,
+        DXGI_FORMAT_R32_FLOAT,
+        DXGI_FORMAT_R32_SINT,
+        DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
+    ];
+    let mut texture: Option<ID3D12Resource> = None;
+    // SAFETY: whole descriptions.
+    unsafe {
+        device.CreateCommittedResource3(
+            &heap,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            D3D12_BARRIER_LAYOUT_COMMON,
+            clear,
+            None,
+            Some(&formats),
+            &mut texture,
+        )
+    }
+    .ok()?;
+    texture
 }
 
 #[cfg(windows)]
@@ -1026,6 +1152,7 @@ fn host_texture(
     windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     Option<crate::texpool::Slot>,
     u32,
+    bool,
 )> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
@@ -1114,7 +1241,20 @@ fn host_texture(
         crate::host::texture_state(state),
     ) as i32);
     if let Some((texture, slot)) = crate::texpool::place(&host.device, &desc, first) {
-        return Some((texture, Some(slot), skip));
+        return Some((texture, Some(slot), skip, false));
+    }
+    if (39..=43).contains(&d.format)
+        && d.flags & UNORDERED != 0
+        && let Some(texture) = castable(
+            &host.device,
+            &desc,
+            clear_value
+                .as_ref()
+                .filter(|_| d.flags & RENDER_TARGET != 0)
+                .map(|v| std::ptr::from_ref(v).cast()),
+        )
+    {
+        return Some((texture, None, skip, true));
     }
     let mut made = create(&d, &mut texture);
     // Not every host GPU offers every use of every format (NVIDIA: no
@@ -1148,7 +1288,7 @@ fn host_texture(
             )
         });
     }
-    texture.map(|t| (t, None, skip))
+    texture.map(|t| (t, None, skip, false))
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -1214,8 +1354,12 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: host.map(|(texture, slot, skip)| {
-            let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
+        host: host.map(|(texture, slot, skip, common)| {
+            let state = if common {
+                0
+            } else {
+                crate::host::legal_state(&texture, crate::host::texture_state(state))
+            };
             let bytes = allocation_bytes(&texture);
             crate::memstat::add(&crate::memstat::HOST_TEXTURES, bytes);
             crate::memstat::add(&crate::memstat::HOST_TEXTURE_COUNT, 1);
@@ -1226,6 +1370,7 @@ fn hand_out_resource(
                 bytes,
                 slot,
                 skip,
+                written: Default::default(),
                 state: state.into(),
             })
         }),
@@ -1234,6 +1379,10 @@ fn hand_out_resource(
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
+    } else if desc.flags & 5 != 0 && resource.host.is_some() {
+        let at = std::ptr::from_ref::<Resource>(&resource) as usize;
+        let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+        targets.entry(resource.data() as u64).or_default().push(at);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -1241,6 +1390,17 @@ fn hand_out_resource(
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        if self.desc.flags & 5 != 0 && self.host.is_some() {
+            let at = std::ptr::from_ref::<Resource>(self) as usize;
+            let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+            let start = self.data() as u64;
+            if let Some(list) = targets.get_mut(&start) {
+                list.retain(|&r| r != at);
+                if list.is_empty() {
+                    targets.remove(&start);
+                }
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if self
             .host
@@ -1486,12 +1646,15 @@ static PLACED_LONGEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// The placed textures alive now (resource objects).
 #[cfg(windows)]
 pub(crate) fn placed_live() -> std::collections::HashSet<usize> {
-    PLACED_TEXTURES
+    let mut live: std::collections::HashSet<usize> = PLACED_TEXTURES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .values()
         .map(|&(r, _)| r)
-        .collect()
+        .collect();
+    let targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+    live.extend(targets.values().flatten());
+    live
 }
 
 /// The resource for a texture placed at `address` with the resource
@@ -1501,16 +1664,19 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if address == 0 {
         return None;
     }
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if d.dimension == BUFFER {
+        return None;
+    }
+    if let Some(target) = target_at(address, &d) {
+        return Some(target);
+    }
     {
         let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&(r, _)) = map.get(&(address, *desc)) {
             return Some(r as This);
         }
-    }
-    // SAFETY: 56 bytes in the description's layout.
-    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
-    if d.dimension == BUFFER {
-        return None;
     }
     let size = footprint(&d).map_or(1, |info| info.size.max(1));
     let end = address.saturating_add(size);
@@ -2034,6 +2200,7 @@ mod tests {
         let (_, _, _, t) = footprints(&texture(64, 64, 71, 1), 1, 1);
         assert_eq!(t, u64::MAX, "no second subresource");
     }
+
 
     /// A 4x4 texture filled from a title buffer through our list and queue,
     /// then read back from the host GPU.

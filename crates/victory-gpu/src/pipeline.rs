@@ -113,6 +113,21 @@ fn hair_strands(container: &[u8]) -> bool {
         })
 }
 
+impl Shader {
+    /// The program's name, if its container tells.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pub(crate) fn name(&self) -> String {
+        const END: &[u8] = b"_Wrapped";
+        let at = self.container.windows(END.len()).position(|w| w == END);
+        let before = &self.container[at.unwrap_or(0).saturating_sub(100)..at.unwrap_or(0)];
+        let name = before
+            .rsplit(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+            .next()
+            .unwrap_or_default();
+        String::from_utf8_lossy(name).into_owned()
+    }
+}
+
 impl std::fmt::Debug for Shader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} {}", self.stage, self.hash)
