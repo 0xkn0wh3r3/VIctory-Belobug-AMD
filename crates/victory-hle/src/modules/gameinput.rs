@@ -1231,20 +1231,7 @@ mod host {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
+                let vk = key_named(key.trim())?;
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
                     vk,
@@ -1257,7 +1244,65 @@ mod host {
         keys.iter()
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
+            .chain(asked())
             .collect()
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn key_named(name: &str) -> Option<u8> {
+        Some(match name {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                k.as_bytes()[0].to_ascii_uppercase()
+            }
+            _ => return None,
+        })
+    }
+
+    /// Debugging aid: keys as in `VICTORY_KEYS`, one per line of the file
+    /// `VICTORY_KEYS_FILE`, each held for 0.2 s once its line is there.
+    #[cfg(feature = "diagnostics")]
+    fn asked() -> Option<u8> {
+        struct Asked {
+            looked: Instant,
+            done: usize,
+            held: Option<(Instant, u8)>,
+        }
+        static ASKED: LazyLock<std::sync::Mutex<Asked>> = LazyLock::new(|| {
+            std::sync::Mutex::new(Asked { looked: Instant::now(), done: 0, held: None })
+        });
+        static FILE: LazyLock<Option<std::ffi::OsString>> =
+            LazyLock::new(|| std::env::var_os("VICTORY_KEYS_FILE"));
+        let file = FILE.as_ref()?;
+        let mut a = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if let Some((since, vk)) = a.held {
+            let age = now - since;
+            if age < Duration::from_millis(200) {
+                return Some(vk);
+            }
+            if age < Duration::from_millis(600) {
+                return None;
+            }
+            a.held = None;
+        }
+        if now - a.looked < Duration::from_millis(100) {
+            return None;
+        }
+        a.looked = now;
+        let lines = std::fs::read_to_string(file).ok()?;
+        let name = lines.lines().nth(a.done)?.trim().to_owned();
+        a.done += 1;
+        tracing::info!(key = name, "a key was asked for");
+        a.held = key_named(&name).map(|vk| (now, vk));
+        a.held.map(|h| h.1)
     }
 
     /// The foreground window is one of ours (the title's or our fallback).

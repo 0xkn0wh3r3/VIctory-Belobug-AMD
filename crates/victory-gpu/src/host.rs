@@ -34,8 +34,6 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
-/// Maximum number of detached host lists kept for reuse after pending resets.
-const LIST_POOL_CAP: usize = 64;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -56,10 +54,6 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
-    /// Detached host lists whose submissions finished, ready to reuse.
-    free_lists: Mutex<Vec<HostList>>,
-    #[cfg(test)]
-    reused_lists: std::sync::atomic::AtomicU64,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -356,9 +350,6 @@ impl Host {
                 messages,
                 next_rtv: AtomicU32::new(0),
                 presenter: Mutex::new(None),
-                free_lists: Mutex::default(),
-                #[cfg(test)]
-                reused_lists: std::sync::atomic::AtomicU64::new(0),
             })
         }
     }

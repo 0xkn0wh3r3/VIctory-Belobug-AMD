@@ -3425,19 +3425,6 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// `x` in lane `lane` of the current quad.
-    fn quad_float(&mut self, x: V, lane: u32) -> V {
-        let (f32t, lane) = (self.s.t.f32, self.s.m.i32(lane));
-        self.s.op(
-            self.cur,
-            "quadReadLaneAt.f32",
-            Attr::NoUnwind,
-            f32t,
-            122,
-            &[x, lane],
-        )
-    }
-
     /// Component `c` of the thread id in the group. With console lanes, the
     /// thread is relabelled so that its host lane is its console lane: the
     /// flat id is the wave's first lane's, rounded down to the wave size,

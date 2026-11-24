@@ -175,6 +175,7 @@ fn compile(host: &Host, dxc: &std::ffi::OsStr, hlsl: &str) -> HostPipeline {
         stages: Vec::new(),
         slots: 0,
         inputs: Vec::new(),
+        rectangles: Default::default(),
         name: "synthetic direct SRV".into(),
     }
 }
