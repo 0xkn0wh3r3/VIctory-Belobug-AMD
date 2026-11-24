@@ -39,6 +39,7 @@ const LIST_POOL_CAP: usize = 64;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    pub(crate) depth_bounds_supported: bool,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -297,8 +298,18 @@ impl Host {
         device: ID3D12Device,
         messages: Option<ID3D12InfoQueue>,
     ) -> windows::core::Result<Host> {
-        // SAFETY: plain D3D12 queue, fence, event and descriptor heap creation.
+        // SAFETY: plain D3D12 feature query and queue, fence, event and
+        // descriptor heap creation.
         unsafe {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
+            let depth_bounds_supported = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS2,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .is_ok()
+                && options.DepthBoundsTestSupported.as_bool();
             let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                 Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
                 ..Default::default()
@@ -321,6 +332,7 @@ impl Host {
             let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
             Ok(Host {
                 device,
+                depth_bounds_supported,
                 queue,
                 fence,
                 submitted: Mutex::new(0),
@@ -441,6 +453,7 @@ mod tests {
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
+    pub(crate) depth_bounds: Option<ID3D12GraphicsCommandList1>,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -478,6 +491,11 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+}
+
+pub(crate) fn warn_depth_bounds() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| tracing::warn!("the host GPU has no depth bounds test; depth bounds are ignored"));
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -709,6 +727,7 @@ impl Host {
             prelude.Close()?;
             Ok(HostList {
                 allocator,
+                depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
