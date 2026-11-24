@@ -344,6 +344,8 @@ fn translate(
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
+    let failures = |t: &Tally| t.failed.values().map(|f| f.0).sum::<usize>();
+    let before = failures(t);
     for p in programs {
         t.programs += 1;
         match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
@@ -426,6 +428,18 @@ fn translate(
                 t.fail(reason, || format!("{} {:?}", example(), p.stage));
             }
         }
+    }
+    // `VICTORY_DUMP_REFUSED`: what fails, each in a file of that folder.
+    if failures(t) > before
+        && let Ok(dir) = std::env::var("VICTORY_DUMP_REFUSED")
+    {
+        let label = source.label();
+        let name: String = label
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+        let _ = std::fs::write(format!("{dir}/{hash}-{name}.dxbc"), &bytes);
     }
 }
 

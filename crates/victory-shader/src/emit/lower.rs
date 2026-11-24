@@ -2290,6 +2290,10 @@ impl<'a> Lower<'a> {
             return Err("a lane mask read whole in a wave64 program split in halves");
         }
         if !self.x.st.active.contains(&lo) {
+            if std::env::var_os("VICTORY_WHY").is_some() {
+                let def = self.def_block.get(&lo).map(|&b| (b, self.x.p.blocks[b].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == lo)).map(|i| (i.machine.offset, i.name().to_owned())), self.x.p.blocks[b].phis.iter().find(|p| p.value == lo).map(|p| (p.reg, p.args.clone()))));
+                eprintln!("mask {lo:?} {m:?} def {def:?} cur {}", self.cur_ir);
+            }
             return Err("a lane mask holding lanes elsewhere read as data");
         }
         if let Some(&xy) = self.ballots.get(&lo) {
