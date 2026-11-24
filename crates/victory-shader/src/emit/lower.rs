@@ -2285,6 +2285,11 @@ impl<'a> Lower<'a> {
         if threads > 128 || mesh.max_vertices > 256 || mesh.max_primitives > 256 {
             return Err("a mesh shader beyond the host's limits");
         }
+        // The console allows larger outputs than the host; the signatures
+        // link to the title's pixel shader, so none are dropped.
+        if mesh_output_bytes(&self.s.outputs, &self.s.prims, mesh) > MAX_MESH_OUTPUT_BYTES {
+            return Err("mesh outputs beyond the host's 32 KiB");
+        }
         let e = self.s.entry;
         let void = self.s.t.void;
         let (v, p) = (
@@ -7774,6 +7779,24 @@ impl<'a> Lower<'a> {
 
 /// The DXIL interpolation mode of a kind of barycentrics (none for the
 /// pull model).
+/// The host's limit on a mesh shader's vertex plus primitive outputs
+/// (DXC's `kMaxMSOutputTotalBytes`).
+const MAX_MESH_OUTPUT_BYTES: u32 = 32768;
+
+/// A mesh shader's output size as the validator counts it: every element's
+/// components times the maximum vertex or primitive count, each rounded up
+/// to 32, four bytes each.
+fn mesh_output_bytes(
+    outputs: &[SigElement],
+    prims: &[SigElement],
+    mesh: super::shader::Mesh,
+) -> u32 {
+    let scalars = |els: &[SigElement], n: u32| -> u32 {
+        els.iter().map(|e| u32::from(e.cols)).sum::<u32>() * n.next_multiple_of(32)
+    };
+    4 * (scalars(outputs, mesh.max_vertices) + scalars(prims, mesh.max_primitives))
+}
+
 /// The coordinates `calculateLOD` takes for a texture of DXIL resource
 /// kind `kind` (DXC's `GetNumDimensionsForCalcLOD`): the size's dimensions,
 /// without an array slice. The validator wants the rest undef ("out of
@@ -7869,6 +7892,41 @@ mod tests {
     use crate::{ShaderError, io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// Mesh output size as the validator counts it (53 programs were over
+    /// the limit; they now fail as unsupported).
+    #[test]
+    fn mesh_output_size_counts_aligned_maxima() {
+        let el = |cols| SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(0),
+            col: 0,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        let mesh = |max_vertices, max_primitives| crate::emit::shader::Mesh {
+            max_vertices,
+            max_primitives,
+            topology: 2,
+        };
+        // 4 + 4 columns of 64 vertices, 1 column of 126 primitives (128).
+        let size = super::mesh_output_bytes(&[el(4), el(4)], &[el(1)], mesh(64, 126));
+        assert_eq!(size, 4 * (8 * 64 + 128));
+        // 32 columns of 256 vertices: exactly the limit; one more is over.
+        let full: Vec<_> = (0..8).map(|_| el(4)).collect();
+        assert_eq!(
+            super::mesh_output_bytes(&full, &[], mesh(256, 1)),
+            super::MAX_MESH_OUTPUT_BYTES
+        );
+        assert!(
+            super::mesh_output_bytes(&full, &[el(1)], mesh(256, 1)) > super::MAX_MESH_OUTPUT_BYTES
+        );
+    }
 
     /// `calculateLOD` takes the size's dimensions only, as DXC's
     /// `GetNumDimensionsForCalcLOD` counts them: an array's slice
