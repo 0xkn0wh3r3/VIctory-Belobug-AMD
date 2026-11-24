@@ -108,11 +108,15 @@ struct Guards {
     protected: BTreeSet<usize>,
     /// Of those, the ones not written since a copy took them.
     clean: BTreeSet<usize>,
+    /// Unmapped blocks (`VirtualProtect` failed) within guarded ranges;
+    /// cleared by [`title_memory_remapped`] when the runtime maps them.
+    holes: BTreeSet<usize>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
+    holes: BTreeSet::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -140,19 +144,20 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     for block in first..=last {
         let open = block < last
             && !g.clean.contains(&block)
+            && !g.holes.contains(&block)
             && (!check_each || mapped(block * BLOCK));
         if open {
-            written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
+                written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             } else {
                 run.get_or_insert(block);
                 continue;
             }
         }
         if let Some(from) = run.take() {
-            protect(&mut g, from, block);
+            protect(&mut g, from, block, &mut written);
         }
     }
     Some(written)
@@ -232,8 +237,9 @@ fn mapped(at: usize) -> bool {
 }
 
 /// Makes blocks `[from, to)` read-only and notes them guarded and clean;
-/// block by block if they span views, leaving out any that fail (unmapped).
-fn protect(g: &mut Guards, from: usize, to: usize) {
+/// block by block if they span views, recording unmapped blocks in `g.holes`
+/// so subsequent checks neither retry `VirtualProtect` nor fault copying them.
+fn protect(g: &mut Guards, from: usize, to: usize, written: &mut Vec<usize>) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
@@ -247,17 +253,20 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             ) != 0
         }
     };
-    let note = |g: &mut Guards, from: usize, to: usize| {
+    let note = |g: &mut Guards, written: &mut Vec<usize>, from: usize, to: usize| {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
+        written.extend(from * BLOCK / PAGE..to * BLOCK / PAGE);
     };
     if set(from, to) {
-        note(g, from, to);
+        note(g, written, from, to);
         return;
     }
     for block in from..to {
         if set(block, block + 1) {
-            note(g, block, block + 1);
+            note(g, written, block, block + 1);
+        } else {
+            g.holes.insert(block);
         }
     }
 }
@@ -304,6 +313,14 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             .range(at / BLOCK..end.div_ceil(BLOCK))
             .copied()
             .collect();
+        let holes: Vec<usize> = g
+            .holes
+            .range(at / BLOCK..end.div_ceil(BLOCK))
+            .copied()
+            .collect();
+        for block in holes {
+            g.holes.remove(&block);
+        }
         for block in blocks {
             g.protected.remove(&block);
             g.clean.remove(&block);
