@@ -3592,7 +3592,7 @@ impl<'a> Lower<'a> {
             self.handle(site, &src, false, props)?
         } else {
             let index = self.heap_index_at(site, skew.wrapping_neg(), false)?;
-            self.s.heap_handle(self.cur, index, false, props)
+            self.s.heap_handle(self.cur, index, false, false, props)
         };
         let c = self.cur;
         let i32t = self.s.t.i32;
