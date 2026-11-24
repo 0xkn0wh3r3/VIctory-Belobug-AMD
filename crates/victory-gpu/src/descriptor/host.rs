@@ -1914,13 +1914,21 @@ fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, 
     Some((start / 4, u32::try_from(dwords).ok()?))
 }
 
+/// Whether structured buffers of this stride are raw views on the host (as
+/// the shaders take them: `emit::lower`).
+fn raw_stride(stride: u32) -> bool {
+    stride >= 16 && stride.is_multiple_of(16)
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let element = element_size(&desc);
+    // SAFETY: a buffer view's union member.
+    let structured = raw_stride(unsafe { desc.Anonymous.Buffer }.StructureByteStride);
+    let element = if structured { 0 } else { element_size(&desc) };
     let shadow = crate::shadow::for_view(address, len, element)?;
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -1940,14 +1948,8 @@ fn buffer_srv(
         buffer.NumElements,
         buffer.StructureByteStride,
     ) {
-        // shortcut: a shader that indexes the view declares it structured,
-        // and D3D12 leaves structured reads of a raw view undefined (NVIDIA
-        // and WARP read the right bytes).
-        once!(
-            offset,
-            element,
-            "structured buffer view off its host copy's elements made raw"
-        );
+        // Shaders read all structured buffers as raw ones (AMD reads element
+        // 0 for every element of a raw view through a structured buffer).
         *buffer = D3D12_BUFFER_SRV {
             FirstElement: first,
             NumElements: count,
@@ -2005,7 +2007,10 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::for_view(address, len, uav_element_size(&desc).unwrap_or(0))?;
+    // SAFETY: a buffer view's union member.
+    let structured = raw_stride(unsafe { desc.Anonymous.Buffer }.StructureByteStride);
+    let whole = if structured { 0 } else { uav_element_size(&desc).unwrap_or(0) };
+    let shadow = crate::shadow::for_view(address, len, whole)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -2014,7 +2019,9 @@ fn buffer_uav(
     }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
-    let element = if buffer.StructureByteStride > 0 {
+    let element = if structured {
+        0
+    } else if buffer.StructureByteStride > 0 {
         u64::from(buffer.StructureByteStride)
     } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
         4
@@ -2043,11 +2050,6 @@ fn buffer_uav(
     ) {
         // As in `buffer_srv`; what shaders write lands in the shared copy,
         // in the range `buffer_range` gives (copied back to title memory).
-        once!(
-            offset,
-            element,
-            "structured unordered buffer view off its host copy's elements made raw"
-        );
         *buffer = D3D12_BUFFER_UAV {
             FirstElement: first,
             NumElements: count,

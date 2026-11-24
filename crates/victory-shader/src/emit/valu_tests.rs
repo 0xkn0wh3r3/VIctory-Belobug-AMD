@@ -256,7 +256,8 @@ fn data_only_structured_srv_reads_its_bound_record_count() {
             View::RawUav(1),
             View::Buffer {
                 data: &words,
-                stride: super::host::Stride::Structured(16),
+                // Strides of 16 bytes and their multiples are raw views.
+                stride: super::host::Stride::Raw,
             },
         ];
         run_with_views(&shader, &[[0; 4]], &views, |device, _, _, out| {

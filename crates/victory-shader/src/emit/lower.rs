@@ -4961,7 +4961,7 @@ impl<'a> Lower<'a> {
             .filter(|u| matches!(u.kind, ResourceType::Srv | ResourceType::Uav))
             .map(|u| {
                 let u_bit = if u.kind == ResourceType::Uav { 0x1000 } else { 0 };
-                let stride = if u.stride >= 4 && u.stride.is_multiple_of(4) {
+                let stride = if u.stride >= 4 && u.stride.is_multiple_of(4) && !u.stride.is_multiple_of(16) {
                     u.stride
                 } else {
                     0
@@ -5249,7 +5249,7 @@ impl<'a> Lower<'a> {
             best
         };
         let use_at = find(true).or_else(|| find(false));
-        let (load, skew, src, props, image, uav) = if let Some((at, load, first, skew)) = use_at {
+        let (load, skew, src, mut props, image, uav) = if let Some((at, load, first, skew)) = use_at {
             let src = Source::Loaded { load, first };
             let used = self.used_kind(&src);
             let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
@@ -5345,6 +5345,11 @@ impl<'a> Lower<'a> {
                 (site, 0, src, (12 | u, binding.stride), None, uav)
             }
         };
+        // A structured buffer's records, of a raw view's bytes.
+        let records = (props.0 & 0xfff == 12 && props.1.is_multiple_of(16)).then_some(props.1);
+        if records.is_some() {
+            props = (11 | props.0 & 0x1000, 0);
+        }
         // The handle is built from this load's own address (the other
         // load's registers need not hold it here): the descriptor starts
         // `skew` dwords before what this load reads.
@@ -5417,7 +5422,14 @@ impl<'a> Lower<'a> {
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
                 vec![(1, d1), (2, d2), (3, d3), (4, depth)]
             }
-            None => vec![(2, field(self, 0))],
+            None => {
+                let mut n = field(self, 0);
+                if let Some(stride) = records {
+                    let st = self.s.m.i32(stride);
+                    n = self.s.m.bin(c, Bin::UDiv, n, st);
+                }
+                vec![(2, n)]
+            }
         };
         for k in 0..count {
             let rel = (k as i32).wrapping_add(skew);
@@ -10263,6 +10275,16 @@ impl<'a> Lower<'a> {
         let (index, off) = match index {
             Some(i) if !typed && format.is_none() => match self.built_element(src, i, off)? {
                 Some(byte) => (None, byte),
+                // Structured buffers of 16-byte multiples are raw views of
+                // their bytes on the host: D3D12 takes structured views only
+                // on multiples of the stride, and AMD reads element 0 for all
+                // of a raw view's. (Others find a start they fit, and raw
+                // views are to start on 16 bytes.)
+                None if stride >= 16 && stride.is_multiple_of(16) => {
+                    let st = self.s.m.i32(stride);
+                    let first = self.s.m.bin(c, Bin::Mul, i, st);
+                    (None, self.s.m.bin(c, Bin::Add, first, off))
+                }
                 None => (Some(i), off),
             },
             x => (x, off),
