@@ -1765,6 +1765,8 @@ struct Presenter {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
+    #[cfg(feature = "diagnostics")]
+    copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
     /// The caption the window had, once read.
@@ -1777,6 +1779,8 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
+            #[cfg(feature = "diagnostics")]
+            copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
@@ -1788,6 +1792,10 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
+        #[cfg(feature = "diagnostics")]
+        {
+            self.copy_stats_frames += 1;
+        }
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
@@ -1826,7 +1834,7 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
-                crate::copystat::log(frames);
+                crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
