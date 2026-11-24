@@ -54,6 +54,9 @@ pub(crate) struct Staging {
     last: Mutex<Last>,
     /// The runtime wrote the memory since it was last looked at.
     rewritten: std::sync::atomic::AtomicBool,
+    /// Set once `GetWriteWatch` reports this texture is not in write-watched
+    /// memory (physical-page views), skipping the syscall on every frame.
+    not_watched: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     gpu_uploads: std::sync::atomic::AtomicU64,
 }
@@ -285,30 +288,24 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
-        if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
-                return (0, false);
+        if !self.not_watched.load(Ordering::Relaxed) {
+            if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
+                if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+                    return (0, false);
+                }
+                last.asked = now;
+                // Read through the copy, which stands unmapped pages: memory of
+                // big pools is too slow to ask page by page.
+                with_tiled_copy(self.memory, size, |tiled| self.detile(tiled));
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
+                return (size, true);
             }
-            last.asked = now;
-            // Read through the copy, which stands unmapped pages: memory of
-            // big pools is too slow to ask page by page.
-            with_tiled_copy(self.memory, size, |tiled| self.detile(tiled));
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return (size, true);
+            self.not_watched.store(true, Ordering::Relaxed);
         }
-        if !committed(self.memory, size) {
-            #[cfg(feature = "diagnostics")]
-            tracing::debug!(
-                memory = ?self.memory,
-                size,
-                desc = ?self.layout.desc,
-                "a sampled texture's memory is not committed"
-            );
-            return (0, false);
-        }
-        // shortcut: contents that did not change the last times are looked at
-        // every 2, 4 and at most 8 frames.
+        // Check backoff BEFORE probing `committed` (which touches every page):
+        // static textures skip both page probing and BLAKE3 hashing in O(1),
+        // while `title_memory_written` still flips `rewritten` immediately.
         let frame = crate::queue::presented() + 1;
         let mode = crate::resource::textures();
         let rewritten = self.rewritten.swap(false, Ordering::AcqRel)
@@ -322,18 +319,28 @@ impl Staging {
         {
             return (0, false);
         }
-        // Read through the kernel, as above: the title may unmap the pages
-        // (evicting a texture a big table lists) while we read them, and a
-        // direct read would fault. The copy is reused, not kept per texture.
+        if !committed(self.memory, size) {
+            #[cfg(feature = "diagnostics")]
+            tracing::debug!(
+                memory = ?self.memory,
+                size,
+                desc = ?self.layout.desc,
+                "a sampled texture's memory is not committed"
+            );
+            return (0, false);
+        }
+        // Read through our safe copy: the title may unmap the pages
+        // (evicting a texture a big table lists) while we read them.
         SCRATCH.with_borrow_mut(|tiled| {
             tiled.resize(size, 0);
             crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
             let read = self.changed(last, tiled, rewritten);
-            last.still = if read.1 { 0 } else { (last.still + 1).min(5) };
-            // Not all in the same frame.
+            last.still = if read.1 { 0 } else { (last.still + 1).min(6) };
+            // Not all in the same frame; static textures back off up to 32 frames
+            // (`title_memory_written` resets `still` immediately on streamed writes).
             last.next = match last.still {
                 0 | 1 => 0,
-                k => frame + (1 << (k - 1).min(3)) - (self.memory as u64 >> 16) % 2,
+                k => frame + (1 << (k - 1).min(5)) - (self.memory as u64 >> 16) % 2,
             };
             // As in `with_tiled_copy`: a one-off huge read is not kept.
             if tiled.capacity() > 64 << 20 {
@@ -674,6 +681,7 @@ fn create_staging(
         memory,
         last: Mutex::default(),
         rewritten: Default::default(),
+        not_watched: Default::default(),
         #[cfg(test)]
         gpu_uploads: std::sync::atomic::AtomicU64::new(0),
     }))

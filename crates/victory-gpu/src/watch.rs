@@ -496,6 +496,19 @@ pub fn title_memory_written(at: usize, len: usize) {
     }
 }
 
+/// Opens a guarded block at `at` (or returns `true` if another thread already
+/// made it read-write). Called both by our own VEH handler and by
+/// `host::safe_copy`'s VEH handler on write faults.
+pub(crate) fn try_open_guarded(at: usize) -> bool {
+    let mut g = guards();
+    if open(&mut g, at, at + 1) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+        return true;
+    }
+    writable(at)
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 fn install() {
@@ -515,16 +528,7 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
-        // Held across both checks: another thread may have opened the block
-        // since this one faulted, and a copy may have guarded it again since
-        // (then it is ours again, not read-only for some other reason).
-        let mut g = guards();
-        if open(&mut g, at, at + 1) {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        if writable(at) {
+        if try_open_guarded(at) {
             EXCEPTION_CONTINUE_EXECUTION
         } else {
             EXCEPTION_CONTINUE_SEARCH
