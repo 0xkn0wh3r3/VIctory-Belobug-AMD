@@ -584,6 +584,14 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        if p.stages.iter().any(|s| s.translated().resource_heap)
+            && self.heaps[0] != 0
+            && let Some(host_heap) = crate::descriptor::heap(self.heaps[0] as This).host_arc()
+        {
+            host_heap.prepare_bindless_record(list);
+            let writes = p.stages.iter().any(|s| s.translated().writes_memory);
+            list.defer_bindless(&host_heap, writes);
+        }
         for stage in &p.stages {
             let t = stage.translated();
             let Some(made) = self.tables(list, &t.used, compute) else {

@@ -485,6 +485,19 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     }
 }
 
+/// Whether a title buffer holds `[address, address + len)` (its memory is
+/// the title's, without asking the kernel).
+pub(crate) fn in_buffer(address: u64, len: u64) -> bool {
+    let Some(end) = address.checked_add(len.max(1)) else {
+        return false;
+    };
+    buffers()
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .any(|(_, e)| e.end >= end)
+}
+
 /// The copy of a title buffer holding `[address, address + len)`: of one
 /// whose copy is made already if there is one (a buffer inside another,
 /// say in the world's 174 MB heap, then shares its copy instead of paying
