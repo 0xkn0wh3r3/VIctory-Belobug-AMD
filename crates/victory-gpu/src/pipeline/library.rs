@@ -109,6 +109,19 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 /// Pipelines a driver's compiler crashed on (names, one per line).
 const CRASHED_FILE: &str = "crashed.txt";
 
+/// The pipeline named `name` is left out from the next run on.
+fn note_crashed(name: &str) {
+    use std::io::Write;
+    let Some(dir) = DIR.get() else { return };
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(CRASHED_FILE));
+    if let Ok(mut f) = file {
+        let _ = writeln!(f, "{name}");
+    }
+}
+
 /// Whether the driver crashed making the pipeline named `name` before.
 fn crashed(name: &str) -> bool {
     static NAMES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
@@ -142,13 +155,59 @@ impl Making {
             AddVectoredExceptionHandler(1, Some(compiler_crashed));
         });
         MAKING.with(|m| name.clone_into(&mut m.borrow_mut()));
+        endless(name, true);
         Making
     }
 }
 
+/// Notes pipelines the driver's compiler has worked on for long
+/// ([`ENDLESS`]): they are left out from the next run on. AMD's never ends
+/// some of the world's ray tracing programs, and takes memory all the while
+/// (16 GB in two minutes).
+fn endless(name: &str, begins: bool) {
+    use std::time::{Duration, Instant};
+    const ENDLESS: Duration = Duration::from_secs(20);
+    static AT_WORK: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
+    static WATCH: std::sync::Once = std::sync::Once::new();
+    {
+        let mut at_work = AT_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        if begins {
+            at_work.push((name.to_owned(), Instant::now()));
+        } else if let Some(i) = at_work.iter().position(|w| w.0 == name) {
+            at_work.swap_remove(i);
+        }
+    }
+    WATCH.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("victory-compiles".into())
+            .spawn(|| {
+                let mut noted: Vec<String> = Vec::new();
+                loop {
+                    std::thread::sleep(Duration::from_secs(2));
+                    let long: Vec<String> = AT_WORK
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .iter()
+                        .filter(|w| w.1.elapsed() > ENDLESS && !noted.contains(&w.0))
+                        .map(|w| w.0.clone())
+                        .collect();
+                    for name in long {
+                        tracing::error!(
+                            name,
+                            "the driver's compiler does not end a pipeline: it is left out from the next run on"
+                        );
+                        note_crashed(&name);
+                        noted.push(name);
+                    }
+                }
+            });
+    });
+}
+
 impl Drop for Making {
     fn drop(&mut self) {
-        MAKING.with(|m| m.borrow_mut().clear());
+        let name = MAKING.with(|m| std::mem::take(&mut *m.borrow_mut()));
+        endless(&name, false);
     }
 }
 
@@ -169,16 +228,7 @@ unsafe extern "system" fn compiler_crashed(
         return 0; // not ours
     }
     tracing::error!(name, "the driver's compiler crashed making a pipeline: it is left out");
-    if let Some(dir) = DIR.get() {
-        use std::io::Write;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join(CRASHED_FILE));
-        if let Ok(mut f) = file {
-            let _ = writeln!(f, "{name}");
-        }
-    }
+    note_crashed(&name);
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
     }
