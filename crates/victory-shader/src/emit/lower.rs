@@ -1254,7 +1254,7 @@ impl<'a> Lower<'a> {
             half_inputs: half_inputs(&x.native.io, &x.inputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
-                HwStage::Ps | HwStage::Vs => MaskData::Host,
+                HwStage::Ps | HwStage::Vs | HwStage::Ms => MaskData::Host,
                 _ => MaskData::None,
             },
             mask_ok: false,
@@ -1721,6 +1721,36 @@ impl<'a> Lower<'a> {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
+            Shape::ActiveF64(lo, hi, mask, is_hi) => {
+                let c = self.cur;
+                let &m = self
+                    .x
+                    .st
+                    .masks
+                    .get(&mask)
+                    .ok_or("a wave reduction's untracked mask")?;
+                let on = self.boolean(m, c)?;
+                let lo_raw = self.i32_of(lo)?;
+                let hi_raw = self.i32_of(hi)?;
+                let z = self.s.m.i32(0);
+                let lo_v = self.s.m.select(c, on, lo_raw, z);
+                let hi_v = self.s.m.select(c, on, hi_raw, z);
+                self.s.flags |= flags::WAVE_OPS | flags::DOUBLES;
+                let f64t = self.s.m.double();
+                let d = self
+                    .s
+                    .op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo_v, hi_v]);
+                let (k0, u0) = (self.s.m.i8(0), self.s.m.i8(0));
+                let sum = self
+                    .s
+                    .op(c, "waveActiveOp.f64", Attr::NoUnwind, f64t, 119, &[d, k0, u0]);
+                let i32t = self.s.t.i32;
+                let pair = self.s.m.named_struct("dx.types.splitdouble", vec![i32t, i32t]);
+                let split = self
+                    .s
+                    .op(c, "splitDouble.f64", Attr::ReadNone, pair, 102, &[sum]);
+                return Ok(self.s.m.extract(c, split, u32::from(is_hi)));
+            }
             Shape::Masked(src, mask, ident) => {
                 let c = self.cur;
                 let &m = self
@@ -1756,13 +1786,21 @@ impl<'a> Lower<'a> {
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
         self.s.flags |= flags::WAVE_OPS;
-        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
+        let f16 = op == Op::AddF16;
+        let float = matches!(op, Op::AddF | Op::AddF16 | Op::MinF | Op::MaxF);
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
-        let arg = if float { self.as_float(x) } else { x };
+        let arg = if f16 {
+            self.s
+                .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
+        } else if float {
+            self.as_float(x)
+        } else {
+            x
+        };
         let ty = if float { f32t } else { i32t };
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
-            (Op::AddU | Op::AddF, Some(inclusive)) => {
+            (Op::AddU | Op::AddF | Op::AddF16, Some(inclusive)) => {
                 let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
                 let r = self.s.op(
                     c,
@@ -1791,7 +1829,7 @@ impl<'a> Lower<'a> {
             (_, None) => {
                 let (code, unsigned) = match op {
                     Op::AddU => (0, 1),
-                    Op::AddF => (0, 0),
+                    Op::AddF | Op::AddF16 => (0, 0),
                     Op::MinU => (2, 1),
                     Op::MaxU => (3, 1),
                     Op::MinI | Op::MinF => (2, 0),
@@ -1808,7 +1846,14 @@ impl<'a> Lower<'a> {
                 )
             }
         };
-        Ok(if float { self.as_int(r) } else { r })
+        Ok(if f16 {
+            self.s
+                .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[r])
+        } else if float {
+            self.as_int(r)
+        } else {
+            r
+        })
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
@@ -2004,8 +2049,9 @@ impl<'a> Lower<'a> {
                     // path that does not need them); they read as zero, as
                     // VGPRs do. In a pixel program the hardware's come
                     // within the first few after the 32 user SGPRs.
-                    None if self.s.threads.is_some() && self.s.mesh.is_none()
-                        || self.s.pixel && n >= 40 =>
+                    None if n <= 105
+                        && (self.s.threads.is_some() && self.s.mesh.is_none()
+                            || self.s.pixel && n >= 40) =>
                     {
                         Val::I32(self.s.m.i32(0))
                     }
@@ -3073,10 +3119,7 @@ impl<'a> Lower<'a> {
     /// `operand` gives, whose low half is 0.
     fn f16_operand(&mut self, inst: &Inst, op: &Operand) -> Result<V, Why> {
         match *op {
-            Operand::Const(c @ 240..=248) => {
-                let h = inline_f16(c);
-                Ok(self.s.m.i32(h | h << 16))
-            }
+            Operand::Const(c @ 240..=248) => Ok(self.s.m.i32(inline_f16(c))),
             _ => self.operand(inst, op),
         }
     }
@@ -7984,12 +8027,103 @@ impl<'a> Lower<'a> {
                 );
                 int(self, r)
             }
+            "v_add_f64" | "v_mul_f64" | "v_fma_f64" => {
+                if v.omod != 0 || v.clamp {
+                    return Err("f64 output modifiers");
+                }
+                let a = self.src_f64(inst, 0)?;
+                let b = self.src_f64(inst, 1)?;
+                let r = match name {
+                    "v_add_f64" => self.s.m.bin(c, Bin::Add, a, b),
+                    "v_mul_f64" => self.s.m.bin(c, Bin::Mul, a, b),
+                    _ => {
+                        let d = self.src_f64(inst, 2)?;
+                        self.s.flags |= flags::DOUBLE_EXT;
+                        let f64t = self.s.m.double();
+                        self.s
+                            .op(c, "fma.f64", Attr::ReadNone, f64t, 47, &[a, b, d])
+                    }
+                };
+                self.write_f64(inst, r, guard)
+            }
+            "v_cvt_f32_f64" => {
+                let a = self.src_f64(inst, 0)?;
+                let r = self.s.m.cast(c, Cast::FpTrunc, a, self.s.t.f32);
+                float(self, r)
+            }
+            "v_cvt_i32_f64" | "v_cvt_u32_f64" => {
+                if v.omod != 0 || v.clamp {
+                    return Err("modifiers on integer conversion");
+                }
+                let a = self.src_f64(inst, 0)?;
+                let cast = if name == "v_cvt_i32_f64" {
+                    Cast::FpToSi
+                } else {
+                    Cast::FpToUi
+                };
+                let r = self.s.m.cast(c, cast, a, self.s.t.i32);
+                int(self, r)
+            }
+            "v_cvt_f64_f32" | "v_cvt_f64_i32" | "v_cvt_f64_u32" => {
+                if v.omod != 0 || v.clamp {
+                    return Err("f64 output modifiers");
+                }
+                self.s.flags |= flags::DOUBLES;
+                let f64t = self.s.m.double();
+                let r = match name {
+                    "v_cvt_f64_f32" => {
+                        let a = f(self, 0)?;
+                        self.s.m.cast(c, Cast::FpExt, a, f64t)
+                    }
+                    "v_cvt_f64_i32" => {
+                        let a = s(self, 0)?;
+                        self.s.m.cast(c, Cast::SiToFp, a, f64t)
+                    }
+                    _ => {
+                        let a = s(self, 0)?;
+                        self.s.m.cast(c, Cast::UiToFp, a, f64t)
+                    }
+                };
+                self.write_f64(inst, r, guard)
+            }
             n if n.contains("_f64") => Err("floating-point arithmetic in f64 is not implemented by the DXIL emitter"),
             _ => {
                 let r = self.integer(inst, name)?;
                 int(self, r)
             }
         }
+    }
+
+    /// A 64-bit floating-point source, constructed from its bit pattern via `dx.op.makeDouble`.
+    fn src_f64(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let bits = self.fp_bits(inst, k, 64)?;
+        let (lo, hi) = self.split64(bits);
+        self.s.flags |= flags::DOUBLES;
+        let f64t = self.s.m.double();
+        Ok(self
+            .s
+            .op(self.cur, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi]))
+    }
+
+    /// Writes a 64-bit floating-point result into a VGPR pair via `dx.op.splitDouble`.
+    fn write_f64(&mut self, inst: &Inst, val: V, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let Some(Operand::Vector { reg, .. }) = v.dst else {
+            return Err("an f64 destination");
+        };
+        self.s.flags |= flags::DOUBLES;
+        let i32t = self.s.t.i32;
+        let pair = self.s.m.named_struct("dx.types.splitdouble", vec![i32t, i32t]);
+        let split = self
+            .s
+            .op(self.cur, "splitDouble.f64", Attr::ReadNone, pair, 102, &[val]);
+        let lo = self.s.m.extract(self.cur, split, 0);
+        let hi = self.s.m.extract(self.cur, split, 1);
+        self.write(inst, Reg::V(reg), lo, guard);
+        self.write(inst, Reg::V(reg + 1), hi, guard);
+        Ok(())
     }
 
     /// A 64-bit source (a register pair; inline constants sign-extend).
