@@ -234,6 +234,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         }
     }
     crate::resource::evict_placed_textures(at as u64, end as u64);
+    crate::descriptor::host::bindless_viewed_changed();
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
