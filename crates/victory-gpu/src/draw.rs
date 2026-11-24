@@ -1040,8 +1040,7 @@ impl State {
         &self,
         list: &HostList,
         kind: u32,
-        args: &crate::shadow::Shadow,
-        arguments: u64,
+        bounded: &ID3D12Resource,
         stride: u32,
         max: u32,
     ) -> Option<(ID3D12Resource, Vec<(u32, D3D12_VERTEX_BUFFER_VIEW)>)> {
@@ -1081,7 +1080,10 @@ impl State {
                 },
             ));
         }
-        let records = crate::rects::records(list, host, &args.buffer, args.gpu(arguments), stride, max)?;
+        // The clamped records (`crate::indirect::bound`'s scratch, from 0).
+        // SAFETY: a live buffer.
+        let from = unsafe { bounded.GetGPUVirtualAddress() };
+        let records = crate::rects::records(list, host, bounded, from, stride, max)?;
         Some((records, views))
     }
 
@@ -1112,6 +1114,24 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
+            return false;
+        };
+        let matches_kind = match kind {
+            DRAW | INDEXED => self.topology != RECTANGLES && !p.compute && !p.mesh,
+            MESH => !p.compute && p.mesh,
+            DISPATCH => p.compute,
+            _ => false,
+        };
+        if !matches_kind {
+            why(&format!(
+                "pipeline mismatch (compute {}, mesh {}, topology {})",
+                p.compute, p.mesh, self.topology
+            ));
+            return false;
+        }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
@@ -1138,23 +1158,30 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        // Bounded first: the clamp binds a compute pipeline of its own and
+        // copies clamped active records into a scratch buffer at offset 0.
+        let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+        let Some(bounded) = crate::indirect::bound(
+            list,
+            (&args.buffer, args.offset(arguments)),
+            count_arg,
+            (kind, stride, max),
+        ) else {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
-        }
+        };
         // Rectangle lists: their vertices expanded and the records rewritten
         // on the GPU, before the draw's own pipeline is bound.
         let mut rect_args: Option<ID3D12Resource> = None;
         let mut rect_vertices: Vec<(u32, D3D12_VERTEX_BUFFER_VIEW)> = Vec::new();
         if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES {
-            match self.indirect_rectangles(list, kind, &args, arguments, stride, max) {
+            match self.indirect_rectangles(list, kind, &bounded, stride, max) {
                 Some((a, views)) => {
                     rect_args = Some(a);
                     rect_vertices = views;
                 }
                 None => {
-                    crate::indirect::done(list, &args.buffer);
+                    crate::indirect::done(list, &bounded);
                     why("a rectangle list (not expanded: indexed, unaligned or unknown inputs)");
                     return false;
                 }
@@ -1192,35 +1219,28 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
-            #[cfg(feature = "diagnostics")]
-            match crate::pipeline::host_pipeline(self.pipeline as This) {
-                None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
-            }
+            crate::indirect::done(list, &bounded);
+            why("prepare failed");
             return false;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
-        // SAFETY: an open list with everything set; the buffers are host
-        // copies the list keeps alive (refresh), the signature is cached.
-        let (arg_buffer, arg_offset) = match &rect_args {
-            Some(a) => (a, 0),
-            None => (&args.buffer, args.offset(arguments)),
-        };
+        let arg_buffer = rect_args.as_ref().unwrap_or(&bounded);
+        // SAFETY: an open list with everything set; the scratch buffers and
+        // host copies are kept alive by the list, and the signature is cached.
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
                 max,
                 arg_buffer,
-                arg_offset,
+                0,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(list, &bounded);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
