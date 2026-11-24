@@ -21,6 +21,7 @@ pub(crate) mod flags {
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
     pub const ATOMIC_TYPED64: u64 = 1 << 27;
+    pub const ATOMIC_INT64_GROUP_SHARED: u64 = 1 << 28;
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
@@ -133,14 +134,21 @@ impl Shader {
         }
     }
 
-    /// The thread-group shared memory: `[lds_dwords x i32]` in address
-    /// space 3.
-    pub fn lds(&mut self) -> V {
+    /// The single LDS allocation in address space 3.
+    pub fn lds(&mut self, wide: bool) -> V {
         if let Some(g) = self.lds {
             return g;
         }
-        let arr = self.m.array(self.lds_dwords, self.t.i32);
+        let arr = if wide {
+            let i64t = self.m.int(64);
+            self.m.array(self.lds_dwords.div_ceil(2), i64t)
+        } else {
+            self.m.array(self.lds_dwords, self.t.i32)
+        };
         let g = self.m.global("lds", arr, 3);
+        if wide {
+            self.m.align_global_to_eight(g);
+        }
         self.lds = Some(g);
         g
     }
@@ -584,6 +592,9 @@ impl Shader {
         }
         if self.flags & flags::ATOMIC_TYPED64 != 0 {
             features |= 0x40_0000;
+        }
+        if self.flags & flags::ATOMIC_INT64_GROUP_SHARED != 0 {
+            features |= 0x80_0000;
         }
         if self.flags & flags::ATOMIC_HEAP64 != 0 {
             features |= 0x1000_0000;
