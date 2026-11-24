@@ -311,7 +311,6 @@ mod tests {
     use crate::native::{ComputeIo, StageIo};
     use crate::{Container, HwStage, NativeProgram, ShaderError, io, ir, resource, structure};
 
-
     fn build(words: &[u32], wave64: bool) -> Program {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         ir::build(&code, wave64, 8).unwrap()
