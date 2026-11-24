@@ -896,6 +896,7 @@ impl State {
         let views = (self.heaps[0] != 0)
             .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
             .flatten();
+        HEAP.store(self.heaps[0], Ordering::Relaxed);
         for stage in &p.stages {
             let t = stage.translated();
             let _ = write!(text, " | {} {}:", stage.shader.name(), stage.shader.hash);
@@ -1720,10 +1721,28 @@ fn describe(view: Option<&View>) -> String {
         {
             // SAFETY: 16 committed bytes of title memory.
             let v = unsafe { (*address as *const [f32; 4]).read_unaligned() };
-            format!("Constant({address:#x}, {size}) {v:?}")
+            let words = crate::shadow::words_text(*address, *size as usize);
+            format!("Constant({address:#x}, {size}) {v:?} words {words}")
         }
         Some(v) => format!("{v:?}").chars().take(60).collect(),
     }
+}
+
+/// The view heap the last noted command used.
+#[cfg(feature = "diagnostics")]
+static HEAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// What the slots `indices` of that heap view.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn report_slots(indices: &[u32]) -> String {
+    let heap = HEAP.load(Ordering::Relaxed);
+    if heap == 0 {
+        return String::new();
+    }
+    let Some(h) = crate::descriptor::heap(heap as This).host() else {
+        return String::new();
+    };
+    indices.iter().map(|&i| format!(" SLOT {i:#x} {}", h.report_slot(i))).collect()
 }
 
 /// The console's own primitive topologies.

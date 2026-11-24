@@ -1109,9 +1109,19 @@ pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<Arc<Shado
 /// tiles that were brought up to date. Reads of the others give zeros, where
 /// a copy ending too soon was a GPU page fault; and memory many buffers of
 /// the title overlap in is copied once.
-/// The first dwords at `address`: as the title has them, as the copy has
-/// them now, and what that is (diagnostics).
+/// The first 32 words of `size` bytes of title memory, in hexadecimal.
 #[cfg(feature = "diagnostics")]
+pub(crate) fn words_text(address: u64, size: usize) -> String {
+    let mut words = [0u32; 32];
+    let n = (size / 4).min(32);
+    // SAFETY: plain words.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), n * 4) };
+    let read = crate::host::read_into(address as *const u8, bytes);
+    format!("{read} {:x?}", &words[..n])
+}
+
+/// The first dwords at `address`: as the title has them, as the copy has
+/// them now, and what that is.
 pub(crate) fn args_text(address: u64) -> String {
     let mut title = [0u32; 4];
     // SAFETY: plain words.
@@ -1311,12 +1321,21 @@ fn new_tile() -> Option<Tile> {
     })
 }
 
+/// Whether tiles are given back (`VICTORY_SWEEP_TILES=1`).
+// shortcut: off, for the copies' memory only grows; what still uses a tile
+// does not always say so, and the host GPU stopped about when the first
+// tiles of the world were given back (120 frames in).
+fn sweeps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cfg!(test) || std::env::var("VICTORY_SWEEP_TILES").is_ok_and(|v| v == "1"))
+}
+
 /// Gives back the tiles nothing has asked about for some frames: what
 /// viewed them is gone. At the present of `frame`.
 pub(crate) fn sweep(frame: u64) {
     const EVERY: u64 = 32;
     const KEEP: u64 = 120;
-    if !frame.is_multiple_of(EVERY) {
+    if !frame.is_multiple_of(EVERY) || !sweeps() {
         return;
     }
     let all: Vec<Arc<Shadow>> = SPARSE

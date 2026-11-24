@@ -165,13 +165,23 @@ pub fn rays() -> bool {
     *RAYS.get_or_init(|| cfg!(test) || std::env::var("VICTORY_RAYS").is_ok_and(|v| v == "1"))
 }
 
-/// Slots of the host's largest view heaps (the title's 2^20 and some, and
-/// `victory-gpu`'s own).
-const VIEW_SLOTS: u32 = 1_769_472;
+/// Slots the host's view heaps have at least (`victory-gpu` pads them); the
+/// last is always null. The title's heap is 1,245,184 slots, with
+/// `victory-gpu`'s own slots after it.
+pub const VIEW_SLOTS: u32 = 1_770_496;
 
-/// Whether heap indices are kept below [`VIEW_SLOTS`].
+/// Those before the views of memory by address, which programs without
+/// such views stay below.
+pub const OWN_SLOTS: u32 = VIEW_SLOTS - 1024;
+
+fn last_slot() -> u32 {
+    if rays() { VIEW_SLOTS - 1 } else { OWN_SLOTS - 1 }
+}
+
+/// Whether heap indices are kept below [`VIEW_SLOTS`]: skinning programs
+/// take them from title data, and one past the heap stops the host GPU.
 fn limits_indices() -> bool {
-    rays() && !cfg!(test)
+    !cfg!(test)
 }
 
 /// A translated shader and what the host binds for it.

@@ -503,6 +503,14 @@ const DYNAMIC_CAPPED: u32 = 1 << 16;
 /// tier.
 const SAMPLERS: u32 = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
 
+/// The slots to make of a view heap of `count` title and dynamic slots: with
+/// those of [`crate::memory`] after them, and enough that shaders' indices,
+/// which stay below [`victory_shader::emit::VIEW_SLOTS`], are inside it.
+fn view_slots(count: u32) -> u32 {
+    let slots = count + crate::memory::SLOTS;
+    if cfg!(test) { slots } else { slots.max(victory_shader::emit::VIEW_SLOTS) }
+}
+
 /// Dynamic slots of a sampler heap capped at [`SAMPLERS`], for tables
 /// reaching past the title slots it keeps.
 const SAMPLER_DYNAMIC: u32 = 256;
@@ -515,8 +523,7 @@ impl HostHeap {
         } else {
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
         };
-        let make = |count: u32| -> windows::core::Result<ID3D12DescriptorHeap> {
-            let count = if sampler { count } else { count + crate::memory::SLOTS };
+        let create = |count: u32| -> windows::core::Result<ID3D12DescriptorHeap> {
             // SAFETY: plain heap creation.
             unsafe {
                 host.device
@@ -527,6 +534,14 @@ impl HostHeap {
                         NodeMask: 0,
                     })
             }
+        };
+        let make = |count: u32| {
+            if sampler {
+                return create(count);
+            }
+            // A host with room for fewer slots gets no padding.
+            let slots = view_slots(count);
+            create(slots).or_else(|_| create(count + crate::memory::SLOTS))
         };
         if sampler && count > SAMPLERS {
             // shortcut: samplers past the host's limit are left out; tables
@@ -592,7 +607,7 @@ impl HostHeap {
                 host.device.GetDescriptorHandleIncrementSize(kind),
             )
         };
-        tracing::debug!(count, extra, sampler, "host descriptor heap");
+        tracing::info!(count, extra, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
@@ -631,8 +646,12 @@ impl HostHeap {
         // used-resource entry names) read a wild address. Every slot starts
         // null instead.
         let started = std::time::Instant::now();
-        let ours = if sampler { 0 } else { crate::memory::SLOTS };
-        if let Err(e) = h.fill_null(kind, count + extra + ours) {
+        // SAFETY: a plain call on a live heap.
+        let total = unsafe { h.heap.GetDesc() }.NumDescriptors;
+        if !sampler && total < victory_shader::emit::VIEW_SLOTS {
+            tracing::warn!(total, "a view heap shorter than shaders keep their indices in");
+        }
+        if let Err(e) = h.fill_null(kind, total) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
@@ -1838,6 +1857,42 @@ impl HostHeap {
     /// title and host addresses of a buffer view (diagnostics). "null" for
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
+    /// What a slot views and how it was made, for the device-removed report.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn report_slot(&self, index: u32) -> String {
+        let mut text = self.describe_slot(index).unwrap_or_else(|| "?".into());
+        let b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+        if b.dirty.contains(&index) {
+            text.push_str(" DIRTY");
+        }
+        match b.uses.get(&index) {
+            None => text.push_str(" no use"),
+            Some(u) => {
+                use std::fmt::Write;
+                let _ = write!(text, " at {:#x}..{:#x} unmapped {}", u.at.0, u.at.1, u.unmapped);
+                if let Some(s) = &u.direct {
+                    let _ = write!(text, " direct dead {}", s.is_dead());
+                }
+                if let Some(t) = u.placed {
+                    let _ = write!(text, " placed {t:#x}");
+                }
+                if let Some(r) = &u.retained {
+                    // SAFETY: a live resource.
+                    let d = unsafe { r.GetDesc() };
+                    let _ = write!(text, " retained dim {} {}x{} f{} flags {:#x}", d.Dimension.0, d.Width, d.Height, d.Format.0, d.Flags.0);
+                    if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+                        // SAFETY: a live buffer.
+                        let _ = write!(text, " va {:#x}", unsafe { r.GetGPUVirtualAddress() });
+                    }
+                }
+                if let Some((s, a, n)) = &u.read {
+                    let _ = write!(text, " read {a:#x}+{n:#x} va {:#x}", s.gpu(*a as u64));
+                }
+            }
+        }
+        text
+    }
+
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
         let key = *self
             .made

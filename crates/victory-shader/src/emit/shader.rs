@@ -380,7 +380,7 @@ impl Shader {
         self.nonuniform_handles += u32::from(nonuniform);
         // An index past the heap is a fault that stops the host GPU.
         let index = if !sampler && super::limits_indices() {
-            let last = self.m.i32(super::VIEW_SLOTS - 1);
+            let last = self.m.i32(super::last_slot());
             let i32t = self.t.i32;
             self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last])
         } else {
