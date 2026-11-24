@@ -564,7 +564,9 @@ impl Shadow {
                         unsafe { std::ptr::write_bytes(t.data as *mut u8, 0, PAGE) };
                     }
                 }
-                look.next = frame + 2 + u64::from(tile) % 2;
+                // Memory committed later is copied by the next frame: zeros
+                // read for what the title filled can hang the GPU.
+                look.next = frame + 1;
                 at = next;
                 continue;
             }
@@ -929,7 +931,7 @@ fn unmapped(address: usize) -> Option<usize> {
 }
 
 /// Tiles of `[start, end)` known to have no title memory are looked at again.
-fn filled(start: u64, end: u64) {
+pub(crate) fn filled(start: u64, end: u64) {
     let over: Vec<Arc<Shadow>> = SPARSE
         .lock()
         .unwrap_or_else(|e| e.into_inner())

@@ -12,7 +12,7 @@
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //!
-//! shortcut: the budget (a tenth of a second of waiting per title frame) is a
+//! shortcut: the budget (half a second of waiting per title frame) is a
 //! guess; a pass the title runs only once and whose pipeline takes longer
 //! is lost.
 
@@ -99,7 +99,7 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Waiting allowed per title frame, over all threads.
-const BUDGET: Duration = Duration::from_millis(100);
+const BUDGET: Duration = Duration::from_millis(500);
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -117,10 +117,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         if p.lost.load(Ordering::Relaxed) {
             return None;
         }
-        // With a world's worth queued there is no use in waiting.
-        if waiting() < 64 {
-            wait(p, crate::frame::current());
-        }
+        // Also with a world's worth queued: passes the title runs only once
+        // set up what later ones loop over.
+        wait(p, crate::frame::current());
     }
     let made = p.made.get()?.as_ref();
     if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {

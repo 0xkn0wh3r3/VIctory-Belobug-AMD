@@ -158,6 +158,9 @@ pub extern "system" fn XMemVirtualAlloc(
     if kind & MEM_RESERVE_PLACEHOLDER != 0 && !at.is_null() {
         physical().reservations.push((at as usize, size));
     }
+    if !constrained && kind & MEM_COMMIT != 0 && !at.is_null() {
+        victory_gpu::title_memory_committed(at as usize, size);
+    }
     if base.is_null() {
         tracing::debug!(
             size,
