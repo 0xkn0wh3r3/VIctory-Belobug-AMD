@@ -389,18 +389,15 @@ impl Shadow {
                 {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                    }
-                    if changed {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
+                    if let Some((dirty_start, dirty_end)) = merge_gpu_writes(title, host, old) {
+                        let dirty_len = dirty_end - dirty_start;
+                        crate::watch::writing(start + at + dirty_start, dirty_len);
+                        crate::host::write_mapped(
+                            (start + at + dirty_start) as *mut u8,
+                            title[dirty_start..].as_ptr(),
+                            dirty_len,
+                        );
+                        written += dirty_len;
                     }
                     synced.push((start + at) / PAGE);
                 }
@@ -499,7 +496,13 @@ impl Shadow {
                 }
                 return copied;
             }
-            self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+            // A sparse shadow spans a 2 GiB chunk that may contain both
+            // watchable mapped/private regions and unmapped holes: one
+            // unwatchable sub-range must not permanently disable watching for
+            // the rest of the chunk.
+            if self.sparse.is_none() {
+                self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+            }
         }
         // shortcut: memory that cannot be watched (unmapped, mostly) is copied
         // once a frame.
@@ -1593,19 +1596,17 @@ impl Shadow {
             if host == old || !crate::host::read_into(at as *const u8, &mut title[..n]) {
                 return;
             }
-            let mut changed = false;
-            for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old.iter_mut()) {
-                if *h != *o && *t != *h {
-                    *t = *h;
-                    changed = true;
-                }
-                *h = *t;
-                *o = *t;
-            }
-            if changed {
-                crate::watch::writing(at, n);
-                crate::host::write_mapped(at as *mut u8, title.as_ptr(), n);
-                written += n;
+            if let Some((dirty_start, dirty_end)) =
+                merge_gpu_writes_mut(&mut title[..n], host, old)
+            {
+                let dirty_len = dirty_end - dirty_start;
+                crate::watch::writing(at + dirty_start, dirty_len);
+                crate::host::write_mapped(
+                    (at + dirty_start) as *mut u8,
+                    title[dirty_start..].as_ptr(),
+                    dirty_len,
+                );
+                written += dirty_len;
             }
         });
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -1615,6 +1616,91 @@ impl Shadow {
         }
         written
     }
+}
+
+/// Merges bytes the GPU changed (`host != old`) into `title`, syncs `host` to
+/// `title`, and returns the tight `[first, last)` byte span where `title` was
+/// modified (or `None` if nothing changed). Scans 8 bytes at a time so
+/// unchanged 64-bit words skip per-byte branching.
+fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &[u8]) -> Option<(usize, usize)> {
+    let n = title.len().min(host.len()).min(old.len());
+    let mut first = usize::MAX;
+    let mut last = 0usize;
+    let mut i = 0;
+    while i + 8 <= n {
+        let hw = u64::from_ne_bytes(host[i..i + 8].try_into().unwrap());
+        let ow = u64::from_ne_bytes(old[i..i + 8].try_into().unwrap());
+        if hw == ow {
+            host[i..i + 8].copy_from_slice(&title[i..i + 8]);
+        } else {
+            for k in i..i + 8 {
+                let h = host[k];
+                if h != old[k] && title[k] != h {
+                    title[k] = h;
+                    first = first.min(k);
+                    last = k + 1;
+                }
+                host[k] = title[k];
+            }
+        }
+        i += 8;
+    }
+    for k in i..n {
+        let h = host[k];
+        if h != old[k] && title[k] != h {
+            title[k] = h;
+            first = first.min(k);
+            last = k + 1;
+        }
+        host[k] = title[k];
+    }
+    (first < last).then_some((first, last))
+}
+
+/// Same as [`merge_gpu_writes`], also updating `old` to match `title`.
+fn merge_gpu_writes_mut(
+    title: &mut [u8],
+    host: &mut [u8],
+    old: &mut [u8],
+) -> Option<(usize, usize)> {
+    let n = title.len().min(host.len()).min(old.len());
+    let mut first = usize::MAX;
+    let mut last = 0usize;
+    let mut i = 0;
+    while i + 8 <= n {
+        let hw = u64::from_ne_bytes(host[i..i + 8].try_into().unwrap());
+        let ow = u64::from_ne_bytes(old[i..i + 8].try_into().unwrap());
+        if hw == ow {
+            let tw = &title[i..i + 8];
+            host[i..i + 8].copy_from_slice(tw);
+            old[i..i + 8].copy_from_slice(tw);
+        } else {
+            for k in i..i + 8 {
+                let h = host[k];
+                if h != old[k] && title[k] != h {
+                    title[k] = h;
+                    first = first.min(k);
+                    last = k + 1;
+                }
+                let t = title[k];
+                host[k] = t;
+                old[k] = t;
+            }
+        }
+        i += 8;
+    }
+    for k in i..n {
+        let h = host[k];
+        if h != old[k] && title[k] != h {
+            title[k] = h;
+            first = first.min(k);
+            last = k + 1;
+        }
+        let t = title[k];
+        host[k] = t;
+        old[k] = t;
+    }
+    (first < last).then_some((first, last))
 }
 
 struct Entry {

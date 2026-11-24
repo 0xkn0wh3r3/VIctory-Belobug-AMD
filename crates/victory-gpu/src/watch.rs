@@ -123,16 +123,24 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
-    if !mapped(start) {
-        return None;
-    }
+    // Fast path: `start` is itself a mapped view. If `start` is an unmapped
+    // hole (common in 2 GiB sparse shadows), jump past leading holes via
+    // `VirtualQuery` to find the first committed page in `[start, end)`.
+    let probe = if mapped(start) {
+        start
+    } else {
+        first_mapped(start, end)?
+    };
+    let check_each = probe != start;
     install();
     let mut g = guards();
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     for block in first..=last {
-        let open = block < last && !g.clean.contains(&block);
+        let open = block < last
+            && !g.clean.contains(&block)
+            && (!check_each || mapped(block * BLOCK));
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
@@ -148,6 +156,33 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
     }
     Some(written)
+}
+
+/// Scans `[start, end)` jumping over unmapped holes; returns the first
+/// committed address if it is a mapped view, or `None` if `[start, end)` has
+/// no committed mapped view (or starts with committed non-view memory).
+fn first_mapped(start: usize, end: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    let mut at = start;
+    while at < end {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: queries our own address space without dereferencing `at`.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 || info.RegionSize == 0 {
+            return None;
+        }
+        if info.State == MEM_COMMIT {
+            return (info.Type == MEM_MAPPED).then_some(at);
+        }
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= at {
+            return None;
+        }
+        at = next;
+    }
+    None
 }
 
 /// Whether the current allocation at `at` is a mapped view. Asking only for
