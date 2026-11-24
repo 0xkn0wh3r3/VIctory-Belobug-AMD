@@ -160,6 +160,21 @@ impl Making {
     }
 }
 
+/// The process's private bytes.
+fn committed() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: a structure of the size passed.
+    unsafe {
+        let mut info: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        let size = size_of_val(&info) as u32;
+        if GetProcessMemoryInfo(GetCurrentProcess(), &mut info, size) == 0 {
+            return 0;
+        }
+        info.PagefileUsage as u64
+    }
+}
+
 /// Workers (threads) lost to compiles that crashed, not replaced yet.
 static LOST: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
@@ -229,7 +244,11 @@ fn suspend(id: u32) -> bool {
 /// (16 GB in two minutes), so their threads are stopped.
 fn endless(name: &str, begins: bool) {
     use std::time::{Duration, Instant};
+    // Some long programs take a while (the upscaler's 10,000 instructions);
+    // what takes memory all along goes first.
     const ENDLESS: Duration = Duration::from_secs(20);
+    const EVEN_SO: Duration = Duration::from_secs(150);
+    const GROWTH: u64 = 3 << 30;
     static AT_WORK: Mutex<Vec<(String, Instant, u32)>> = Mutex::new(Vec::new());
     static WATCH: std::sync::Once = std::sync::Once::new();
     {
@@ -247,6 +266,8 @@ fn endless(name: &str, begins: bool) {
             .name("victory-compiles".into())
             .spawn(|| {
                 let mut noted: Vec<String> = Vec::new();
+                // The process's commit when a compile was first seen late.
+                let mut late: Option<u64> = None;
                 loop {
                     std::thread::sleep(Duration::from_secs(2));
                     let lost = std::mem::take(&mut *LOST.lock().unwrap_or_else(|e| e.into_inner()));
@@ -260,6 +281,24 @@ fn endless(name: &str, begins: bool) {
                         .filter(|w| w.1.elapsed() > ENDLESS && !noted.contains(&w.0))
                         .map(|w| (w.0.clone(), w.2))
                         .collect();
+                    if long.is_empty() {
+                        late = None;
+                        continue;
+                    }
+                    let now = committed();
+                    let grown = now.saturating_sub(*late.get_or_insert(now)) > GROWTH;
+                    let long: Vec<(String, u32)> = if grown {
+                        late = None;
+                        long
+                    } else {
+                        AT_WORK
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .iter()
+                            .filter(|w| w.1.elapsed() > EVEN_SO && !noted.contains(&w.0))
+                            .map(|w| (w.0.clone(), w.2))
+                            .collect()
+                    };
                     for (name, id) in long {
                         let stopped = suspend(id);
                         if stopped {

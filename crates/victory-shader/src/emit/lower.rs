@@ -1065,6 +1065,7 @@ impl<'a> Lower<'a> {
             let whole = |i: &Inst| {
                 let n = i.name();
                 n.contains("permute")
+                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     // Its derivatives are the quad's.
                     || n == "image_sample"
