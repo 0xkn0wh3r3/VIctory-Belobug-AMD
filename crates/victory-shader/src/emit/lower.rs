@@ -352,6 +352,8 @@ impl<'a> Lower<'a> {
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
                     || n.starts_with("v_mbcnt")
+                    // Its derivatives are the quad's.
+                    || n == "image_sample"
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
@@ -1814,6 +1816,19 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// `x` in lane `lane` of the current quad.
+    fn quad_float(&mut self, x: V, lane: u32) -> V {
+        let (f32t, lane) = (self.s.t.f32, self.s.m.i32(lane));
+        self.s.op(
+            self.cur,
+            "quadReadLaneAt.f32",
+            Attr::NoUnwind,
+            f32t,
+            122,
+            &[x, lane],
+        )
+    }
+
     /// Component `c` of the thread id in the group. With console lanes, the
     /// thread is relabelled so that its host lane is its console lane: the
     /// flat id is the wave's first lane's, rounded down to the wave size,
@@ -2870,8 +2885,9 @@ impl<'a> Lower<'a> {
                     _ => None,
                 })
             });
-        let Some((at, first)) = use_at else {
-            return Err("a descriptor read only as data");
+        let (at, first) = match use_at {
+            Some(x) => x,
+            None => (self.sibling_use(site)?, 0),
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
@@ -2975,6 +2991,89 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Where the program uses, as an image, what another load of whole
+    /// image descriptors reads from the same table entry, at the same
+    /// computed index if any, as the load at `site`: a size is often read
+    /// through a load of its own (in a loop over the indices lanes hold).
+    /// Only if every such use agrees on the view's kind.
+    fn sibling_use(&self, site: Site) -> Result<Site, Why> {
+        const WHY: Why = "a descriptor read only as data";
+        let whole = |s: Site| {
+            let inst = self.x.p.blocks[s.0].insts.get(s.1);
+            inst.is_some_and(|i| i.name() == "s_load_dwordx8")
+        };
+        let own = *self.scalar.get(&site).ok_or(WHY)?;
+        if !whole(site) {
+            return Err(WHY);
+        }
+        let index = own.dynamic.map(|v| self.lane_index_of(v));
+        let mut found: Option<(Site, u8)> = None;
+        for d in &self.x.res.descriptors {
+            let same = d.role == Role::Resource
+                && d.source.leaves().into_iter().any(|l| match *l {
+                    Source::Loaded { load, first: 0 } if whole(load) => {
+                        self.scalar.get(&load).is_some_and(|a| {
+                            (a.param, a.offset) == (own.param, own.offset)
+                                && a.dynamic.map(|v| self.lane_index_of(v)) == index
+                        })
+                    }
+                    _ => false,
+                });
+            if !same {
+                continue;
+            }
+            let user = &self.x.p.blocks[d.site.0].insts[d.site.1];
+            let Fields::Image { dim, .. } = user.fields else {
+                return Err(WHY);
+            };
+            let name = user.name();
+            if name.contains("store") || name.contains("atomic") {
+                return Err(WHY);
+            }
+            match found {
+                Some((_, kind)) if kind != dim => return Err(WHY),
+                Some(_) => {}
+                None => found = Some((d.site, dim)),
+            }
+        }
+        found.map(|f| f.0).ok_or(WHY)
+    }
+
+    /// The per-lane value a scalar index is one lane's copy of, through
+    /// copies and shifts by a constant; itself if none. Two loops over the
+    /// same per-lane index each take their own copies.
+    fn lane_index_of(&self, v: Value) -> (Value, Vec<(&'static str, u8)>) {
+        let (mut v, mut steps) = (v, Vec::new());
+        for _ in 0..8 {
+            let Some(inst) = self.writer(v) else { break };
+            let Fields::Valu(f) = &inst.fields else { break };
+            let (source, step) = match (inst.name(), &f.src[..]) {
+                ("v_readfirstlane_b32", [op]) => (op, None),
+                ("v_mov_b32", [op]) if f.sdwa.is_none() && f.dpp.is_none() => (op, None),
+                ("v_lshlrev_b32", [Operand::Const(c), op])
+                    if f.sdwa.is_none() && f.dpp.is_none() =>
+                {
+                    (op, Some(("shl", *c)))
+                }
+                _ => break,
+            };
+            let Operand::Vector { reg, .. } = *source else { break };
+            let Some(next) = inst.read(Reg::V(reg)) else { break };
+            v = next;
+            steps.extend(step);
+        }
+        (v, steps)
+    }
+
+    /// The instruction that writes `v`.
+    fn writer(&self, v: Value) -> Option<&'a Inst> {
+        let block = *self.def_block.get(&v)?;
+        self.x.p.blocks[block]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == v))
     }
 
     /// `s_load_dword*` from the program's constant table.
@@ -5569,6 +5668,31 @@ impl<'a> Lower<'a> {
             let mut args = vec![h, sh];
             args.extend(&cs);
             match op {
+                // Compute has no implicit derivatives on the host; the
+                // console takes them from the quad of lanes all the same.
+                60 if self.s.threads.is_some() => {
+                    self.cross_lane(true)?;
+                    let n = if kind == 5 { 3 } else { spatial };
+                    let mut g = vec![fu; 6];
+                    for k in 0..n {
+                        let base = self.quad_float(cs[k], 0);
+                        let x = self.quad_float(cs[k], 1);
+                        let y = self.quad_float(cs[k], 2);
+                        g[k] = self.s.m.bin(c, Bin::Sub, x, base);
+                        g[3 + k] = self.s.m.bin(c, Bin::Sub, y, base);
+                    }
+                    args.extend(&os);
+                    args.extend(g);
+                    args.push(fu);
+                    self.s.op(
+                        c,
+                        "sampleGrad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        63,
+                        &args,
+                    )
+                }
                 60 => {
                     args.extend(&os);
                     args.push(fu);
