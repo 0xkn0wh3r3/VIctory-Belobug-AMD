@@ -529,16 +529,51 @@ impl Shadow {
             static READ: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0; PAGE]);
         }
         let mut bytes = 0;
-        self.each_tile(s, from, to, |at, data, n| {
+        // The title's unmapped memory found last: tiles of it have no memory
+        // here either (reads give zeros). Tens of thousands of tiles a frame
+        // were zeros copied, 1.4 GB of them.
+        let mut hole = 0..0;
+        let mut at = from;
+        while at < to {
+            let n = (PAGE - at % PAGE).min(to - at);
+            let next = at + n;
             let tile = ((at - self.start as usize) / PAGE) as u32;
+            let whole = at - at % PAGE..at - at % PAGE + PAGE;
             let look = {
                 let mut looks = s.looks.lock().unwrap_or_else(|e| e.into_inner());
                 looks.entry(tile).or_default().clone()
             };
             let mut look = look.lock().unwrap_or_else(|e| e.into_inner());
-            if lazy && n == PAGE && frame < look.next {
-                return;
+            if lazy && n == PAGE && frame < look.next || look.hole && frame < look.next {
+                at = next;
+                continue;
             }
+            if !(hole.contains(&whole.start) && whole.end <= hole.end) {
+                hole = match unmapped(whole.start) {
+                    Some(end) => whole.start..end,
+                    None => 0..0,
+                };
+            }
+            if whole.start >= hole.start && whole.end <= hole.end {
+                if !look.hole {
+                    look.hole = true;
+                    look.blocks = [0; PAGE / BLOCK];
+                    let tiles = s.tiles.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(t) = tiles.get(&tile) {
+                        // SAFETY: the tile's mapping.
+                        unsafe { std::ptr::write_bytes(t.data as *mut u8, 0, PAGE) };
+                    }
+                }
+                look.next = frame + 2 + u64::from(tile) % 2;
+                at = next;
+                continue;
+            }
+            look.hole = false;
+            let Some(data) = self.tile(s, at) else {
+                at = next;
+                continue;
+            };
+            let data = (data + at % PAGE) as *mut u8;
             bytes += n;
             let mut same = true;
             READ.with_borrow_mut(|read| {
@@ -577,7 +612,8 @@ impl Shadow {
                 };
                 look.next = frame + wait;
             }
-        });
+            at = next;
+        }
         bytes
     }
 
@@ -875,9 +911,58 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
     Some(window)
 }
 
+/// Where the unmapped title memory `address` is in ends, if it is.
+fn unmapped(address: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+    };
+    // SAFETY: the query looks at an address and fills a local structure.
+    unsafe {
+        let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        let size = size_of_val(&info);
+        if VirtualQuery(address as *const _, &mut info, size) != size {
+            return Some((address | (CHUNK as usize - 1)) + 1);
+        }
+        (info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS)
+            .then(|| info.BaseAddress as usize + info.RegionSize)
+    }
+}
+
+/// Tiles of `[start, end)` known to have no title memory are looked at again.
+fn filled(start: u64, end: u64) {
+    let over: Vec<Arc<Shadow>> = SPARSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(chunk, _)| *chunk * CHUNK < end && start < (*chunk + 1) * CHUNK)
+        .filter_map(|(_, s)| s.clone())
+        .collect();
+    for root in over {
+        let Some(s) = &root.sparse else { continue };
+        let page = PAGE as u64;
+        let first = (start.max(root.start) - root.start) / page;
+        let last = (end.min(root.start + root.len) - root.start).div_ceil(page);
+        for tile in first..last {
+            let look = s
+                .looks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(tile as u32))
+                .cloned();
+            if let Some(look) = look {
+                // Being copied now: it is looked at again soon anyway.
+                if let Ok(mut look) = look.try_lock() {
+                    look.next = 0;
+                }
+            }
+        }
+    }
+}
+
 /// The title mapped or unmapped memory in `[start, end)`.
 pub(crate) fn remapped(start: u64, end: u64) {
     use windows::core::Interface;
+    filled(start, end);
     let mut map = windows_of_memory();
     if map.is_empty() {
         return;
@@ -976,6 +1061,8 @@ struct Look {
     /// changed.
     next: u64,
     still: u32,
+    /// The title has no memory there.
+    hole: bool,
     /// A hash of each [`BLOCK`] as last copied (0: not known).
     blocks: [u64; PAGE / BLOCK],
 }
@@ -985,6 +1072,7 @@ impl Default for Look {
         Look {
             next: 0,
             still: 0,
+            hole: false,
             blocks: [0; PAGE / BLOCK],
         }
     }
