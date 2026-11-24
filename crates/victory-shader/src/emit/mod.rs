@@ -94,6 +94,8 @@ mod opcode_audit;
 #[cfg(all(test, windows))]
 mod opcode_tests;
 mod sampler;
+#[cfg(all(test, windows))]
+mod scratch_tests;
 mod shader;
 mod threading;
 #[cfg(windows)]
