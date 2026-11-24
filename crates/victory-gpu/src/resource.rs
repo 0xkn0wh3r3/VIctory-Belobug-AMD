@@ -1158,6 +1158,14 @@ pub(crate) fn placed_epoch() -> u64 {
     PLACED_EPOCH.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Runs `f` if `texture` is a placed texture alive now, keeping it so: it
+/// is not evicted until `f` returns (`f` must not make placed textures).
+#[cfg(windows)]
+pub(crate) fn with_placed<R>(texture: This, f: impl FnOnce() -> R) -> Option<R> {
+    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    map.values().any(|&(r, _)| r == texture as usize).then(f)
+}
+
 /// The placed textures alive now (resource objects).
 #[cfg(windows)]
 pub(crate) fn placed_live() -> std::collections::HashSet<usize> {

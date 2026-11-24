@@ -393,6 +393,19 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     buffers().remove(&(start, resource));
 }
 
+/// Whether a title buffer holds `[address, address + len)` (its memory is
+/// the title's, without asking the kernel).
+pub(crate) fn in_buffer(address: u64, len: u64) -> bool {
+    let Some(end) = address.checked_add(len.max(1)) else {
+        return false;
+    };
+    buffers()
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .any(|(_, e)| e.end >= end)
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {

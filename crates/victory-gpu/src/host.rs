@@ -412,9 +412,6 @@ struct Deferred {
     /// and whether any of their shaders may write memory: their slots are
     /// brought up to date once per submission, after every other step.
     bindless: Vec<(std::sync::Arc<crate::descriptor::host::HostHeap>, bool)>,
-    /// Incremented whenever a deferred step may write title memory (`Copy` or
-    /// `Run`), invalidating per-list bindless preparation caches.
-    copy_epoch: u64,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -1038,7 +1035,6 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
-        deferred.copy_epoch += 1;
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -1169,12 +1165,6 @@ impl HostList {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.refreshed.clear();
-        deferred.copy_epoch += 1;
-    }
-
-    /// Epoch of title-memory-writing steps recorded into this list so far.
-    pub(crate) fn title_write_epoch(&self) -> u64 {
-        self.deferred().copy_epoch
     }
 
     /// Queues submission-time materialization and refresh of the bindless
