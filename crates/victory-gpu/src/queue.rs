@@ -342,6 +342,14 @@ fn show(resource: Option<object::Held>) {
     if crate::capture::listed(frame) {
         crate::capture::dump_targets(frame);
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(target) = crate::capture::present_override(frame)
+        && let Some(host) = crate::host::host()
+    {
+        let state = crate::host::legal_state(&target.texture, target.state.load(Ordering::Relaxed));
+        host.present(&target.texture, state, frame);
+        return;
+    }
     #[cfg(windows)]
     if let Some(resource) = resource.as_ref().map(object::Held::get)
         && let Some(texture) = crate::resource::host_resource(resource)
@@ -510,7 +518,9 @@ fn apply_page_mappings(map: crate::resource::PageMapper, pool: u64, ops: &[PageO
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        ONCE.call_once(|| {
+            tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed")
+        });
     }
 }
 
