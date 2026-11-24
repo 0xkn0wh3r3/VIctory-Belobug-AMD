@@ -391,17 +391,47 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
+    if blocks.is_empty() {
+        return false;
+    }
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
     }
-    if !blocks.is_empty() {
-        bump_region_epochs(start, end);
+    // Coalesce contiguous blocks into a single VirtualProtect call to minimize
+    // kernel transitions and multi-core TLB shootdowns.
+    let mut run_start = blocks[0];
+    let mut run_end = run_start + 1;
+    for &block in &blocks[1..] {
+        if block == run_end {
+            run_end = block + 1;
+        } else {
+            let mut old = 0;
+            // SAFETY: blocks we made read-only.
+            unsafe {
+                VirtualProtect(
+                    (run_start * BLOCK) as *const _,
+                    (run_end - run_start) * BLOCK,
+                    PAGE_READWRITE,
+                    &mut old,
+                );
+            }
+            run_start = block;
+            run_end = block + 1;
+        }
     }
-    !blocks.is_empty()
+    let mut old = 0;
+    // SAFETY: blocks we made read-only.
+    unsafe {
+        VirtualProtect(
+            (run_start * BLOCK) as *const _,
+            (run_end - run_start) * BLOCK,
+            PAGE_READWRITE,
+            &mut old,
+        );
+    }
+    bump_region_epochs(start, end);
+    true
 }
 
 /// Before our own write into title memory `[at, at + len)` through the

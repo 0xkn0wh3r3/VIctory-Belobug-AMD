@@ -24,6 +24,10 @@ enum Memory {
     Upload(ID3D12Resource, usize),
 }
 
+// SAFETY: D3D12 heaps and resources are free-threaded; the CPU pointer is
+// only metadata for the owning slab and is never dereferenced on drop.
+unsafe impl Send for Memory {}
+
 /// Slot size, and whether for staging, to slabs of such slots.
 type Slabs = BTreeMap<(u64, bool), Vec<Slab>>;
 static SLABS: Mutex<Slabs> = Mutex::new(BTreeMap::new());
@@ -37,12 +41,21 @@ pub(crate) struct Slot {
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        let mut slabs = SLABS.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(s) = slabs.get_mut(&self.size).and_then(|v| v.get_mut(self.heap)) {
-            s.free.push(self.index);
-            if s.free.len() == s.slots as usize {
-                s.memory = None;
+        let retired = {
+            let mut slabs = SLABS.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(s) = slabs.get_mut(&self.size).and_then(|v| v.get_mut(self.heap)) {
+                s.free.push(self.index);
+                if s.free.len() == s.slots as usize {
+                    s.memory.take()
+                } else {
+                    None
+                }
+            } else {
+                None
             }
+        };
+        if let Some(mem) = retired {
+            crate::host::retire(mem);
         }
     }
 }

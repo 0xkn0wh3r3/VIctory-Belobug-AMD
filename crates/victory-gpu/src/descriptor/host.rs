@@ -34,6 +34,10 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
+    /// Owning `HostTexture` (and its `texpool::Slot` / `ID3D12Heap`) for any
+    /// slot viewing a pooled texture, so the backing heap cannot be freed while
+    /// a shader-visible descriptor slot still points into it.
+    kept_textures: Mutex<HashMap<u32, Arc<crate::resource::HostTexture>>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -118,6 +122,11 @@ impl Drop for HostHeap {
         if let Ok(mut kept) = self.kept.lock() {
             for res in kept.drain(..).flatten() {
                 crate::host::retire(res);
+            }
+        }
+        if let Ok(mut texs) = self.kept_textures.lock() {
+            for (_, tex) in texs.drain() {
+                crate::host::retire(tex);
             }
         }
     }
@@ -606,6 +615,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
+            kept_textures: Mutex::default(),
             next: Mutex::new((0, vec![false; extra as usize])),
             strides,
             bindless: Mutex::default(),
@@ -801,7 +811,7 @@ impl HostHeap {
                 null_for(view, self.cpu(index));
             }
         }
-        self.keep(index, kept.flatten());
+        self.keep_with_view(index, kept.flatten(), view);
         self.set_stride(index, if ok { view_stride(view) } else { 0 });
     }
 
@@ -866,6 +876,29 @@ impl HostHeap {
     /// previously viewed resource is retired rather than dropped inline so an
     /// in-flight GPU submission reading that slot cannot fault on freed memory.
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        self.keep_owner(index, resource, None);
+    }
+
+    fn keep_with_view(&self, index: u32, resource: Option<ID3D12Resource>, view: &View) {
+        let tex = if resource.is_some() {
+            match view {
+                View::Shader(r, _) | View::Unordered(r, _, _) => {
+                    crate::resource::host_copy(*r as crate::object::This)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        self.keep_owner(index, resource, tex);
+    }
+
+    fn keep_owner(
+        &self,
+        index: u32,
+        resource: Option<ID3D12Resource>,
+        texture: Option<Arc<crate::resource::HostTexture>>,
+    ) {
         // A running submission may still read the old resource through
         // this slot; it is retired outside the lock.
         let old = {
@@ -873,8 +906,18 @@ impl HostHeap {
             kept.get_mut(index as usize)
                 .and_then(|slot| std::mem::replace(slot, resource))
         };
+        let old_tex = {
+            let mut texs = self.kept_textures.lock().unwrap_or_else(|e| e.into_inner());
+            match texture {
+                Some(t) => texs.insert(index, t),
+                None => texs.remove(&index),
+            }
+        };
         if let Some(old) = old {
             crate::host::retire(old);
+        }
+        if let Some(old_tex) = old_tex {
+            crate::host::retire(old_tex);
         }
     }
 
@@ -977,7 +1020,7 @@ impl HostHeap {
                 if kept.is_none() && !self.sampler {
                     null_for(&view, self.cpu(index));
                 }
-                self.keep(index, kept.flatten());
+                self.keep_with_view(index, kept.flatten(), &view);
                 // The stride is the title view's, however and whenever the
                 // host view is made.
                 self.set_stride(index, view_stride(&view));
@@ -1083,7 +1126,7 @@ impl HostHeap {
             } else {
                 made[index as usize] = key;
             }
-            self.keep(index, kept.flatten());
+            self.keep_with_view(index, kept.flatten(), shader_view);
             self.set_stride(index, 0);
         }
     }

@@ -76,6 +76,14 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
+impl Drop for Staging {
+    fn drop(&mut self) {
+        // Retire the upload buffer and its texpool slot so an in-flight GPU
+        // submission or async copy cannot fault on freed staging memory.
+        crate::host::retire((self.buffer.clone(), self._slot.take()));
+    }
+}
+
 /// Textures found changed since they were uploaded: by chance (looked at
 /// again when their turn came), and because the runtime wrote them.
 pub(crate) static CHANGED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];

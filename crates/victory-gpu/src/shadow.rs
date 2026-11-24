@@ -379,6 +379,7 @@ impl Shadow {
             // submission, title memory read only where the GPU wrote.
             // An unchanged page is never modified by copy-back, so later
             // overlapping ranges can skip it for the rest of the submission.
+            let mode = self.watched.load(Ordering::Relaxed);
             let mut title: Option<Vec<u8>> = None;
             let mut synced = Vec::new();
             let mut at = from;
@@ -402,7 +403,9 @@ impl Shadow {
                             merge_gpu_writes(title_slice, host, old)
                         {
                             let dirty_len = dirty_end - dirty_start;
-                            crate::watch::writing(start + at + dirty_start, dirty_len);
+                            if mode == WATCHED_GUARDED {
+                                crate::watch::writing(start + at + dirty_start, dirty_len);
+                            }
                             crate::host::write_mapped(
                                 (start + at + dirty_start) as *mut u8,
                                 title_slice[dirty_start..].as_ptr(),
@@ -422,7 +425,6 @@ impl Shadow {
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-            let mode = self.watched.load(Ordering::Relaxed);
             if first < last && !synced.is_empty() && mode != NOT_WATCHED {
                 let res = if mode == WATCHED_GUARDED {
                     crate::watch::writes_guarded(first * PAGE, last * PAGE)

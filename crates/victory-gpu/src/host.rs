@@ -97,7 +97,7 @@ static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// is not enough on its own. Ages are in frames presented to the host, not
 /// the title's 60 Hz clock (which ticks many times per host frame while
 /// the host runs at 1-2 fps).
-const KEEP_FRAMES: u64 = 8;
+const KEEP_FRAMES: u64 = 32;
 
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired {
