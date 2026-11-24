@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::mem::offset_of;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
+use crate::object::{self, E_INVALIDARG, E_NOTIMPL, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
 const PIPELINE_IIDS: [Iid; 4] = [
@@ -232,10 +232,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
             })
     });
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let programs = match c.part(FourCC::DXIL) {
-        Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
-        None => Vec::new(),
-    };
+    let programs = victory_shader::container_programs(&c).unwrap_or_default();
     let writes_memory = programs.is_empty() || programs.iter().any(writes_memory);
     let (used, native_heap) = programs
         .into_iter()
@@ -488,8 +485,25 @@ pub(crate) extern "system" fn create_compute(
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    let shader = copy("compute", &desc.stage);
+    // A container of another compiler's code only (`ACCC`: Grand Theft Auto
+    // VI's upscaler passes) does not run here: the title is told, and does
+    // without (`VICTORY_ACCC=1` takes them, their dispatches are dropped).
+    #[cfg(windows)]
+    if let Some(s) = &shader
+        && victory_shader::Container::parse(&s.container)
+            .is_ok_and(|c| c.part(victory_shader::FourCC::DXIL).is_none())
+        && std::env::var("VICTORY_ACCC").as_deref() == Ok("0")
+    {
+        tracing::warn!(hash = %s.hash, "a compute pipeline without DXIL is not made");
+        if !out.is_null() {
+            // SAFETY: the title's out pointer.
+            unsafe { *out = std::ptr::null() };
+        }
+        return E_NOTIMPL;
+    }
     hand_out(
-        copy("compute", &desc.stage).into_iter().collect(),
+        shader.into_iter().collect(),
         #[cfg(windows)]
         None,
         iid,

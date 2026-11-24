@@ -11,7 +11,7 @@ use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
-    Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
+    Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir,
 };
 use victory_shader::{io, resource};
 
@@ -333,14 +333,18 @@ fn translate(
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
+    let Some(dxil) = container
+        .part(FourCC::DXIL)
+        .or_else(|| container.part(FourCC::ACCC))
+        .map(|p| p.data)
+    else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
     if !lock(seen).insert(blake3::hash(dxil)) {
         t.duplicates += 1;
         return;
     }
-    let programs = match native_programs(dxil) {
+    let programs = match victory_shader::container_programs(&container) {
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
