@@ -438,6 +438,22 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     entry.shadow.clone()
 }
 
+/// The copy holding `address` for a view without a size (a root view, which
+/// the host does not bound): in memory outside buffers, one with at least
+/// `reach` bytes after `address`. A window ending sooner than the data read
+/// through the view is a GPU page fault.
+pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
+    let in_buffer = buffers()
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .any(|(_, e)| e.end > address);
+    if in_buffer {
+        return find(address, 1);
+    }
+    loose(address, address.checked_add(reach)?)
+}
+
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches.
