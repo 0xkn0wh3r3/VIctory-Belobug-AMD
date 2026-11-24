@@ -1006,7 +1006,10 @@ impl State {
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+                Some(p) => why(&format!(
+                    "prepare failed (topology {}, vertex slots {:#x}, {})",
+                    self.topology, p.slots, p.name
+                )),
             }
             return false;
         }
