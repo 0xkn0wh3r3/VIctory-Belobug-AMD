@@ -81,6 +81,11 @@ static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 /// loading the world commits gigabytes of them.
 static STAGED: AtomicU64 = AtomicU64::new(0);
 
+/// Bytes of the texture staging buffers kept.
+pub(crate) fn staged_bytes() -> u64 {
+    STAGED.load(Ordering::Relaxed)
+}
+
 /// Texture uses so far: the clock of [`Staging::used`].
 static USES: AtomicU64 = AtomicU64::new(0);
 

@@ -65,6 +65,12 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
+/// Bytes of the snapshot memory kept for reuse.
+pub(crate) fn pool_bytes() -> u64 {
+    let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    pool.iter().map(|v| v.capacity() as u64).sum()
+}
+
 /// Bytes the pool keeps at most: snapshots of the world's 174 MB heap
 /// would otherwise keep 8 of that size (1.4 GB of host memory) for good.
 const POOL_BYTES: usize = 512 << 20;
@@ -91,6 +97,15 @@ unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
 
+impl Drop for Shadow {
+    fn drop(&mut self) {
+        // SAFETY: a live resource.
+        let bytes = unsafe { self.buffer.GetDesc() }.Width;
+        crate::memstat::sub(&crate::memstat::SHADOWS, bytes);
+        crate::memstat::sub(&crate::memstat::SHADOW_COUNT, 1);
+    }
+}
+
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
@@ -116,6 +131,10 @@ impl Shadow {
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
+        // SAFETY: a live resource.
+        let bytes = unsafe { buffer.GetDesc() }.Width;
+        crate::memstat::add(&crate::memstat::SHADOWS, bytes);
+        crate::memstat::add(&crate::memstat::SHADOW_COUNT, 1);
         Shadow {
             buffer,
             data,
@@ -163,7 +182,8 @@ impl Shadow {
             .push((address, address + len));
         let (from, to) = self.inside(address, len);
         // SAFETY: inside the mapping.
-        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+        let host =
+            |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (start, end) = match &*before {
             Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
@@ -401,16 +421,25 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     buffers().remove(&(start, resource));
 }
 
-/// The copy of the innermost title buffer holding `[address, address +
-/// len)`, made on first use.
+/// The copy of a title buffer holding `[address, address + len)`: of one
+/// whose copy is made already if there is one (a buffer inside another,
+/// say in the world's 174 MB heap, then shares its copy instead of paying
+/// for its bytes twice, and the GPU's writes land in one copy), else of
+/// the innermost, made now.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
-    let key = map
+    let holding: Vec<((u64, usize), bool)> = map
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
-        .find(|(_, e)| e.end >= end)
+        .filter(|(_, e)| e.end >= end)
+        .map(|(k, e)| (*k, e.shadow.is_some()))
+        .collect();
+    let key = holding
+        .iter()
+        .find(|(_, made)| *made)
+        .or(holding.first())
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
@@ -457,8 +486,16 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = map.get(&(start, len)) {
-        return Some(shadow.clone());
+    // Any window copied already that holds the range: a range crossing a
+    // window's end used to get a second copy of the same bytes.
+    if let Some(shadow) = map
+        .range(..=(start, u64::MAX))
+        .rev()
+        .take(64)
+        .find(|((s, l), _)| *s <= address && s + l >= end)
+        .map(|(_, shadow)| shadow.clone())
+    {
+        return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
