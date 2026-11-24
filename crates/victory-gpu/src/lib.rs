@@ -35,12 +35,15 @@ pub mod list;
 #[cfg(windows)]
 mod memwait;
 mod timeline;
+pub mod memstat;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod rects;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -57,5 +60,6 @@ mod watch;
 
 #[cfg(windows)]
 pub use host::on_failure;
+pub use memstat::report as memory_report;
 #[cfg(windows)]
 pub use watch::{title_memory_remapped, writing as kernel_will_write};
