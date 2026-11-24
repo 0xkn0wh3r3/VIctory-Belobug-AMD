@@ -561,7 +561,9 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
                 t.constant += 1;
                 None
             }
-            resource::Source::Phi { .. } => unreachable!("leaves are no phis"),
+            resource::Source::Phi { .. } | resource::Source::Select { .. } => {
+                unreachable!("leaves are no phis or selects")
+            }
         };
         // Heaps hold dynamic resources, which no used entry lists; code
         // tables are no root parameter.
