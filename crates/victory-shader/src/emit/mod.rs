@@ -449,4 +449,123 @@ mod tests {
         v.validate(&mut c).unwrap();
         assert_eq!(c[4..20], ours[..], "our hash differs from the validator's");
     }
+
+    #[test]
+    fn med3_uses_dxil_isnan_for_nan_operands() {
+        // Synthetic GFX10 compute shader: takes three f32 inputs in root
+        // constants s0..s2, loads a raw buffer UAV descriptor from table slot 0
+        // (s4..s5), computes v_med3_f32 v0, v1, v2, v3, and stores v0 at offset 0.
+        let words: [u32; 10] = [
+            // s_mov_b32 s5, 0 (high half of the 32-bit descriptor table address in s4)
+            0xBE80_0000 | 5 << 16 | 0x03 << 8 | 0x80,
+            // s_load_dwordx4 s[8:11], s[4:5], 0 (soffset = null)
+            0x3D << 26 | 0x02 << 18 | 8 << 6 | (4 >> 1),
+            125 << 25,
+            // v_mov_b32 v1, s0; v_mov_b32 v2, s1; v_mov_b32 v3, s2
+            0x7E00_0000 | 1 << 17 | 0x01 << 9,
+            0x7E00_0000 | 2 << 17 | 0x01 << 9 | 1,
+            0x7E00_0000 | 3 << 17 | 0x01 << 9 | 2,
+            // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
+            0x35 << 26 | 0x157 << 16,
+            257 | (258 << 9) | (259 << 18),
+            // buffer_store_dword v0, off, s[8:11], 0 offset:0
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | (8 >> 2) << 16,
+        ];
+        let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        code.extend_from_slice(&0xBF81_0000u32.to_le_bytes()); // s_endpgm
+        let native = crate::native::NativeProgram {
+            stage: crate::HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                crate::native::RootParam {
+                    root: crate::native::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 3,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::native::RootParam {
+                    root: crate::native::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![crate::native::UsedResource {
+                kind: crate::native::ResourceType::Uav,
+                root: crate::native::RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                threads: [1, 1, 1],
+                rsrc2: 0,
+            }),
+            code,
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let bytes = crate::dxbc::build(&[]);
+        let c = crate::dxbc::Container::parse(&bytes).unwrap();
+        let host_shader = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        assert!(!host_shader.dxil.is_empty());
+        #[cfg(windows)]
+        {
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut host_shader.dxil.clone()).unwrap();
+            }
+            if let Ok(host) = super::host::Host::new(false) {
+                let (root, pso) = host.compute_pipeline(&host_shader).unwrap();
+                let nan = f32::NAN.to_bits();
+                let cases = [
+                    ([1.0f32.to_bits(), 2.0f32.to_bits(), nan], 1.0f32),
+                    ([nan, 1.0f32.to_bits(), 0.0f32.to_bits()], 0.0f32),
+                    ([2.0f32.to_bits(), nan, 1.0f32.to_bits()], 1.0f32),
+                    ([nan, 5.0f32.to_bits(), nan], 5.0f32),
+                ];
+                for ([a, b, d_in], want) in cases {
+                    let mut ud = vec![0u32; host_shader.user_data.len().max(6)];
+                    for (i, u) in host_shader.user_data.iter().enumerate() {
+                        if u.slot == 0 {
+                            ud[i] = match u.dword {
+                                0 => a,
+                                1 => b,
+                                2 => d_in,
+                                _ => 0,
+                            };
+                        }
+                    }
+                    let d = super::host::Dispatch {
+                        roots: vec![(0, super::host::Root::Constants(ud))],
+                        views: &[super::host::View::RawUav(1)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    };
+                    let out = host.dispatch(&root, &pso, &d).unwrap();
+                    assert_eq!(
+                        f32::from_bits(out[0][0]),
+                        want,
+                        "v_med3_f32({:?}, {:?}, {:?}) got {:#010x}, want {want}",
+                        f32::from_bits(a),
+                        f32::from_bits(b),
+                        f32::from_bits(d_in),
+                        out[0][0],
+                    );
+                }
+            }
+        }
+    }
 }
