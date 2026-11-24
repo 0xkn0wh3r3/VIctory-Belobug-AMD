@@ -873,3 +873,56 @@ fn mask_grown_inside_a_branch_counted_after_it() {
     let got: Vec<u32> = out[0][..64].to_vec();
     assert!(got.iter().all(|&x| x == 32), "lanes counted: {got:?}");
 }
+
+/// Nested divergent loops with a scalar counter in the inner one: the wave
+/// runs 4 outer iterations, and in each the inner loop runs until its
+/// longest lane (4 iterations) is done, so every lane reads 16.
+#[test]
+fn scalar_counted_in_nested_divergent_loops() {
+    let body = [
+        0x7E14_0300, // v_mov_b32 v10, v0
+        0x3602_0083, // v_and_b32 v1, 3, v0          outer count - 1
+        0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+        0x2C08_0084, // v_lshrrev_b32 v4, 4, v0      inner count - 1
+        0x4A08_0881, // v_add_nc_u32 v4, 1, v4
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0xBE82_0480, // s_mov_b64 s[2:3], 0
+        0xBE8C_0480, // outer: s_mov_b64 s[12:13], 0
+        0x7E06_0304, // v_mov_b32 v3, v4
+        0x8106_8106, // inner: s_add_i32 s6, s6, 1
+        0x4E06_0681, // v_subrev_nc_u32 v3, 1, v3
+        0x7D84_0680, // v_cmp_eq_u32 vcc, 0, v3
+        0x888C_0C6A, // s_or_b64 s[12:13], vcc, s[12:13]
+        0x8AFE_0C7E, // s_andn2_b64 exec, exec, s[12:13]
+        0xBF89_FFFA, // s_cbranch_execnz inner
+        0x88FE_0C7E, // s_or_b64 exec, exec, s[12:13]
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+        0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+        0xBF89_FFF2, // s_cbranch_execnz outer
+        0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+        0x7E00_0206, // v_mov_b32 v0, s6
+    ];
+    let shader = build_lanes_cs(&body).unwrap_or_else(|e| panic!("translation: {e}"));
+    let host = Host::new(false).unwrap();
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch");
+    let got: Vec<u32> = out[0][..64].to_vec();
+    assert!(
+        got.iter().all(|&x| x == 16),
+        "inner iterations counted: {got:?}"
+    );
+}
