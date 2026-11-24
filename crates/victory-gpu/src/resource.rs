@@ -842,7 +842,7 @@ pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// What the driver allocates for it (counted in [`crate::memstat`]).
-    bytes: u64,
+    pub(crate) bytes: u64,
 }
 
 #[cfg(windows)]
