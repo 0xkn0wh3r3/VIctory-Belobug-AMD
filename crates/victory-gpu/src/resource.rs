@@ -1963,6 +1963,37 @@ mod tests {
         };
         copy(list, &crop_loc, 0, 0, 0, &tex_loc, &crop_box);
 
+        // Both a source box and a whole subresource can fill only part of a footprint.
+        let larger = PlacedFootprint {
+            width: 6,
+            height: 6,
+            row_pitch: 24,
+            ..full_rows
+        };
+        let partials = [(full_rows, 0, 0, Some(crop_box)), (larger, 1, 1, None)].map(
+            |(footprint, x, y, region)| {
+                let size = u64::from(footprint.row_pitch) * u64::from(footprint.height);
+                let mut output = null;
+                assert_eq!(
+                    create_committed(
+                        null, &PROPERTIES, 0, &buffer(size), 0, null.cast(), iid, &mut output,
+                    ),
+                    S_OK
+                );
+                let (data, len) = buffer_bytes(output).unwrap();
+                // SAFETY: fill this mapped destination before the GPU copy.
+                unsafe { data.write_bytes(0xa5, len as usize) };
+                let dst = Location {
+                    resource: output,
+                    kind: 1,
+                    footprint,
+                };
+                let src_box = region.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
+                copy(list, &dst, x, y, 0, &tex_loc, src_box);
+                (output, footprint, x, y, region)
+            },
+        );
+
         // 5) Console formats 118..=120 (3 B/texel) map to 4-byte PC formats
         // (45..=47): skipped cleanly without breaking Close() or touching dst.
         let mut dst_d16s8 = null;
@@ -2022,6 +2053,30 @@ mod tests {
         // SAFETY: dst_d16s8 holds 1024 bytes.
         let d16 = unsafe { std::slice::from_raw_parts(d16_ptr, 1024) };
         assert!(d16.iter().all(|&b| b == 0), "mismatched format 118 buffer touched");
+
+        for (output, footprint, dst_x, dst_y, region) in partials {
+            let [left, top, _, right, bottom, _] = region.unwrap_or([0, 0, 0, 4, 4, 1]);
+            let (data, len) = buffer_bytes(output).unwrap();
+            // SAFETY: the destination is still mapped after the submission.
+            let pixels = unsafe { std::slice::from_raw_parts(data, len as usize) };
+            for y in 0..footprint.height {
+                for x in 0..footprint.width {
+                    let at = (y * footprint.row_pitch + x * 4) as usize;
+                    let expected: &[u8] = if (dst_x..dst_x + (right - left)).contains(&x)
+                        && (dst_y..dst_y + (bottom - top)).contains(&y)
+                    {
+                        let src_at = ((top + y - dst_y) * 256 + (left + x - dst_x) * 4) as usize;
+                        &up[src_at..src_at + 4]
+                    } else {
+                        &[0xa5; 4]
+                    };
+                    assert_eq!(
+                        &pixels[at..at + 4], expected,
+                        "pixel ({x}, {y}) in {footprint:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
