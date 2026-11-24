@@ -37,6 +37,16 @@ pub(crate) struct HostHeap {
     /// Populated buffer, constant-buffer, and placed-texture slots (`< count`)
     /// tracked for bindless `ResourceDescriptorHeap[]` materialization.
     bindless: Mutex<Bindless>,
+    /// A recording thread is preparing the placed-texture slots (others
+    /// skip it rather than wait).
+    recording: std::sync::atomic::AtomicBool,
+    /// Placed-texture slots are waiting to be prepared at recording.
+    record_hint: std::sync::atomic::AtomicBool,
+    /// The placed-texture epoch, and the frame (plus one), recording last
+    /// looked for evicted textures at.
+    record_looked: [AtomicU64; 2],
+    /// The frame the oldest uploaded texture is due a look again in.
+    recheck_at: AtomicU64,
 }
 
 // SAFETY: D3D12 descriptor heaps and resources are free-threaded; mutable
@@ -85,8 +95,6 @@ struct Bindless {
     uploaded: HashMap<usize, (ID3D12Resource, u64)>,
     /// Uploaded textures by frame, oldest first, to look at again.
     recheck: VecDeque<(u64, usize)>,
-    /// The placed-texture epoch `recorded` and `uploaded` were checked at.
-    recorded_epoch: u64,
     /// A frame and the uploads of known textures done in it.
     rechecks: (u64, u32),
     /// When the slot-making budget was last refilled, and the microseconds
@@ -337,6 +345,10 @@ impl HostHeap {
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             bindless: Mutex::default(),
+            recording: std::sync::atomic::AtomicBool::new(false),
+            record_hint: std::sync::atomic::AtomicBool::new(false),
+            record_looked: [AtomicU64::new(0), AtomicU64::new(0)],
+            recheck_at: AtomicU64::new(u64::MAX),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -624,6 +636,7 @@ impl HostHeap {
         };
         if changed {
             b.record_pending.insert(index);
+            self.record_hint.store(true, Ordering::Release);
         }
     }
 
@@ -853,27 +866,38 @@ impl HostHeap {
         }
         let epoch = crate::resource::placed_epoch();
         let frame = crate::queue::presented();
-        // Most draws find nothing to do: one look under the lock.
-        let evictions = {
-            let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-            let evictions = b.recorded_epoch != epoch && b.looked[1] != frame + 1;
-            let have = b.budget()[1] > 0;
-            let recheck_due = (b.rechecks.0 != frame || b.rechecks.1 < RECHECKS)
-                && b
-                    .recheck
-                    .front()
-                    .is_some_and(|&(f, _)| f + RECHECK_FRAMES <= frame);
-            if !evictions && (b.record_pending.is_empty() || !have) && !recheck_due {
-                return;
+        // Most draws find nothing to do: a few atomics, no lock.
+        let evictions = self.record_looked[0].load(Ordering::Acquire) != epoch
+            && self.record_looked[1].load(Ordering::Acquire) != frame + 1;
+        if !evictions
+            && !self.record_hint.load(Ordering::Acquire)
+            && self.recheck_at.load(Ordering::Acquire) > frame
+        {
+            return;
+        }
+        // One recording thread prepares at a time; the others go on.
+        if self.recording.swap(true, Ordering::Acquire) {
+            return;
+        }
+        struct Done<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
             }
-            evictions
-        };
+        }
+        let _done = Done(&self.recording);
         let started = std::time::Instant::now();
         // Asked before taking the heap's lock: the placed textures' lock is
         // taken first where both are held.
         let live = evictions.then(crate::resource::placed_live);
         let (todo, due) = {
-            let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+            // The submission may hold the heap's lock for a while: the work
+            // waits for a later draw rather than this one waiting.
+            let mut b = match self.bindless.try_lock() {
+                Ok(b) => b,
+                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return,
+            };
             let b = &mut *b;
             if let Some(live) = &live {
                 b.uploaded.retain(|t, _| live.contains(t));
@@ -883,21 +907,16 @@ impl HostHeap {
                     }
                 }
                 b.recorded.retain(|_, (_, t)| live.contains(t));
-                b.recorded_epoch = epoch;
-                b.looked[1] = frame + 1;
-            }
-            let recheck_due = b
-                .recheck
-                .front()
-                .is_some_and(|&(f, _)| f + RECHECK_FRAMES <= frame);
-            if b.record_pending.is_empty() && !recheck_due {
-                return;
+                self.record_looked[0].store(epoch, Ordering::Release);
+                self.record_looked[1].store(frame + 1, Ordering::Release);
             }
             let mut todo: Vec<(u32, Option<(u32, u32)>)> = Vec::new();
-            while todo.len() < SLOT_CHUNK
-                && let Some(i) = b.record_pending.pop_first()
-            {
-                todo.push((i, b.placed_set.get(&i).copied()));
+            if b.budget()[1] > 0 {
+                while todo.len() < SLOT_CHUNK
+                    && let Some(i) = b.record_pending.pop_first()
+                {
+                    todo.push((i, b.placed_set.get(&i).copied()));
+                }
             }
             let mut due = Vec::new();
             while due.len() < RECHECKS as usize
@@ -908,24 +927,30 @@ impl HostHeap {
                 b.recheck.pop_front();
                 due.push(t as crate::object::This);
             }
+            self.recheck_at.store(
+                b.recheck.front().map_or(u64::MAX, |&(f, _)| f + RECHECK_FRAMES),
+                Ordering::Release,
+            );
+            self.record_hint
+                .store(!b.record_pending.is_empty(), Ordering::Release);
             (todo, due)
         };
+        if todo.is_empty() && due.is_empty() {
+            return;
+        }
         let mut stale = Vec::new();
         let mut learnt = Vec::new();
         let mut reached = Vec::new();
         let left = self.budget_left(1);
         let mut todo = todo.into_iter();
+        let mut over = Vec::new();
         for (index, entry) in todo.by_ref() {
             let Some((vi, generation)) = entry else {
                 continue;
             };
             if started.elapsed().as_micros() as u64 > left {
                 // Over budget: the rest waits (this one too).
-                self.bindless
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .record_pending
-                    .insert(index);
+                over.push(index);
                 break;
             }
             match self.resolve_placed(index, vi, generation) {
@@ -938,33 +963,32 @@ impl HostHeap {
                 Err(()) => stale.push(index),
             }
         }
-        {
-            let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-            b.record_pending.extend(todo.map(|(i, _)| i));
-        }
+        over.extend(todo.map(|(i, _)| i));
         reached.extend(due);
         for texture in reached {
-            // The texture may be evicted meanwhile: it is used only while
-            // it is known alive.
-            crate::resource::with_placed(texture, || {
-                let Some(host_tex) = crate::resource::host_resource(texture) else {
-                    return;
-                };
-                if crate::texture::title_written(host_tex)
-                    && self.upload_due(texture, host_tex, frame)
-                {
-                    crate::texture::upload(list, texture, host_tex);
-                }
-                const SHADER_RESOURCE: u32 = 0x40 | 0x80;
-                crate::list::ensure_state(list, texture, SHADER_RESOURCE);
-            });
+            // The texture may be evicted meanwhile: a reference keeps it.
+            let Some(_held) = crate::resource::hold_placed(texture) else {
+                continue;
+            };
+            let Some(host_tex) = crate::resource::host_resource(texture) else {
+                continue;
+            };
+            if crate::texture::title_written(host_tex) && self.upload_due(texture, host_tex, frame)
+            {
+                crate::texture::upload(list, texture, host_tex);
+            }
+            const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+            crate::list::ensure_state(list, texture, SHADER_RESOURCE);
         }
-        if !stale.is_empty() || !learnt.is_empty() {
+        {
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
             b.recorded.extend(learnt);
             for idx in stale {
                 self.drop_bindless(&mut b, idx, None);
             }
+            b.record_pending.extend(over);
+            self.record_hint
+                .store(!b.record_pending.is_empty(), Ordering::Release);
         }
         let us = started.elapsed().as_micros() as u64;
         self.budget_spend(1, us);
@@ -1035,6 +1059,10 @@ impl HostHeap {
             b.uploaded
                 .insert(texture as usize, (host.clone(), frame));
             b.recheck.push_back((frame, texture as usize));
+            self.recheck_at.store(
+                b.recheck.front().map_or(u64::MAX, |&(f, _)| f + RECHECK_FRAMES),
+                Ordering::Release,
+            );
         }
         due
     }
