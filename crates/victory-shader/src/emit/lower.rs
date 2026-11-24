@@ -288,6 +288,39 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     })
 }
 
+/// Whether `inst` gives each lane what it would under any EXEC: scalar
+/// code and loads that do not touch EXEC, and vector code that reads no
+/// other lane (no DPP, permutes or lane reads and writes).
+fn lane_local(inst: &Inst) -> bool {
+    // EXEC as an operand, or EXECZ.
+    let exec = |o: &Operand| {
+        matches!(*o, Operand::Scalar { code, .. } if code >= EXEC) || *o == Operand::Const(252)
+    };
+    let name = inst.name();
+    match &inst.fields {
+        Fields::Sop { .. } => !inst
+            .reads
+            .iter()
+            .chain(&inst.writes)
+            .any(|&(r, _)| r == Reg::S(EXEC) || r == Reg::S(EXEC + 1)),
+        Fields::Smem { .. } => name.starts_with("s_load_") || name.starts_with("s_buffer_load_"),
+        Fields::Valu(v) => {
+            v.dpp.is_none()
+                && !name.starts_with("v_interp_")
+                && !matches!(
+                    name,
+                    "v_readlane_b32"
+                        | "v_readfirstlane_b32"
+                        | "v_writelane_b32"
+                        | "v_permlane16_b32"
+                        | "v_permlanex16_b32"
+                )
+                && !v.src.iter().chain(&v.dst).chain(&v.carry).any(exec)
+        }
+        _ => false,
+    }
+}
+
 /// Dwords a scalar load reads, by the suffix of its name after
 /// `s_load_dword` or `s_buffer_load_dword`.
 fn smem_dwords(suffix: &str) -> Option<u32> {
@@ -682,8 +715,7 @@ impl<'a> Lower<'a> {
         };
         let c = self.cur;
         let mut off = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
-            let d = self.i32_of(d)?;
+        if let Some(d) = self.dynamic_term(&a)? {
             off = self.s.m.bin(c, Bin::Add, off, d);
         }
         let h = if a.param == CODE {
@@ -779,23 +811,60 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// An instruction inside a whole-wave section: the values that leave
-    /// the section are made from what the simulation found them to be.
-    fn section_inst(&mut self, b: usize, i: usize, start: usize) {
+    /// The instructions of the whole-wave section from `start` to `end`:
+    /// the values that leave it are made from what the simulation found
+    /// them to be. A value it found no shape for, written by a step that
+    /// does not look at other lanes (scalar code the compiler scheduled
+    /// into the section, or lane-local vector code), is lowered as outside
+    /// a section: the lanes active on entry compute it as they would under
+    /// their own EXEC, and only they run on the host.
+    fn section(&mut self, b: usize, start: usize, end: usize) -> Result<(), Stop> {
         const UNKNOWN: Why = "a whole-wave section step the simulation does not follow";
-        let inst = &self.x.p.blocks[b].insts[i];
-        for &(_, w) in &inst.writes {
-            let val = if self.section_out.contains(&w) {
-                let shape = self.sections[&b][&start].shapes.get(&w).copied();
-                match shape.ok_or(UNKNOWN).and_then(|sh| self.shape(sh)) {
-                    Ok(x) => Val::I32(x),
-                    Err(why) => Val::Missing(why),
-                }
-            } else {
-                Val::Missing(UNKNOWN)
-            };
-            self.vals.insert(w, val);
+        let insts = &self.x.p.blocks[b].insts;
+        let inside: HashSet<Value> = insts[start + 1..end]
+            .iter()
+            .flat_map(|inst| inst.writes.iter().map(|w| w.1))
+            .collect();
+        let mut need: HashSet<Value> = inside
+            .iter()
+            .copied()
+            .filter(|w| self.section_out.contains(w))
+            .collect();
+        let mut plain = vec![false; end - start];
+        for j in (start + 1..end).rev() {
+            let inst = &insts[j];
+            let shapes = &self.sections[&b][&start].shapes;
+            let wanted = inst
+                .writes
+                .iter()
+                .any(|&(_, w)| need.contains(&w) && !shapes.contains_key(&w));
+            if wanted && lane_local(inst) {
+                plain[j - start] = true;
+                need.extend(
+                    inst.reads
+                        .iter()
+                        .map(|r| r.1)
+                        .filter(|r| inside.contains(r)),
+                );
+            }
         }
+        for j in start + 1..end {
+            if plain[j - start] {
+                self.inst(b, j)?;
+            }
+            for &(_, w) in &insts[j].writes {
+                let shapes = &self.sections[&b][&start].shapes;
+                let shape = need.contains(&w).then(|| shapes.get(&w).copied()).flatten();
+                let val = match (shape.map(|sh| self.shape(sh)), plain[j - start]) {
+                    (Some(Ok(x)), _) => Val::I32(x),
+                    (_, true) => continue,
+                    (Some(Err(why)), false) => Val::Missing(why),
+                    (None, false) => Val::Missing(UNKNOWN),
+                };
+                self.vals.insert(w, val);
+            }
+        }
+        Ok(())
     }
 
     /// A value a whole-wave section leaves, as DXIL wave operations over the
@@ -958,9 +1027,7 @@ impl<'a> Lower<'a> {
             while i < p.blocks[b].insts.len() {
                 self.inst(b, i)?;
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
-                    for j in i + 1..end {
-                        self.section_inst(b, j, i);
-                    }
+                    self.section(b, i, end)?;
                     i = end;
                     continue;
                 }
@@ -1001,6 +1068,11 @@ impl<'a> Lower<'a> {
         for &(reg, v) in &self.x.p.inputs {
             let val = match reg {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
+                // Most programs only interpolate with them: loaded on first
+                // use as a value (`get`).
+                Reg::V(_) if matches!(io_inputs.get(&v), Some(Input::Barycentric { .. })) => {
+                    continue;
+                }
                 Reg::S(_) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
                     None => Val::Missing("a hardware SGPR input"),
@@ -1029,7 +1101,7 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
             }
-            Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
+            Input::Barycentric { kind, index } => return self.barycentric(kind, index),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
@@ -1191,7 +1263,108 @@ impl<'a> Lower<'a> {
             self.vals.insert(v, val);
             return Ok(val);
         }
+        if let Some(loaded) = self.lazy_barycentric(v) {
+            loaded?;
+            return Ok(self.vals[&v]);
+        }
         Err("a value defined after its use")
+    }
+
+    /// Loads `v` if it is a barycentric input VGPR not loaded yet (see
+    /// `inputs`): `None` if it is not one.
+    fn lazy_barycentric(&mut self, v: Value) -> Option<Result<(), Why>> {
+        let (kind, index) = self.x.io.inputs.iter().find_map(|&(w, i)| match i {
+            Input::Barycentric { kind, index } if w == v => Some((kind, index)),
+            _ => None,
+        })?;
+        let val = self.barycentric(kind, index);
+        self.vals.insert(v, val);
+        Some(match val {
+            Val::Missing(w) => Err(w),
+            _ => Ok(()),
+        })
+    }
+
+    /// Barycentric `index` (0 i, 1 j) of `kind` as a value: a channel of
+    /// `SV_Barycentrics` declared with the same interpolation mode.
+    ///
+    /// GFX10 interpolates P0 + i (P1 - P0) + j (P2 - P0), so i and j are
+    /// the weights of vertices 1 and 2. The host's weights (x, y, z) are
+    /// those of vertices 0, 1 and 2, vertex 0 being the provoking vertex,
+    /// which is the console's P0 (`v_interp_mov` P0 is lowered to a flat
+    /// input): i is y and j is z.
+    /// shortcut: triangles only; on lines and points the console's i and j
+    /// are not checked against the host's weights.
+    fn barycentric(&mut self, kind: Barycentric, index: u8) -> Val {
+        let Some(mode) = interp_mode(kind) else {
+            return Val::Missing("pull-model barycentrics");
+        };
+        if index > 1 {
+            return Val::Missing("pull-model barycentrics");
+        }
+        // One element per interpolation mode (the console's own, if its
+        // signature declares one): DXIL allows two.
+        let bary = |e: &SigElement| e.kind == 28;
+        let id = match self
+            .s
+            .inputs
+            .iter()
+            .position(|e| bary(e) && (e.interp == mode || e.usage == 0))
+        {
+            Some(id) => id,
+            None => {
+                let index = self.s.inputs.iter().filter(|e| bary(e)).count() as u32;
+                if index >= 2 {
+                    return Val::Missing("barycentrics of a third interpolation mode");
+                }
+                let row = self
+                    .s
+                    .inputs
+                    .iter()
+                    .filter_map(|e| e.row.map(|r| r + 1))
+                    .max()
+                    .unwrap_or(0);
+                self.s.inputs.push(SigElement {
+                    name: "SV_Barycentrics".into(),
+                    index,
+                    kind: 28,
+                    comp: 9,
+                    interp: mode,
+                    row: Some(row),
+                    col: 0,
+                    cols: 3,
+                    usage: 0,
+                    half: false,
+                });
+                self.s.inputs.len() - 1
+            }
+        };
+        let e = &mut self.s.inputs[id];
+        if e.col != 0 || e.cols < 3 || e.row.is_none() {
+            return Val::Missing("a console barycentrics element without i and j");
+        }
+        e.interp = mode;
+        self.s.flags |= flags::BARYCENTRICS;
+        self.load_any_input(id, index + 1)
+    }
+
+    /// The computed byte offset `a` adds to its parameter's address: its
+    /// computed term, less the parameter's address when that term is a
+    /// pointer that holds it (see [`Address::includes_base`]).
+    fn dynamic_term(&mut self, a: &Address) -> Result<Option<V>, Why> {
+        let Some(d) = a.dynamic else { return Ok(None) };
+        let d = self.i32_of(d)?;
+        if !a.includes_base {
+            return Ok(Some(d));
+        }
+        if a.param == CODE {
+            return Err("an address from a phi");
+        }
+        let base = match self.user(a.param, 0) {
+            Val::I32(x) => x,
+            _ => return Err("an advanced pointer into a root descriptor"),
+        };
+        Ok(Some(self.s.m.bin(self.cur, Bin::Sub, d, base)))
     }
 
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {
@@ -3286,8 +3459,7 @@ impl<'a> Lower<'a> {
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let mut addr = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
-            let d = self.i32_of(d)?;
+        if let Some(d) = self.dynamic_term(&a)? {
             addr = self.s.m.bin(c, Bin::Add, addr, d);
         }
         let constant = a.dynamic.is_none().then_some(a.offset);
@@ -3516,8 +3688,7 @@ impl<'a> Lower<'a> {
             .ok_or("a scalar load from the code")?;
         let c = self.cur;
         let mut addr = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
-            let d = self.i32_of(d)?;
+        if let Some(d) = self.dynamic_term(&a)? {
             addr = self.s.m.bin(c, Bin::Add, addr, d);
         }
         for k in 0..count {
@@ -3676,10 +3847,7 @@ impl<'a> Lower<'a> {
     fn built_offset(&mut self, src: &Source) -> Result<(u32, Option<V>), Why> {
         match src {
             Source::Built { address, .. } => {
-                let x = match address.dynamic {
-                    Some(v) => Some(self.i32_of(v)?),
-                    None => None,
-                };
+                let x = self.dynamic_term(address)?;
                 Ok((address.offset, x))
             }
             _ => Ok((0, None)),
@@ -5656,15 +5824,7 @@ impl<'a> Lower<'a> {
                 ..
             } => (
                 attribute,
-                match barycentric {
-                    Barycentric::PerspectiveCenter => 2,
-                    Barycentric::PerspectiveCentroid => 3,
-                    Barycentric::PerspectiveSample => 6,
-                    Barycentric::LinearCenter => 4,
-                    Barycentric::LinearCentroid => 5,
-                    Barycentric::LinearSample => 7,
-                    Barycentric::PerspectivePullModel => return Err("pull-model interpolation"),
-                },
+                interp_mode(*barycentric).ok_or("pull-model interpolation")?,
             ),
             // P0, the provoking vertex: a flat (nointerpolation) input.
             Interp::Vertex {
@@ -7130,6 +7290,9 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
+                if self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
+                    let _ = self.lazy_barycentric(arg);
+                }
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
@@ -7171,13 +7334,27 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// The DXIL interpolation mode of a kind of barycentrics (none for the
+/// pull model).
+fn interp_mode(kind: Barycentric) -> Option<u8> {
+    Some(match kind {
+        Barycentric::PerspectiveCenter => 2,
+        Barycentric::PerspectiveCentroid => 3,
+        Barycentric::PerspectiveSample => 6,
+        Barycentric::LinearCenter => 4,
+        Barycentric::LinearCentroid => 5,
+        Barycentric::LinearSample => 7,
+        Barycentric::PerspectivePullModel => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::container::SigElement;
     use super::{Lowered, Numeric, Parts, SubDword, buffer_format, inline_f16, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
-    use super::super::container::SigElement;
     use crate::{ShaderError, io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
@@ -7314,6 +7491,24 @@ mod tests {
             user_data,
             slot,
         }
+    }
+
+    #[test]
+    fn scalar_code_inside_a_whole_wave_section_is_lowered() {
+        // Assembled with llvm-mc (gfx1030, wave32): scalar code the
+        // compiler scheduled into a whole-wave section, branched on after.
+        let words = [
+            0xBE84_0385, // s_mov_b32 s4, 5
+            0xBE80_3DC1, // s_or_saveexec_b32 s0, -1
+            0x8005_8104, // s_add_u32 s5, s4, 1
+            0x7E02_0280, // v_mov_b32_e32 v1, 0
+            0xBEFE_0300, // s_mov_b32 exec_lo, s0
+            0xBF06_8605, // s_cmp_eq_u32 s5, 6
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE86_0380, // s_mov_b32 s6, 0
+            S_ENDPGM,
+        ];
+        lowers(&words).unwrap();
     }
 
     #[test]
@@ -7721,6 +7916,88 @@ mod tests {
             }]
         };
         lower_with(&words, layout(), used()).unwrap();
+    }
+
+    /// A table at s0 holding structured buffers of dwords.
+    fn dword_buffers() -> Vec<UsedResource> {
+        vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }]
+    }
+
+    #[test]
+    fn descriptors_loaded_through_pointers_kept_in_phis() {
+        // A buffer descriptor loaded from the table at s0 through a pointer
+        // a root constant (s1) picks by a branch, then loaded through by
+        // index and stored to LDS so the load is needed.
+        let picked = [
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0xBF85_0002, // s_cbranch_scc1 -> 0x10
+            0x8004_9000, // s_add_u32 s4, s0, 16
+            0xBF82_0001, // s_branch -> 0x14
+            0x8004_A000, // 0x10: s_add_u32 s4, s0, 32
+            0xBE85_0380, // 0x14: s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        // The same through a pointer advanced over four descriptors.
+        let advanced = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xF408_0202,
+            0xFA00_0000, // 0xc: s_load_dwordx4 s[8:11], s[4:5], null
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            0x8004_9004, // s_add_u32 s4, s4, 16
+            0x8006_8106, // s_add_u32 s6, s6, 1
+            0xBF07_8406, // s_cmp_lg_u32 s6, 4
+            0xBF85_FFF6, // s_cbranch_scc1 -> 0xc
+            S_ENDPGM,
+        ];
+        let layout = || vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        lower_with(&picked, layout(), dword_buffers()).unwrap();
+        lower_with(&advanced, layout(), dword_buffers()).unwrap();
+    }
+
+    #[test]
+    fn data_read_through_a_pointer_into_a_root_descriptor_stops() {
+        // A root descriptor's address (s[0:1]) advanced in a loop and read
+        // through: its address is no value the translation has, so the
+        // offset from it is unknown.
+        let words = [
+            0xBE82_0300, // s_mov_b32 s2, s0
+            0xBE83_0301, // s_mov_b32 s3, s1
+            0xF400_0101,
+            0xFA00_0000, // 0x8: s_load_dword s4, s[2:3], null
+            0x8002_9002, // s_add_u32 s2, s2, 16
+            0x8203_8003, // s_addc_u32 s3, s3, 0
+            0xBF06_8004, // s_cmp_eq_u32 s4, 0
+            0xBF84_FFFA, // s_cbranch_scc0 -> 0x8
+            S_ENDPGM,
+        ];
+        let e = lower_with(&words, vec![root(RootType::Descriptor, 0, 3)], vec![])
+            .err()
+            .unwrap();
+        assert!(
+            e.to_string()
+                .contains("an advanced pointer into a root descriptor"),
+            "{e}"
+        );
     }
 
     #[test]
