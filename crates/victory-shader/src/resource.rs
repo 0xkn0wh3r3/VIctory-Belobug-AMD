@@ -1419,9 +1419,22 @@ impl<'a> Tracer<'a> {
                 }
                 self.per_lane(&edge, joins)
             })
-            .collect::<Result<_, _>>();
+            .collect::<Vec<Result<Source, &'static str>>>();
         self.lane_joins.borrow_mut().pop();
         joins.pop();
+        // shortcut: where other paths bring descriptors, one that brings
+        // something else holds the registers' former use: no lane that came
+        // that way reads them as a descriptor.
+        let known = args.iter().any(|a| !matches!(a, Err(_) | Ok(Source::Unset | Source::Carried { .. })));
+        let args = args
+            .into_iter()
+            .map(|a| match a {
+                Err(why) if known && why.starts_with("a descriptor read from the first lane of") => {
+                    Ok(Source::Unset)
+                }
+                a => a,
+            })
+            .collect::<Result<_, _>>();
         Ok(Some(Source::Paths { block, args: args? }))
     }
 

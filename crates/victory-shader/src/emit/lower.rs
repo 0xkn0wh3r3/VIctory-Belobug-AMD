@@ -2118,6 +2118,10 @@ impl<'a> Lower<'a> {
             }
             return Ok(val);
         }
+        if is_mask && !self.mask_ok && std::env::var_os("VICTORY_WHY").is_some() {
+            let def = self.def_block.get(&v).map(|&b| (b, self.x.p.blocks[b].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == v)).map(|i| (format!("{:#x}", i.machine.offset), i.name().to_owned())), self.x.p.blocks[b].phis.iter().find(|p| p.value == v).map(|p| (p.reg, p.args.clone()))));
+            eprintln!("mask data {v:?} {:?} def {def:?} cur {} high {:?} val {:?}", self.x.st.masks.get(&v), self.cur_ir, self.x.st.highs.get(&v), self.vals.get(&v));
+        }
         match self.vals.get(&v) {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
@@ -4148,6 +4152,9 @@ impl<'a> Lower<'a> {
             // Generic addresses: private, shared or global memory by aperture.
             Fields::Flat { .. } => Err("flat memory"),
         };
+        if let Err(w) = &r && std::env::var_os("VICTORY_WHY").is_some() {
+            eprintln!("missing {offset:#x} {name} {w}");
+        }
         #[cfg(test)]
         if let Err(why) = r
             && AUDIT_OFFSET.get() == Some(offset)
@@ -11461,6 +11468,16 @@ impl<'a> Lower<'a> {
                         } else {
                             self.s.m.undef(self.s.t.i32)
                         }
+                    }
+                    // As above, of a lane mask: the registers held one before.
+                    // shortcut: as above, zero there.
+                    (Some(Val::Missing(why)), false)
+                        if has_data
+                            && (why == LANE_MASK
+                                || self.x.st.masks.contains_key(&arg)
+                                || self.x.st.highs.contains_key(&arg)) =>
+                    {
+                        self.s.m.i32(0)
                     }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, why));
