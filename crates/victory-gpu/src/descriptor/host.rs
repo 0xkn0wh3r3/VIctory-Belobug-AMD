@@ -152,6 +152,8 @@ struct Bindless {
     dirty: BTreeSet<u32>,
     /// What each slot made for bindless access needs at submission.
     uses: BTreeMap<u32, SlotUse>,
+    /// Of them, those with work at each submission.
+    busy: BTreeSet<u32>,
     /// The released-view and placed-texture epochs `uses` was checked at.
     checked: (u64, u64),
     /// What submissions do for the slots, until they or what they view change.
@@ -184,7 +186,7 @@ struct Bindless {
 /// slots not made yet read nothing (null views) for a few frames, as
 /// streaming pops in; making all of them at once stalled frames for
 /// seconds.
-const SLOT_BUDGET_US: u64 = 60_000;
+const SLOT_BUDGET_US: u64 = 20_000;
 /// Slots taken to make at once (the rest wait without being looked at).
 const SLOT_CHUNK: usize = 256;
 
@@ -195,7 +197,7 @@ impl Bindless {
         let (at, left) = self
             .budget
             .get_or_insert((now, [SLOT_BUDGET_US; 2]));
-        let add = now.duration_since(*at).as_micros() as u64 / 3;
+        let add = now.duration_since(*at).as_micros() as u64 / 4;
         if add > 0 {
             *at = now;
             for l in left.iter_mut() {
@@ -272,6 +274,8 @@ pub(crate) struct BindlessPlan {
     pub(crate) writes: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Misaligned constant buffers: bounce slice, title address, bytes.
     bounces: Vec<(usize, u64, u32)>,
+    /// The frame (plus one) the bounces were last copied in.
+    copied_in: AtomicU64,
     /// The host resources the slots view, held while a submission runs.
     _retained: Vec<ID3D12Resource>,
 }
@@ -283,7 +287,14 @@ unsafe impl Sync for BindlessPlan {}
 
 impl BindlessPlan {
     /// Copies the misaligned constant buffers into their bounce slices.
+    ///
+    /// shortcut: all of them once a frame, else only for a plan not copied
+    /// yet: the title writes constants before it points a slot at them.
     pub(crate) fn copy_constants(&self) {
+        let frame = crate::queue::presented() + 1;
+        if self.copied_in.swap(frame, Ordering::AcqRel) == frame {
+            return;
+        }
         for &(cpu, address, len) in &self.bounces {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
@@ -885,6 +896,7 @@ impl HostHeap {
     /// Slot `index` (viewing `entry`) is no longer one for bindless access.
     fn drop_bindless(&self, b: &mut Bindless, index: u32, entry: Option<(u32, u32)>) {
         b.uses.remove(&index);
+        b.busy.remove(&index);
         b.recorded.remove(&index);
         if entry.is_none_or(|e| b.slots.get(&index) == Some(&e)) {
             b.slots.remove(&index);
@@ -1349,7 +1361,8 @@ impl HostHeap {
             {
                 dirty.insert(i);
             }
-            for (&i, u) in &b.uses {
+            let all = live.is_some() || viewed;
+            for (&i, u) in b.uses.iter().filter(|_| all) {
                 let evicted = live
                     .zip(u.placed)
                     .is_some_and(|(l, t)| !l.contains(&t));
@@ -1402,8 +1415,14 @@ impl HostHeap {
             match made {
                 None => {
                     b.uses.remove(&index);
+                    b.busy.remove(&index);
                 }
                 Some((_, Some(u))) => {
+                    if u.read.is_some() || u.write.is_some() || u.bounce.is_some() {
+                        b.busy.insert(index);
+                    } else {
+                        b.busy.remove(&index);
+                    }
                     b.uses.insert(index, u);
                 }
                 Some((e, None)) => self.drop_bindless(&mut b, index, Some(e)),
@@ -1417,16 +1436,19 @@ impl HostHeap {
         }
         let (mut reads, mut writes, mut bounces, mut retained) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        for u in b.uses.values() {
+        // What slots view is held by the slots, and for some frames after
+        // (`host::retire`).
+        for u in b.busy.iter().filter_map(|i| b.uses.get(i)) {
             reads.extend(u.read.clone());
             writes.extend(u.write.clone());
             bounces.extend(u.bounce);
-            retained.extend(u.retained.clone());
+            retained.extend(u.read.is_some().then(|| u.retained.clone()).flatten());
         }
         let plan = Arc::new(BindlessPlan {
             reads: merged(reads, READ_GAP),
             writes: merged(writes, 0),
             bounces,
+            copied_in: AtomicU64::new(0),
             _retained: retained,
         });
         b.plan = Some(plan.clone());
@@ -1780,6 +1802,10 @@ fn buffer_srv(
         );
         return None;
     }
+    let size = if buffer.StructureByteStride > 0 { u64::from(buffer.StructureByteStride) } else { element_size_of(buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, element) };
+    if !fits_buffer(&shadow, buffer.FirstElement, buffer.NumElements, size) {
+        return None;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -1787,6 +1813,26 @@ fn buffer_srv(
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
     Some(Some(shadow.buffer.clone()))
+}
+
+fn element_size_of(raw: bool, element: u64) -> u64 {
+    if raw { 4 } else { element }
+}
+
+/// Whether a view of `count` elements of `size` bytes from `first` on lies in
+/// the buffer (the host removes the device for one that does not, or is
+/// empty).
+fn fits_buffer(shadow: &crate::shadow::Shadow, first: u64, count: u32, size: u64) -> bool {
+    // SAFETY: a live buffer.
+    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    let end = first
+        .checked_add(u64::from(count))
+        .and_then(|n| n.checked_mul(size.max(1)));
+    let fits = count > 0 && size > 0 && end.is_some_and(|e| e <= width);
+    if !fits {
+        once!(first, count, size, width, "a buffer view the host does not allow");
+    }
+    fits
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -1851,6 +1897,10 @@ fn buffer_uav(
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
     } else {
         once!(offset, element, "unordered buffer view not on an element of its host copy");
+        return None;
+    }
+    let size = if buffer.StructureByteStride > 0 { u64::from(buffer.StructureByteStride) } else { element_size_of(buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0, element) };
+    if !fits_buffer(&shadow, buffer.FirstElement, buffer.NumElements, size) {
         return None;
     }
     let host = host()?;

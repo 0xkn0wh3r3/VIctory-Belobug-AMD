@@ -611,32 +611,40 @@ fn run_of(from: u64, to: u64) -> Option<(u64, u64)> {
         let mut info = MEMORY_BASIC_INFORMATION::default();
         // SAFETY: a query of our own address space.
         let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-        (n != 0
-            && info.State == MEM_COMMIT
-            && info.Type != MEM_IMAGE
-            && matches!(info.Protect, PAGE_READWRITE | PAGE_READONLY))
-        .then_some(info)
+        (n != 0).then_some(info)
     };
-    let first = query(from)?;
+    let usable = |i: &MEMORY_BASIC_INFORMATION| {
+        i.State == MEM_COMMIT
+            && i.Type != MEM_IMAGE
+            && matches!(i.Protect, PAGE_READWRITE | PAGE_READONLY)
+    };
+    let first = query(from).filter(usable)?;
     let allocation = first.AllocationBase as u64;
     let low = (from & !(WINDOW_REACH - 1)).max(allocation);
     let high = to.checked_next_multiple_of(WINDOW_REACH)?;
-    let mut start = first.BaseAddress as u64;
-    let mut end = start + first.RegionSize as u64;
+    // A query gives the region from the address up, not down: from the
+    // bottom on.
+    let (mut start, mut end) = (low, low);
     while end < high
         && let Some(i) = query(end)
         && i.AllocationBase as u64 == allocation
     {
-        end += i.RegionSize as u64;
-    }
-    while start > low
-        && let Some(i) = query(start - 1)
-        && i.AllocationBase as u64 == allocation
-    {
-        start = i.BaseAddress as u64;
+        let next = i.BaseAddress as u64 + i.RegionSize as u64;
+        if !usable(&i) {
+            if end > from {
+                break;
+            }
+            start = next;
+        }
+        end = next;
     }
     let page = PAGE as u64;
     let (start, end) = (start.max(low).next_multiple_of(page), end.min(high) & !(page - 1));
+    // Not short views: the title maps and unmaps those (streaming), which
+    // the host refuses while the GPU uses them.
+    if first.Type == windows_sys::Win32::System::Memory::MEM_MAPPED && end - start < 16 << 20 {
+        return None;
+    }
     (start <= from && end >= to).then_some((start, end))
 }
 
@@ -708,6 +716,23 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
                 len = end - address,
                 "title memory not usable in place: copied"
             );
+            if count <= 3 {
+                use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+                let (mut at, mut text) = (address, String::new());
+                while at < end && text.len() < 1500 {
+                    let mut i = MEMORY_BASIC_INFORMATION::default();
+                    // SAFETY: a query of our own address space.
+                    if unsafe { VirtualQuery(at as *const _, &mut i, size_of_val(&i)) } == 0 {
+                        break;
+                    }
+                    text.push_str(&format!(
+                        " {:x}+{:x}@{:x}:{:x}/{:x}/{:x}",
+                        i.BaseAddress as usize, i.RegionSize, i.AllocationBase as usize, i.State, i.Type, i.Protect
+                    ));
+                    at = i.BaseAddress as u64 + i.RegionSize as u64;
+                }
+                tracing::info!("its regions:{text}");
+            }
         }
         refused.insert(address, (end, frame));
         return None;
@@ -886,16 +911,19 @@ fn find_copy(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// `reach` bytes after `address`. A window ending sooner than the data read
 /// through the view is a GPU page fault.
 pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
-    if let Some(window) = direct(address, address.checked_add(1)?) {
-        return Some(window);
-    }
-    let in_buffer = buffers()
+    // To the end of the innermost buffer holding it: a window ending sooner
+    // faults.
+    let end = buffers()
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
-        .any(|(_, e)| e.end > address);
-    if in_buffer {
-        return find(address, 1);
+        .map(|(_, e)| e.end)
+        .find(|&e| e > address);
+    if let Some(end) = end {
+        return direct(address, end).or_else(|| find_copy(address, 1));
+    }
+    if let Some(window) = direct(address, address.checked_add(reach)?) {
+        return Some(window);
     }
     loose(address, address.checked_add(reach)?)
 }

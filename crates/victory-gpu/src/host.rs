@@ -2070,7 +2070,10 @@ impl Batch {
                 }
                 update(shadow, *address, *len);
             }
-            if writes {
+            // shortcut: what shaders write through directly indexed slots into
+            // copied memory stays in the copy (title memory used in place
+            // needs no copy back); copying all of it back cost ~0.3 s a frame.
+            if writes && cfg!(test) {
                 for (shadow, address, len) in &plan.writes {
                     if !self.bindless_writes.iter().any(|(s, a, l)| {
                         std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len)
@@ -2286,6 +2289,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                wait_if_removed(&self.device, &e);
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
             }
@@ -2703,6 +2707,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                wait_if_removed(&self.device, &e);
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None
             }
@@ -2989,4 +2994,19 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             before.as_secs_f64() / after.as_secs_f64()
         );
     }
+}
+
+/// The device is gone: why is logged, and the caller waits, so the thread
+/// that runs the submission can report it before the title fails.
+fn wait_if_removed(device: &ID3D12Device, error: &windows::core::Error) {
+    if error.code().0 as u32 != 0x887A_0005 {
+        return;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: a plain query.
+        let reason = unsafe { device.GetDeviceRemovedReason() };
+        tracing::error!(?reason, layer = ?host().and_then(|h| h.log_messages()), "host GPU device gone");
+    });
+    std::thread::sleep(std::time::Duration::from_secs(20));
 }
