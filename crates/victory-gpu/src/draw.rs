@@ -721,6 +721,11 @@ impl State {
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
+        // What it reads takes far longer to write down than the draw.
+        static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*FULL.get_or_init(|| std::env::var_os("VICTORY_OP_TEXT").is_some()) {
+            return text;
+        }
         let views = (self.heaps[0] != 0)
             .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
             .flatten();

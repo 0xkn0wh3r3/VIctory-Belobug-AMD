@@ -48,6 +48,8 @@ pub(crate) struct Shadow {
     direct: Option<Direct>,
     /// Ranges that cannot be watched, with the frame they were copied in.
     unwatched: Mutex<std::collections::HashMap<(usize, usize), u64>>,
+    /// The buffer has memory only where it was brought up to date.
+    sparse: Option<Sparse>,
 }
 
 struct Direct {
@@ -157,7 +159,7 @@ unsafe impl Sync for Shadow {}
 
 impl Drop for Shadow {
     fn drop(&mut self) {
-        if self.direct.is_some() {
+        if self.direct.is_some() || self.sparse.is_some() {
             return;
         }
         // SAFETY: a live resource.
@@ -219,6 +221,7 @@ impl Shadow {
             before: Mutex::default(),
             direct: None,
             unwatched: Mutex::default(),
+            sparse: None,
         }
     }
 
@@ -292,6 +295,9 @@ impl Shadow {
         if self.direct.is_some() {
             return;
         }
+        if let Some((root, s)) = self.sparse_root() {
+            return root.sparse_writing(s, address, len);
+        }
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -335,6 +341,9 @@ impl Shadow {
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
         if self.direct.is_some() {
             return 0;
+        }
+        if let Some((root, s)) = self.sparse_root() {
+            return root.sparse_back(s, address, len);
         }
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let Before {
@@ -422,6 +431,9 @@ impl Shadow {
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
         if self.direct.is_some() {
             return 0;
+        }
+        if let Some(root) = self.sparse.as_ref().and_then(|s| s.of.as_ref()) {
+            return root.update(address, len);
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
@@ -527,6 +539,12 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        if let Some(s) = &self.sparse {
+            self.each_tile(s, from, to, |at, data, n| {
+                crate::host::copy_mapped(data, at as *const u8, n, false);
+            });
+            return to - from;
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
@@ -608,6 +626,7 @@ fn placed(
             dead: std::sync::atomic::AtomicBool::new(false),
         }),
         unwatched: Mutex::default(),
+        sparse: None,
     })
 }
 
@@ -813,6 +832,9 @@ pub(crate) fn remapped(start: u64, end: u64) {
 /// `len` bytes at `address`.
 pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
     let shadow = find(address, len)?;
+    if shadow.sparse.is_some() {
+        return shadow.sparse_on_element(address, element);
+    }
     if !shadow.is_direct() {
         return Some(shadow);
     }
@@ -821,8 +843,353 @@ pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<Arc<Shado
         ONCE.call_once(|| {
             tracing::warn!(address = format_args!("{address:#x}"), element, "a view off its elements: copied");
         });
-        find_copy(address, len)
+        let copy = find_copy(address, len)?;
+        if copy.sparse.is_some() {
+            return copy.sparse_on_element(address, element);
+        }
+        Some(copy)
     })
+}
+
+/// Copies of title memory the host GPU cannot use in place: a buffer as long
+/// as the address space chunk it stands for, with memory behind the 64 KiB
+/// tiles that were brought up to date. Reads of the others give zeros, where
+/// a copy ending too soon was a GPU page fault; and memory many buffers of
+/// the title overlap in is copied once.
+struct Sparse {
+    /// By tile: where the CPU writes it, and where it is in which heap.
+    tiles: Mutex<std::collections::HashMap<u32, Tile>>,
+    /// What tiles shaders write held before the submission.
+    before: Mutex<std::collections::HashMap<u32, Vec<u8>>>,
+    /// The same from other 64 KiB starts ([`Direct::aliases`]).
+    aliases: Mutex<Vec<Arc<Shadow>>>,
+    /// This is an alias of that one.
+    of: Option<Arc<Shadow>>,
+}
+
+#[derive(Clone, Copy)]
+struct Tile {
+    data: usize,
+    heap: usize,
+    offset: u32,
+}
+
+/// Address space a sparse copy stands for.
+const CHUNK: u64 = 16 << 30;
+
+/// Memory for tiles, in heaps the CPU maps.
+struct TilePool {
+    heaps: Vec<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, ID3D12Resource, usize)>,
+    /// Tiles used of the last one.
+    used: u32,
+}
+// SAFETY: free-threaded objects and a persistent mapping.
+unsafe impl Send for TilePool {}
+
+static TILES: Mutex<TilePool> = Mutex::new(TilePool {
+    heaps: Vec::new(),
+    used: 0,
+});
+
+const POOL_TILES: u32 = 512;
+
+fn new_tile() -> Option<Tile> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let mut pool = TILES.lock().unwrap_or_else(|e| e.into_inner());
+    if pool.heaps.is_empty() || pool.used == POOL_TILES {
+        let size = u64::from(POOL_TILES) * PAGE as u64;
+        let desc = D3D12_HEAP_DESC {
+            SizeInBytes: size,
+            Properties: D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            },
+            Alignment: 0,
+            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+        };
+        let mut heap: Option<ID3D12Heap> = None;
+        let mut whole: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation; the mapping lives as long as the heap.
+        let made = unsafe {
+            let device = &host()?.device;
+            device.CreateHeap(&desc, &mut heap).and_then(|()| {
+                device.CreatePlacedResource(
+                    heap.as_ref(),
+                    0,
+                    &buffer_desc(size, D3D12_RESOURCE_FLAG_NONE),
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut whole,
+                )
+            })
+            .and_then(|()| match &whole {
+                Some(w) => w.Map(0, None, Some(&mut data)),
+                None => Err(windows::core::Error::empty()),
+            })
+        };
+        if let Err(error) = made {
+            tracing::warn!(%error, "no memory for copies of title memory");
+            return None;
+        }
+        pool.heaps.push((heap?, whole?, data as usize));
+        pool.used = 0;
+    }
+    let heap = pool.heaps.len() - 1;
+    let offset = pool.used;
+    pool.used += 1;
+    crate::memstat::add(&crate::memstat::SHADOWS, PAGE as u64);
+    Some(Tile {
+        data: pool.heaps[heap].2 + offset as usize * PAGE,
+        heap,
+        offset,
+    })
+}
+
+fn buffer_desc(
+    len: u64,
+    flags: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAGS,
+) -> windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC {
+    use windows::Win32::Graphics::Direct3D12::*;
+    D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: len,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: flags,
+        ..Default::default()
+    }
+}
+
+/// Sparse copies by chunk.
+static SPARSE: Mutex<BTreeMap<u64, Option<Arc<Shadow>>>> = Mutex::new(BTreeMap::new());
+
+fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation of a buffer without memory.
+    let made = unsafe {
+        host()?.device.CreateReservedResource(
+            &buffer_desc(len, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut buffer,
+        )
+    };
+    if let Err(error) = made {
+        tracing::warn!(%error, len, "no sparse buffer");
+        return None;
+    }
+    let buffer = buffer?;
+    crate::host::name(&buffer, || format!("copies of title memory {start:#x}+{len:#x}"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    tracing::info!(start = format_args!("{start:#x}"), len, alias = of.is_some(), "sparse copies of title memory");
+    Some(Shadow {
+        buffer,
+        data: std::ptr::null_mut(),
+        gpu,
+        start,
+        len,
+        copied: Mutex::new(if of.is_some() { Vec::new() } else { vec![0; (len / PAGE as u64) as usize] }),
+        watched: AtomicU8::new(0),
+        pending: Mutex::default(),
+        before: Mutex::default(),
+        direct: None,
+        unwatched: Mutex::default(),
+        sparse: Some(Sparse {
+            tiles: Mutex::default(),
+            before: Mutex::default(),
+            aliases: Mutex::default(),
+            of,
+        }),
+    })
+}
+
+/// The sparse copy `[address, end)` lies in.
+fn sparse(address: u64, end: u64) -> Option<Arc<Shadow>> {
+    if cfg!(test) || (end - 1) / CHUNK != address / CHUNK {
+        return None;
+    }
+    SPARSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(address / CHUNK)
+        .or_insert_with(|| sparse_buffer(address / CHUNK * CHUNK, CHUNK, None).map(Arc::new))
+        .clone()
+}
+
+/// Maps tiles of a sparse buffer (`first`, then each the next) to heaps.
+fn map_tiles(buffer: &ID3D12Resource, tiles: &[(u32, Tile)]) {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let Some(host) = host() else { return };
+    let pool = TILES.lock().unwrap_or_else(|e| e.into_inner());
+    for &(at, tile) in tiles {
+        let coordinate = D3D12_TILED_RESOURCE_COORDINATE {
+            X: at,
+            ..Default::default()
+        };
+        let region = D3D12_TILE_REGION_SIZE {
+            NumTiles: 1,
+            ..Default::default()
+        };
+        // SAFETY: a live sparse buffer and heap, tiles inside both.
+        unsafe {
+            host.queue().UpdateTileMappings(
+                buffer,
+                1,
+                Some(&coordinate),
+                Some(&region),
+                &pool.heaps[tile.heap].0,
+                1,
+                Some(&D3D12_TILE_RANGE_FLAG_NONE),
+                Some(&tile.offset),
+                Some(&1),
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            );
+        }
+    }
+}
+
+impl Shadow {
+    /// The copy whose tiles these are.
+    fn sparse_root(&self) -> Option<(&Shadow, &Sparse)> {
+        let s = self.sparse.as_ref()?;
+        match &s.of {
+            Some(root) => Some((root, root.sparse.as_ref()?)),
+            None => Some((self, s)),
+        }
+    }
+
+    /// The CPU's view of the tile `address` is in, with memory behind it.
+    fn tile(&self, s: &Sparse, address: usize) -> Option<usize> {
+        let at = ((address - self.start as usize) / PAGE) as u32;
+        let mut tiles = s.tiles.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = tiles.get(&at) {
+            return Some(t.data);
+        }
+        let tile = new_tile()?;
+        tiles.insert(at, tile);
+        map_tiles(&self.buffer, &[(at, tile)]);
+        for alias in s.aliases.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            let shift = ((alias.start - self.start) / PAGE as u64) as u32;
+            if at >= shift {
+                map_tiles(&alias.buffer, &[(at - shift, tile)]);
+            }
+        }
+        Some(tile.data)
+    }
+
+    /// Runs `f` on the CPU's view of each tile's part of `[from, to)`: its
+    /// title address, the view, its length.
+    fn each_tile(&self, s: &Sparse, from: usize, to: usize, mut f: impl FnMut(usize, *mut u8, usize)) {
+        let mut at = from;
+        while at < to {
+            let n = (PAGE - at % PAGE).min(to - at);
+            if let Some(data) = self.tile(s, at) {
+                f(at, (data + at % PAGE) as *mut u8, n);
+            }
+            at += n;
+        }
+    }
+
+    /// A sparse copy from a start `address` is a multiple of `element` bytes
+    /// after.
+    fn sparse_on_element(self: &Arc<Self>, address: u64, element: u64) -> Option<Arc<Shadow>> {
+        if element == 0 || (address - self.start) % element == 0 {
+            return Some(self.clone());
+        }
+        let s = self.sparse.as_ref()?;
+        let page = PAGE as u64;
+        let mut base = self.start + page;
+        while base <= address && base - self.start <= 4096 * page {
+            if (address - base) % element == 0 {
+                let mut aliases = s.aliases.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(a) = aliases.iter().find(|a| a.start == base) {
+                    return Some(a.clone());
+                }
+                let len = self.start + self.len - base;
+                let made = Arc::new(sparse_buffer(base, len, Some(self.clone()))?);
+                aliases.push(made.clone());
+                drop(aliases);
+                let shift = ((base - self.start) / page) as u32;
+                let known: Vec<(u32, Tile)> = s
+                    .tiles
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .filter(|(at, _)| **at >= shift)
+                    .map(|(at, t)| (at - shift, *t))
+                    .collect();
+                map_tiles(&made.buffer, &known);
+                return Some(made);
+            }
+            base += page;
+        }
+        None
+    }
+
+    /// [`Shadow::writing`] of a sparse copy.
+    fn sparse_writing(&self, s: &Sparse, address: usize, len: usize) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((address, address + len));
+        let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
+        let start = self.start as usize;
+        self.each_tile(s, address, address + len, |at, data, _| {
+            let tile = ((at - start) / PAGE) as u32;
+            before.entry(tile).or_insert_with(|| {
+                let whole = data as usize & !(PAGE - 1);
+                // SAFETY: the tile's mapping.
+                unsafe { std::slice::from_raw_parts(whole as *const u8, PAGE) }.to_vec()
+            });
+        });
+    }
+
+    /// [`Shadow::copy_back`] of a sparse copy.
+    fn sparse_back(&self, s: &Sparse, address: usize, len: usize) -> usize {
+        let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
+        let start = self.start as usize;
+        let mut written = 0;
+        let mut title = vec![0u8; PAGE];
+        self.each_tile(s, address, address + len, |at, data, n| {
+            let Some(old) = before.get_mut(&(((at - start) / PAGE) as u32)) else {
+                return;
+            };
+            let old = &mut old[at % PAGE..at % PAGE + n];
+            // SAFETY: the tile's mapping; only this thread writes it.
+            let host = unsafe { std::slice::from_raw_parts_mut(data, n) };
+            if host == old || !crate::host::read_into(at as *const u8, &mut title[..n]) {
+                return;
+            }
+            let mut changed = false;
+            for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old.iter_mut()) {
+                if *h != *o && *t != *h {
+                    *t = *h;
+                    changed = true;
+                }
+                *h = *t;
+                *o = *t;
+            }
+            if changed {
+                crate::watch::writing(at, n);
+                crate::host::write_mapped(at as *mut u8, title.as_ptr(), n);
+                written += n;
+            }
+        });
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.retain(|&r| r != (address, address + len));
+        if pending.is_empty() {
+            before.clear();
+        }
+        written
+    }
 }
 
 struct Entry {
@@ -884,6 +1251,9 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 fn find_copy(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
+    if let Some(copy) = sparse(address, end) {
+        return Some(copy);
+    }
     let mut map = buffers();
     let holding: Vec<((u64, usize), bool)> = map
         .range(..=(address, usize::MAX))
@@ -961,6 +1331,9 @@ const WINDOW: u64 = 4 << 20;
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
+    if let Some(copy) = sparse(address, end) {
+        return Some(copy);
+    }
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());

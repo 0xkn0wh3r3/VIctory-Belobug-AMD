@@ -524,8 +524,25 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     } else {
         (0.0, finite.fold(0.0f32, f32::max))
     };
+    let wild = values.iter().filter(|v| v.iter().any(|c| !c.is_finite())).count();
+    let mut most = high;
+    if !grey && matches!(format, 1..=2 | 9..=11 | 26) {
+        // What most pixels reach: a few far brighter ones leave the rest black.
+        let mut lit: Vec<f32> = values
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .step_by(7)
+            .collect();
+        if !lit.is_empty() {
+            let k = lit.len() * 95 / 100;
+            most = *lit.select_nth_unstable_by(k, f32::total_cmp).1;
+        }
+    }
+    tracing::info!(format, low, high, most, wild, w, h, "target values");
+    let high = most;
     let range = (high - low).max(1e-20);
-    tracing::info!(format, low, high, "target values");
     for v in values {
         let c = v.map(|c| (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8);
         out.extend([c[0], c[1], c[2], 255]);
