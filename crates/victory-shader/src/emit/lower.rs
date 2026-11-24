@@ -1512,13 +1512,20 @@ impl<'a> Lower<'a> {
             _ if sub.is_some() => 1,
             _ => return Err(name),
         };
-        let a = *self
-            .scalar
-            .get(&(b, i))
-            .ok_or("an untracked global address")?;
         let guard = self.guard(b, i)?;
         let Some(Operand::Vector { reg, .. }) = *dst else {
             return Err("a global load result");
+        };
+        let Some(&a) = self.scalar.get(&(b, i)) else {
+            if sub.is_none() && crate::resource::traces_rays(self.x.p) {
+                // shortcut: out of the acceleration structure.
+                let z = self.s.m.i32(0);
+                for k in 0..n {
+                    self.write(inst, Reg::V(reg + k as u8), z, guard);
+                }
+                return Ok(());
+            }
+            return Err("an untracked global address");
         };
         let c = self.cur;
         let mut off = self.s.m.i32(a.offset);
@@ -4871,6 +4878,18 @@ impl<'a> Lower<'a> {
             return self.code_smem(inst, a);
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
+            if self.scalar.get(&site).is_none()
+                && crate::resource::traces_rays(self.x.p)
+                && let Some(count) = name.strip_prefix("s_load_dword").and_then(smem_dwords)
+                && let Some(Operand::Scalar { code, .. }) = *data
+            {
+                // shortcut: out of the acceleration structure.
+                let z = self.s.m.i32(0);
+                for k in 0..count {
+                    self.write(inst, Reg::S(code + k as u8), z, None);
+                }
+                return Ok(());
+            }
             if let Some(a) = self.scalar.get(&site).copied()
                 && self
                     .x
@@ -9101,6 +9120,19 @@ impl<'a> Lower<'a> {
             return Err("an image access with tfe or lwe");
         }
         let name = inst.name();
+        if name.starts_with("image_bvh") {
+            // shortcut: rays hit nothing (no node after this one): nothing is
+            // in shadow, and indirect light is the sky's.
+            let guard = self.guard(b, i)?;
+            let Operand::Vector { reg, .. } = *data else {
+                return Err("a ray intersection's result");
+            };
+            let none = self.s.m.i32(u32::MAX);
+            for k in 0..4 {
+                self.write(inst, Reg::V(reg + k), none, guard);
+            }
+            return Ok(());
+        }
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
@@ -11448,12 +11480,13 @@ impl<'a> Lower<'a> {
                 // Console flow: every lane arrives by every edge, so a join
                 // also takes masks that are constants or built from scalars.
                 let arg = &phi.args[n];
-                let others = self.console_cf.then(|| self.x.st.others.get(arg)).flatten();
-                let m =
-                    *self.x.st.masks.get(arg).or(others).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
-                let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
+                // shortcut: a plain scalar on the edge is the register in
+                // another use, taken for a mask no lane is in; right as long
+                // as the program does not read the join after that edge.
+                let x = match self.x.st.masks.get(arg).or_else(|| self.x.st.others.get(arg)) {
+                    Some(&m) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
+                    None => self.s.m.bool(false),
+                };
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);

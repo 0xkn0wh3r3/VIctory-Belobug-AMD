@@ -151,6 +151,14 @@ pub struct Waterfall {
 /// Traces every descriptor and scalar address of `p`, which runs as
 /// `stage`, to the root parameters in `layout`. Fails on the first one it
 /// cannot trace.
+/// Whether the program intersects rays with an acceleration structure.
+pub(crate) fn traces_rays(p: &Program) -> bool {
+    p.blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|i| i.name().starts_with("image_bvh"))
+}
+
 pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resources, ShaderError> {
     let t = Tracer::new(p, layout, stage)?;
     let mut out = Resources {
@@ -166,6 +174,10 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
     };
     // `v_readfirstlane_b32` results descriptors are read from.
     let mut first_lane: Vec<Value> = Vec::new();
+    // Programs that trace rays follow pointers out of the acceleration
+    // structure, which the host does not have: those loads are left untracked
+    // (they give zeros, and rays hit nothing).
+    let traces = traces_rays(p);
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -180,6 +192,7 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
                 Ok(())
             };
             match &inst.fields {
+                Fields::Image { .. } if inst.name().starts_with("image_bvh") => {}
                 Fields::Image { rsrc, sampler, .. } => {
                     descriptor(rsrc, Role::Resource)?;
                     if let Some(s) = sampler {
@@ -205,8 +218,11 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
                     soffset,
                     ..
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
-                    let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
-                    out.scalar.push((site, address));
+                    match t.smem_address(inst, base, *offset, soffset) {
+                        Ok(address) => out.scalar.push((site, address)),
+                        Err(_) if traces && inst.name().contains("_load_") => {}
+                        Err(what) => return Err(fail(what)),
+                    }
                 }
                 Fields::Flat {
                     addr,
@@ -214,10 +230,11 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
                     offset,
                     ..
                 } if inst.name().starts_with("global_") => {
-                    let address = t
-                        .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
-                        .map_err(fail)?;
-                    out.scalar.push((site, address));
+                    match t.flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset) {
+                        Ok(address) => out.scalar.push((site, address)),
+                        Err(_) if traces && inst.name().starts_with("global_load_dword") => {}
+                        Err(what) => return Err(fail(what)),
+                    }
                 }
                 _ => {}
             }

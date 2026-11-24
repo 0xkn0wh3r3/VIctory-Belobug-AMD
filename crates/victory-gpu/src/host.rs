@@ -1991,6 +1991,8 @@ impl HostList {
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// The same of sparse copies.
+    pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
     /// View heaps the submission's draws index directly, and whether their
@@ -2006,6 +2008,11 @@ struct Batch {
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
+        if shadow.is_sparse() {
+            // It stands for far more memory than a list reads.
+            self.pieces.push((shadow.clone(), address, end));
+            return;
+        }
         match self
             .refreshes
             .iter_mut()
@@ -2044,6 +2051,24 @@ impl Batch {
     fn flush(&mut self) {
         for (shadow, from, to) in std::mem::take(&mut self.refreshes) {
             update(&shadow, from, to - from);
+        }
+        let mut pieces = std::mem::take(&mut self.pieces);
+        pieces.sort_unstable_by_key(|(s, from, _)| (s.root_key(), *from));
+        let mut run: Option<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = None;
+        for (shadow, from, to) in pieces {
+            if let Some((s, _, end)) = &mut run
+                && s.root_key() == shadow.root_key()
+                && from <= *end + 4096
+            {
+                *end = (*end).max(to);
+                continue;
+            }
+            if let Some((s, a, b)) = run.replace((shadow, from, to)) {
+                update(&s, a, b - a);
+            }
+        }
+        if let Some((s, a, b)) = run {
+            update(&s, a, b - a);
         }
     }
 

@@ -230,6 +230,16 @@ impl Shadow {
         self.direct.is_some()
     }
 
+    pub(crate) fn is_sparse(&self) -> bool {
+        self.sparse.is_some()
+    }
+
+    /// The same for copies that share their memory.
+    pub(crate) fn root_key(&self) -> usize {
+        self.sparse_root()
+            .map_or(std::ptr::from_ref(self) as usize, |(r, _)| std::ptr::from_ref(r) as usize)
+    }
+
     /// Whether the title mapped other memory there since.
     pub(crate) fn is_dead(&self) -> bool {
         self.direct
@@ -875,7 +885,7 @@ struct Tile {
 }
 
 /// Address space a sparse copy stands for.
-const CHUNK: u64 = 16 << 30;
+const CHUNK: u64 = 2 << 30;
 
 /// Memory for tiles, in heaps the CPU maps.
 struct TilePool {
