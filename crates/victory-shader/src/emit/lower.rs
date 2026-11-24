@@ -3561,7 +3561,15 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
-        let h = self.handle(site, &src, false, props)?;
+        // The handle is built from this load's own address (the other
+        // load's registers need not hold it here): the descriptor starts
+        // `skew` dwords before what this load reads.
+        let h = if load == site {
+            self.handle(site, &src, false, props)?
+        } else {
+            let index = self.heap_index_at(site, skew.wrapping_neg(), false)?;
+            self.s.heap_handle(self.cur, index, false, props)
+        };
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
@@ -3631,12 +3639,19 @@ impl<'a> Lower<'a> {
 
     /// The dword of what the scalar load at `other` reads that `inst` (at
     /// `site`) reads first: the same base and offset registers, immediates
-    /// a whole number of dwords apart (none for loads that differ
-    /// otherwise). The handle of the other load's descriptor is then built
-    /// from values `inst` reads too.
+    /// a whole number of dwords apart, or else traced addresses that are
+    /// (the same parameter and computed term: the code often builds the
+    /// table pointer `{table, 0}` again before the second load); none for
+    /// loads that differ otherwise.
     fn load_skew(&self, inst: &Inst, site: Site, other: Site) -> Option<i32> {
         if other == site {
             return Some(0);
+        }
+        if let (Some(a), Some(b)) = (self.scalar.get(&site), self.scalar.get(&other))
+            && (a.param, a.dynamic, a.includes_base) == (b.param, b.dynamic, b.includes_base)
+            && a.offset.wrapping_sub(b.offset) % 4 == 0
+        {
+            return Some(a.offset.wrapping_sub(b.offset) as i32 / 4);
         }
         let o: &Inst = &self.x.p.blocks[other.0].insts[other.1];
         let (
@@ -4022,6 +4037,13 @@ impl<'a> Lower<'a> {
     /// The heap index of the descriptor at dword `first` of what the scalar
     /// load at `load` reads, computed in the current block.
     fn heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
+        self.heap_index_at(load, i32::from(first), sampler)
+    }
+
+    /// The heap index of the descriptor `dwords` dwords from the first one
+    /// the scalar load at `load` reads (before it if negative), computed
+    /// in the current block.
+    fn heap_index_at(&mut self, load: Site, dwords: i32, sampler: bool) -> Result<V, Why> {
         let a = *self
             .scalar
             .get(&load)
@@ -4049,7 +4071,7 @@ impl<'a> Lower<'a> {
         let k = self
             .s
             .m
-            .i32((*offset as u32).wrapping_add(4 * u32::from(first)));
+            .i32((*offset as u32).wrapping_add(4u32.wrapping_mul(dwords as u32)));
         addr = self.s.m.bin(c, Bin::Add, addr, k);
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
             let so = self.operand(li, soffset)?;
@@ -7565,6 +7587,120 @@ mod tests {
             e.to_string().contains("a descriptor read only as data"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn a_descriptor_dword_loaded_through_a_rebuilt_table_pointer() {
+        // A 2D image's descriptor (a table range at s0) loaded whole for an
+        // image_store in an exec-masked tail, and its dword 2 (width and
+        // height) loaded alone through another copy of the table pointer
+        // {s0, 0} (a copy in other registers, or the high half set to 0
+        // again after the registers held scratch), its height bits read.
+        let layout = || vec![root(RootType::Table, 0, 0)];
+        let copied = [
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF400_0300,
+            0xFA00_0008, // s_load_dword s12, s[0:1], 0x8
+            0xBE82_0300, // s_mov_b32 s2, s0
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF40C_0101,
+            0xFA00_0000, // s_load_dwordx8 s[4:11], s[2:3], 0x0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x938D_FF0C,
+            0x000E_000E, // s_bfe_u32 s13, s12, 0xe000e
+            0x7E0A_020D, // v_mov_b32 v5, s13
+            0xD834_0000,
+            0x0000_0500, // ds_write_b32 v0, v5
+            0x7D88_0084, // v_cmp_gt_u32 vcc_lo, 4, v0
+            0xBE82_3C6A, // s_and_saveexec_b32 s2, vcc_lo
+            0xBF88_0002, // s_cbranch_execz -> s_endpgm
+            0xF020_1F08,
+            0x0001_0100, // image_store v[1:4], v[0:1], s[4:11] dmask:0xf dim:SQ_RSRC_IMG_2D unorm
+            S_ENDPGM,
+        ];
+        lower_with(&copied, layout(), vec![]).unwrap();
+        let rebuilt = [
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF40C_0100,
+            0xFA00_0000, // s_load_dwordx8 s[4:11], s[0:1], 0x0
+            0x7D88_0084, // v_cmp_gt_u32 vcc_lo, 4, v0
+            0xBE82_3C6A, // s_and_saveexec_b32 s2, vcc_lo
+            0xBF88_0002, // s_cbranch_execz -> s_or_b32
+            0xF020_1F08,
+            0x0001_0100, // image_store v[1:4], v[0:1], s[4:11] dmask:0xf dim:SQ_RSRC_IMG_2D unorm
+            0x887E_027E, // s_or_b32 exec_lo, exec_lo, s2
+            0x7E08_0500, // v_readfirstlane_b32 s4, v0
+            0x7E02_0501, // v_readfirstlane_b32 s1, v1
+            0x8704_FF04,
+            0x0000_01FF, // s_and_b32 s4, s4, 0x1ff
+            0x8F01_8901, // s_lshl_b32 s1, s1, 9
+            0x8804_0104, // s_or_b32 s4, s4, s1
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF400_0300,
+            0xFA00_0008, // s_load_dword s12, s[0:1], 0x8
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x938D_FF0C,
+            0x000E_000E, // s_bfe_u32 s13, s12, 0xe000e
+            0x8804_0D04, // s_or_b32 s4, s4, s13
+            0x7E0A_0204, // v_mov_b32 v5, s4
+            0xD834_0000,
+            0x0000_0500, // ds_write_b32 v0, v5
+            S_ENDPGM,
+        ];
+        lower_with(&rebuilt, layout(), vec![]).unwrap();
+        // Dword 2 of the next descriptor: no load of it is used.
+        let mut next = copied;
+        next[2] = 0xFA00_0028;
+        let e = lower_with(&next, layout(), vec![]).err().unwrap();
+        assert!(
+            e.to_string().contains("a descriptor read only as data"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn descriptor_registers_reused_after_a_masked_image_store() {
+        // An image_store in an exec-masked tail is the only use of its
+        // descriptor load; after the join the descriptor's registers hold
+        // scratch (v_readfirstlane, then bit packing), alone or as the low
+        // half of a 64-bit shift whose high half is still a descriptor
+        // dword.
+        let layout = || vec![root(RootType::Table, 0, 0)];
+        let head = [
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF40C_0100,
+            0xFA00_0000, // s_load_dwordx8 s[4:11], s[0:1], 0x0
+            0x7D88_0084, // v_cmp_gt_u32 vcc_lo, 4, v0
+            0xBE82_3C6A, // s_and_saveexec_b32 s2, vcc_lo
+            0xBF88_0002, // s_cbranch_execz -> past the store
+            0xF020_1F08,
+            0x0001_0100, // image_store v[1:4], v[0:1], s[4:11] dmask:0xf dim:SQ_RSRC_IMG_2D unorm
+        ];
+        let packed = [
+            0x887E_027E, // s_or_b32 exec_lo, exec_lo, s2
+            0x7E08_0500, // v_readfirstlane_b32 s4, v0
+            0x7E0A_0501, // v_readfirstlane_b32 s5, v1
+            0x8704_FF04,
+            0x0000_01FF, // s_and_b32 s4, s4, 0x1ff
+            0x8F05_8905, // s_lshl_b32 s5, s5, 9
+            0x8804_0504, // s_or_b32 s4, s4, s5
+            0x7E0A_0204, // v_mov_b32 v5, s4
+            0xD834_0000,
+            0x0000_0500, // ds_write_b32 v0, v5
+            S_ENDPGM,
+        ];
+        let wide = [
+            0x887E_027E, // s_or_b32 exec_lo, exec_lo, s2
+            0x7E08_0500, // v_readfirstlane_b32 s4, v0
+            0x8F84_8904, // s_lshl_b64 s[4:5], s[4:5], 9
+            0x7E0A_0204, // v_mov_b32 v5, s4
+            0xD834_0000,
+            0x0000_0500, // ds_write_b32 v0, v5
+            S_ENDPGM,
+        ];
+        lower_with(&[&head[..], &[S_ENDPGM]].concat(), layout(), vec![]).unwrap();
+        lower_with(&[&head[..], &packed].concat(), layout(), vec![]).unwrap();
+        lower_with(&[&head[..], &wide].concat(), layout(), vec![]).unwrap();
     }
 
     #[test]
