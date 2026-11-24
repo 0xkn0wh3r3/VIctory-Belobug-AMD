@@ -842,7 +842,7 @@ pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// What the driver allocates for it (counted in [`crate::memstat`]).
-    bytes: u64,
+    pub(crate) bytes: u64,
 }
 
 #[cfg(windows)]
@@ -850,6 +850,8 @@ impl Drop for HostTexture {
     fn drop(&mut self) {
         crate::memstat::sub(&crate::memstat::HOST_TEXTURES, self.bytes);
         crate::memstat::sub(&crate::memstat::HOST_TEXTURE_COUNT, 1);
+        // A submission recorded but not yet run may still name it.
+        crate::host::retire(self.texture.clone());
     }
 }
 
@@ -1504,6 +1506,24 @@ static RESOURCE_FUNCTIONS: Table<32> = {
     Table(f)
 };
 
+#[cfg(all(test, windows))]
+pub(crate) fn test_buffer_at(address: u64, width: u64) -> This {
+    let mut buffer = std::ptr::null();
+    assert_eq!(
+        create_at_address(
+            std::ptr::null(),
+            address,
+            &tests::buffer(width),
+            0,
+            std::ptr::null(),
+            &RESOURCE_IIDS[0],
+            &mut buffer,
+        ),
+        S_OK,
+    );
+    buffer
+}
+
 #[cfg(test)]
 pub(crate) fn test_buffer(width: u64) -> This {
     let heap = HeapProperties {
@@ -1558,7 +1578,7 @@ mod tests {
         visible_nodes: 0,
     };
 
-    fn buffer(width: u64) -> ResourceDesc {
+    pub(super) fn buffer(width: u64) -> ResourceDesc {
         ResourceDesc {
             dimension: BUFFER,
             alignment: 0,

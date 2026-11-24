@@ -10,10 +10,9 @@
 //! in its copy. Ranges shaders write go back to title memory after the
 //! submission ([`Shadow::gpu_writes`]).
 //!
-//! shortcut: only the ranges draws are known to read are brought up to
-//! date (vertex and index buffer views, constant buffers in tables, root
-//! descriptors, buffer views in tables); buffers read through directly
-//! indexed heaps keep what their first use copied.
+//! Mirrored buffer SRVs in bound heaps also refresh at submission, since
+//! a shader may select their index dynamically. Directly indexed UAVs
+//! still need read/write tracking independent of conventional table use.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -164,6 +163,13 @@ impl Shadow {
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start
+    }
+
+    /// The copy's bytes at `[address, address + len)` (inside the buffer).
+    #[cfg(test)]
+    pub(crate) fn host_bytes(&self, address: u64, len: usize) -> Vec<u8> {
+        // SAFETY: inside the mapping; no submission runs while tests read.
+        unsafe { std::slice::from_raw_parts(self.data.add(self.offset(address) as usize), len) }.to_vec()
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
