@@ -389,6 +389,7 @@ fn emit_program(
         _ => 0,
     };
     let mut parts = lower::Parts {
+        psv: c.part(FourCC::PSV0).map(|p| p.data),
         native,
         p,
         st,
@@ -497,6 +498,42 @@ fn psv_interp(part: &[u8], pixel: bool) -> Option<Vec<(Option<u32>, u8, u8, u8)>
         out.push((row, col, e[11], e[13]));
     }
     Some(out)
+}
+
+/// The native binding map gives a register but no space. Require every
+/// covering declaration of that register class to describe a structured buffer.
+fn declares_structured_buffer(part: &[u8], register: u32, uav: bool) -> bool {
+    use crate::dxbc::u32_at;
+    let table = || {
+        let info = u32_at(part, 0).ok()? as usize;
+        let header = part.get(4..)?.get(info..)?;
+        let count = u32_at(header, 0).ok()? as usize;
+        let stride = u32_at(header, 4).ok()? as usize;
+        if stride < 16 {
+            return None;
+        }
+        Some(
+            header
+                .get(8..)?
+                .get(..count.checked_mul(stride)?)?
+                .chunks_exact(stride),
+        )
+    };
+    let Some(entries) = table() else { return false };
+    let mut found = false;
+    for entry in entries {
+        let kind = u32_at(entry, 0).expect("binding header");
+        let class = if uav { 6..=9 } else { 3..=5 };
+        if class.contains(&kind)
+            && (u32_at(entry, 8).unwrap()..=u32_at(entry, 12).unwrap()).contains(&register)
+        {
+            if kind != if uav { 8 } else { 5 } {
+                return false;
+            }
+            found = true;
+        }
+    }
+    found
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -1105,6 +1142,7 @@ mod tests {
             prims: Vec::new(),
             mesh_stride: 0,
             target: crate::emit::Target::ANY,
+            psv: None,
             console_cf: false,
             per_lane_only: false,
         })
@@ -1261,6 +1299,7 @@ mod tests {
             prims: Vec::new(),
             mesh_stride: 0,
             target: crate::emit::Target::ANY,
+            psv: None,
             console_cf: false,
             per_lane_only: false,
         })
@@ -1425,6 +1464,7 @@ mod tests {
             prims: Vec::new(),
             mesh_stride: 0,
             target: crate::emit::Target::ANY,
+            psv: None,
             console_cf: false,
             per_lane_only: false,
         })
@@ -1582,6 +1622,7 @@ mod tests {
             prims: Vec::new(),
             mesh_stride: 0,
             target: crate::emit::Target::ANY,
+            psv: None,
             console_cf: false,
             per_lane_only: false,
         })

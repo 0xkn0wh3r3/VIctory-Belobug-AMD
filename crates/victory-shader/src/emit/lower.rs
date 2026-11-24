@@ -113,6 +113,7 @@ pub(crate) struct Lowered {
 
 pub(crate) struct Parts<'a> {
     pub native: &'a NativeProgram,
+    pub psv: Option<&'a [u8]>,
     pub p: &'a Program,
     pub st: &'a Structured,
     pub io: &'a Io,
@@ -5224,14 +5225,36 @@ impl<'a> Lower<'a> {
                 load: site,
                 first: 0,
             };
-            if count != 8
-                || self
-                    .used_kind(&src)
-                    .is_some_and(|u| u.kind != ResourceType::Srv)
-            {
-                return Err("a descriptor read only as data");
+            let used = self.used_kind(&src);
+            if count == 8 && !used.is_some_and(|u| u.kind != ResourceType::Srv) {
+                (site, 0, src, (2, 0x409), Some(2), false)
+            } else {
+                // A buffer the program only counts the records of (#329):
+                // an exact statically addressed four-dword binding of a
+                // structured buffer the container declares, never the
+                // nearest earlier entry or a dynamically indexed range.
+                let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
+                let address = self
+                    .scalar
+                    .get(&site)
+                    .ok_or("a descriptor read only as data")?;
+                let Some(binding) = used.filter(|b| {
+                    count == 4
+                        && address.dynamic.is_none()
+                        && b.table_offset_dwords.checked_mul(4) == Some(address.offset)
+                        && b.dwords == 4
+                        && matches!(b.kind, ResourceType::Srv | ResourceType::Uav)
+                        && (4..=2048).contains(&b.stride)
+                        && b.stride.is_multiple_of(4)
+                        && self.x.psv.is_some_and(|part| {
+                            super::declares_structured_buffer(part, b.lower_bound, uav)
+                        })
+                }) else {
+                    return Err("a descriptor read only as data");
+                };
+                let u = if uav { 0x1000 } else { 0 };
+                (site, 0, src, (12 | u, binding.stride), None, uav)
             }
-            (site, 0, src, (2, 0x409), Some(2), false)
         };
         // The handle is built from this load's own address (the other
         // load's registers need not hold it here): the descriptor starts
@@ -11611,6 +11634,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             target: crate::emit::Target::ANY,
+            psv: None,
             console_cf: false,
             per_lane_only: false,
         };
@@ -11659,6 +11683,7 @@ mod tests {
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
         lower(&Parts {
+            psv: None,
             native: &native,
             p: &p,
             st: &st,
@@ -12582,6 +12607,7 @@ mod tests {
             prims: Vec::new(),
             mesh_stride: 0,
             target: crate::emit::Target::ANY,
+            psv: None,
             console_cf: false,
             per_lane_only: false,
         })
@@ -12661,6 +12687,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             target: crate::emit::Target::ANY,
+            psv: None,
             console_cf: false,
             per_lane_only: false,
         };
@@ -12742,6 +12769,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             target: crate::emit::Target::ANY,
+            psv: None,
             console_cf: false,
             per_lane_only: false,
         })
@@ -12837,6 +12865,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             target: crate::emit::Target::ANY,
+            psv: None,
             console_cf: false,
             per_lane_only: false,
         })
@@ -13067,6 +13096,7 @@ mod tests {
                 prims: vec![],
                 mesh_stride: 0,
                 target: crate::emit::Target::ANY,
+                psv: None,
                 console_cf: false,
                 per_lane_only: false,
             })
@@ -13155,6 +13185,7 @@ mod tests {
                 prims: vec![],
                 mesh_stride: 0,
                 target: crate::emit::Target::ANY,
+                psv: None,
                 console_cf: false,
                 per_lane_only: false,
             });
@@ -13226,6 +13257,7 @@ mod tests {
                 prims: vec![],
                 mesh_stride: 0,
                 target: crate::emit::Target::ANY,
+                psv: None,
                 console_cf: false,
                 per_lane_only: false,
             })

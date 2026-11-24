@@ -168,6 +168,7 @@ fn build_cs(body: &[u32], outputs: &[u8]) -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
         target: crate::emit::Target::ANY,
+        psv: None,
         console_cf: false,
         per_lane_only: false,
     })
