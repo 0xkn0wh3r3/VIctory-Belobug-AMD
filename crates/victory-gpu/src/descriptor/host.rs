@@ -350,7 +350,9 @@ impl BindlessPlan {
     /// shortcut: all of them once a frame, else only for a plan not copied
     /// yet: the title writes constants before it points a slot at them.
     /// Returns the title memory to bring up to date, by the same rule.
-    pub(crate) fn copy_constants(&self) -> &[(Arc<crate::shadow::Shadow>, usize, usize)] {
+    /// And whether it is all of it (and may be looked at less often where it
+    /// does not change) rather than what is new.
+    pub(crate) fn copy_constants(&self) -> (&[(Arc<crate::shadow::Shadow>, usize, usize)], bool) {
         let frame = crate::queue::presented() + 1;
         // Counted for all plans: each is the one before with a few changes.
         static FRAME: AtomicU64 = AtomicU64::new(0);
@@ -359,7 +361,7 @@ impl BindlessPlan {
         let (bounces, reads) = match (all || cfg!(test), fresh) {
             (true, _) => (&*self.bounces, &*self.reads),
             (_, true) => (&self.fresh, &self.fresh_reads),
-            _ => return &[],
+            _ => return (&[], false),
         };
         if !bounces.is_empty() {
             let started = std::time::Instant::now();
@@ -375,7 +377,7 @@ impl BindlessPlan {
             crate::host::PREPARING[0].fetch_add(us, Ordering::Relaxed);
             crate::host::PREPARING[1].fetch_add(bytes, Ordering::Relaxed);
         }
-        reads
+        (reads, all)
     }
 }
 

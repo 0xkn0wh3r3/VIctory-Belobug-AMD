@@ -11,7 +11,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 const LARGEST: u64 = 8 << 20;
 
 struct Slab {
-    memory: Memory,
+    /// `None` once no slot was used.
+    memory: Option<Memory>,
     free: Vec<u32>,
     slots: u32,
 }
@@ -39,6 +40,9 @@ impl Drop for Slot {
         let mut slabs = SLABS.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(s) = slabs.get_mut(&self.size).and_then(|v| v.get_mut(self.heap)) {
             s.free.push(self.index);
+            if s.free.len() == s.slots as usize {
+                s.memory = None;
+            }
         }
     }
 }
@@ -57,13 +61,14 @@ fn class(bytes: u64) -> u64 {
 fn slot(size: (u64, bool), make: impl FnOnce(u64) -> Option<Memory>) -> Option<(Slot, Memory)> {
     let mut slabs = SLABS.lock().unwrap_or_else(|e| e.into_inner());
     let of = slabs.entry(size).or_default();
-    let at = match of.iter().position(|s| !s.free.is_empty()) {
+    let bytes = (size.0 * 8).clamp(1 << 20, 16 << 20).next_multiple_of(64 << 10);
+    let used = of.iter().position(|s| s.memory.is_some() && !s.free.is_empty());
+    let at = match used.or_else(|| of.iter().position(|s| s.memory.is_none())) {
         Some(at) => at,
         None => {
-            let bytes = (size.0 * 32).clamp(1 << 20, 32 << 20).next_multiple_of(64 << 10);
             let slots = (bytes / size.0) as u32;
             of.push(Slab {
-                memory: make(bytes)?,
+                memory: None,
                 free: (0..slots).rev().collect(),
                 slots,
             });
@@ -71,9 +76,12 @@ fn slot(size: (u64, bool), make: impl FnOnce(u64) -> Option<Memory>) -> Option<(
         }
     };
     let s = &mut of[at];
+    if s.memory.is_none() {
+        s.memory = Some(make(bytes)?);
+    }
     let index = s.free.pop()?;
     debug_assert!(index < s.slots);
-    Some((Slot { size, heap: at, index }, s.memory.clone()))
+    Some((Slot { size, heap: at, index }, s.memory.clone()?))
 }
 
 /// Upload memory for `bytes`: a buffer, where the CPU writes it from its

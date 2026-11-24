@@ -2086,7 +2086,7 @@ impl Batch {
             let Some(plan) = plan else {
                 continue;
             };
-            let reads = plan.copy_constants();
+            let (reads, all) = plan.copy_constants();
             if !reads.is_empty() {
                 let started = std::time::Instant::now();
                 let copied = std::sync::atomic::AtomicU64::new(0);
@@ -2098,7 +2098,7 @@ impl Batch {
                             add(C::Refreshes, 1);
                             add(C::RefreshBytes, *len as u64);
                         }
-                        let n = shadow.update(*address, *len);
+                        let n = shadow.update_lazily(*address, *len, all);
                         copied.fetch_add(n as u64, Ordering::Relaxed);
                     }
                 });

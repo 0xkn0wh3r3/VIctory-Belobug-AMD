@@ -439,11 +439,17 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        self.update_lazily(address, len, false)
+    }
+
+    /// [`Shadow::update`]; `lazy`: the tiles of a sparse copy that did not
+    /// change the last times are looked at less often.
+    pub(crate) fn update_lazily(&self, address: usize, len: usize, lazy: bool) -> usize {
         if self.direct.is_some() {
             return 0;
         }
         if let Some(root) = self.sparse.as_ref().and_then(|s| s.of.as_ref()) {
-            return root.update(address, len);
+            return root.update_lazily(address, len, lazy);
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
@@ -466,21 +472,21 @@ impl Shadow {
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
                 if a > at {
-                    bytes += self.update_free(at, a);
+                    bytes += self.update_free(at, a, lazy);
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_free(at, to);
+                bytes += self.update_free(at, to, lazy);
             }
             return bytes;
         }
-        self.update_free(from, to)
+        self.update_free(from, to, lazy)
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
-    fn update_free(&self, from: usize, to: usize) -> usize {
+    fn update_free(&self, from: usize, to: usize, lazy: bool) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
@@ -504,8 +510,69 @@ impl Shadow {
                 return 0;
             }
         }
+        if let Some(s) = self.sparse.as_ref().filter(|_| !cfg!(test)) {
+            return self.copy_tiles(s, from, to, frame, lazy);
+        }
         self.copy(from, to);
         to - from
+    }
+
+    /// Copies title memory `[from, to)` into the tiles of a sparse copy;
+    /// `lazy`: not those whose turn it is not.
+    ///
+    /// shortcut: a tile that did not change when looked at twice is next
+    /// looked at after 2, 4 and at most 16 frames, unless something new reads
+    /// it: the title fills memory, then makes views of it.
+    fn copy_tiles(&self, s: &Sparse, from: usize, to: usize, frame: u64, lazy: bool) -> usize {
+        thread_local! {
+            static READ: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0; PAGE]);
+        }
+        let mut bytes = 0;
+        self.each_tile(s, from, to, |at, data, n| {
+            if n < PAGE {
+                crate::host::copy_mapped(data, at as *const u8, n, false);
+                bytes += n;
+                return;
+            }
+            let tile = ((at - self.start as usize) / PAGE) as u32;
+            let seen = {
+                let looks = s.looks.lock().unwrap_or_else(|e| e.into_inner());
+                looks.get(&tile).copied()
+            };
+            if lazy && seen.is_some_and(|(next, _)| frame < next) {
+                return;
+            }
+            bytes += n;
+            // Only written where it changed: the copy is in memory the CPU
+            // reads quickly.
+            let same = READ.with_borrow_mut(|read| {
+                if !crate::host::read_into(at as *const u8, &mut read[..n]) {
+                    crate::host::copy_mapped(data, at as *const u8, n, false);
+                    return false;
+                }
+                // SAFETY: the tile's mapping; only submissions write it.
+                let host = unsafe { std::slice::from_raw_parts_mut(data, n) };
+                let same = *host == read[..n];
+                if !same {
+                    host.copy_from_slice(&read[..n]);
+                }
+                same
+            });
+            let still = match seen {
+                Some((_, still)) if same => (still + 1).min(5),
+                _ => 0,
+            };
+            // Not all in the same frame.
+            let wait = match still {
+                0 | 1 => 1,
+                k => (1 << (k - 1)) - u64::from(tile) % 2,
+            };
+            s.looks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(tile, (frame + wait, still));
+        });
+        bytes
     }
 
     /// Copies the pages of `[from, to)` written after their last copy
@@ -894,6 +961,9 @@ struct Sparse {
     tiles: Mutex<std::collections::HashMap<u32, Tile, Mix>>,
     /// What tiles shaders write held before the submission.
     before: Mutex<std::collections::HashMap<u32, Vec<u8>, Mix>>,
+    /// By tile: the frame to look at it next in, and how often in a row it
+    /// had not changed.
+    looks: Mutex<std::collections::HashMap<u32, (u64, u32), Mix>>,
     /// The same from other 64 KiB starts ([`Direct::aliases`]).
     aliases: Mutex<Vec<Arc<Shadow>>>,
     /// This is an alias of that one.
@@ -1038,6 +1108,7 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
         sparse: Some(Sparse {
             tiles: Mutex::default(),
             before: Mutex::default(),
+            looks: Mutex::default(),
             aliases: Mutex::default(),
             of,
         }),
