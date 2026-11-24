@@ -6582,7 +6582,118 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Numeric, buffer_format};
+    use super::{Numeric, Parts, buffer_format, lower};
+    use crate::emit::container::SigElement;
+    use crate::native::{NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource};
+    use crate::{HwStage, ShaderError};
+
+    /// Lowers a pixel program that loads a sampler and an image from two
+    /// tables, samples v[0:3] from the address at v2 on with the two-dword
+    /// instruction `sample`, and exports the result.
+    fn lower_sample(sample: [u32; 2]) -> Result<Vec<u8>, ShaderError> {
+        let words = [
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0204,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[8:9], null
+            0xF40C_0001,
+            0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+            sample[0],
+            sample[1],
+            0xF800_180F,
+            0x0302_0100, // exp mrt0, v0, v1, v2, v3 done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let table = |user_data, slot| RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let used = |kind, dwords, user_data, slot| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords,
+            user_data,
+            slot,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![table(8, 0), table(9, 1)],
+            used: vec![
+                used(ResourceType::Sampler, 4, 8, 0),
+                used(ResourceType::Srv, 8, 9, 1),
+            ],
+            io: StageIo::Ps {
+                inputs: Vec::new(),
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: Vec::new(),
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs)?;
+        let res = crate::resource::track(&p, &native.layout, native.stage)?;
+        let io = crate::io::raise(&p, &native)?;
+        let st = crate::structure::structure(&p)?;
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: vec![target],
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .map(|l| l.dxil)
+    }
+
+    /// MIMG words: opcode, all four channels, the dimension; data v0,
+    /// address v2, image s[0:7], sampler s[8:11].
+    fn mimg(opcode: u32, dim: u32) -> [u32; 2] {
+        [0xF000_0F00 | opcode << 18 | dim << 3, 0x0040_0002]
+    }
+
+    const SAMPLE_D: u32 = 0x22;
+    const SAMPLE_D_CL: u32 = 0x23;
+    const DIM_2D: u32 = 1;
+    const DIM_CUBE: u32 = 3;
+
+    #[test]
+    fn gradient_samples_lower_on_planes_and_cubes() {
+        for (opcode, dim) in [
+            (SAMPLE_D, DIM_2D),
+            (SAMPLE_D, DIM_CUBE),
+            (SAMPLE_D_CL, DIM_2D),
+            (SAMPLE_D_CL, DIM_CUBE),
+        ] {
+            if let Err(e) = lower_sample(mimg(opcode, dim)) {
+                panic!("opcode {opcode:#x} on dimension {dim}: {e:?}");
+            }
+        }
+    }
 
     #[test]
     fn buffer_formats_by_number() {
