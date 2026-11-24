@@ -531,7 +531,7 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         let stage_data = &payload[(start + RECORD_SIZE) as usize..];
         let io = match stage {
             HwStage::Ps => ps_io(stage_data, code.len())?,
-            HwStage::Vs => vs_io(stage_data)?,
+            HwStage::Vs => vs_inputs_fit(vs_io(stage_data)?)?,
             HwStage::Cs => StageIo::Cs(ComputeIo {
                 rsrc2: u32_at(stage_data, CS_RSRC2)?,
                 threads: [
@@ -639,6 +639,21 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
         })
         .collect();
     Ok(StageIo::Vs { inputs, outputs })
+}
+
+/// Raising loads a vertex input's channel `c` from `v[vgpr + c]`, an 8-bit
+/// register number: every enabled channel must land on a VGPR.
+fn vs_inputs_fit(io: StageIo) -> Result<StageIo, ShaderError> {
+    if let StageIo::Vs { inputs, .. } = &io
+        && inputs.iter().any(|i| {
+            i.mask
+                .checked_ilog2()
+                .is_some_and(|last| u32::from(i.vgpr) + last > u32::from(u8::MAX))
+        })
+    {
+        return Err(Malformed("vertex input outside the VGPRs"));
+    }
+    Ok(io)
 }
 
 fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
@@ -1169,6 +1184,26 @@ mod tests {
             let mut blob = vs.clone();
             blob[e + count_at..][..4].copy_from_slice(&(MAX_SEMANTICS + 1).to_le_bytes());
             assert_eq!(refused_blob(&xbch(&blob)), "implausible semantic count");
+        }
+        // One input in v252 or v253: x-w of v252 end at v255 and fit; from
+        // v253, w would be v256.
+        let input = |vgpr: u8, mask: u8| {
+            let mut blob = vs.clone();
+            blob[e + VS_INPUT_COUNT..][..4].copy_from_slice(&1u32.to_le_bytes());
+            blob[e + VS_INPUTS..][..5].copy_from_slice(&[0, 0, mask, vgpr, 0]);
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        assert!(input(252, 0xf).is_ok());
+        assert!(input(255, 0x1).is_ok());
+        assert!(input(255, 0).is_ok(), "no channel is loaded");
+        for (vgpr, mask) in [(253, 0xf), (255, 0x2)] {
+            assert!(
+                matches!(
+                    input(vgpr, mask),
+                    Err(Malformed("vertex input outside the VGPRs"))
+                ),
+                "v{vgpr} mask {mask:#x}"
+            );
         }
 
         let ps = fssm(&[(HwStage::Ps, &PS_CODE)]);
