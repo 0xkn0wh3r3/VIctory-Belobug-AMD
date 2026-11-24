@@ -67,10 +67,16 @@ pub(crate) enum Plane {
 const D16_S8: std::ops::RangeInclusive<u32> = 118..=120;
 
 /// Whether a title texture of `format` and `flags` gets twins.
+/// shortcut: off unless `VICTORY_DEPTH_TWINS=1`. With them the lit image
+/// has every material (no squares) but the final picture comes out washed
+/// white and noisy (run w95, 2026-11-24), worse to look at than without.
 pub(crate) fn wanted(format: u32, flags: u32) -> bool {
     const DEPTH: u32 = 2;
     const UNORDERED: u32 = 4;
-    flags & (DEPTH | UNORDERED) == DEPTH | UNORDERED && D16_S8.contains(&format)
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DEPTH_TWINS").is_ok_and(|v| v == "1"))
+        && flags & (DEPTH | UNORDERED) == DEPTH | UNORDERED
+        && D16_S8.contains(&format)
 }
 
 /// Makes the twins of the host depth texture `texture`.

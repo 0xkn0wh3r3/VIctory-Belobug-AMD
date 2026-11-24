@@ -437,13 +437,23 @@ pub(crate) fn dump_targets(frame: u64) {
                 continue;
             };
             let offset = u64::from_str_radix(offset, 16).unwrap_or(0);
+            // A placed view's address, a constant buffer's or a buffer view's.
             let found = passes
                 .iter()
                 .find(|(_, t)| t.contains(program))
-                .and_then(|(_, t)| t.split_once(&format!("{slot}: placed")))
-                .and_then(|(_, t)| t.split_once(" at 0x"))
-                .and_then(|(_, t)| t.split_once('"'))
-                .and_then(|(t, _)| u64::from_str_radix(t, 16).ok());
+                .and_then(|(_, t)| t.split_once(&format!("{slot}: ")))
+                .and_then(|(_, t)| {
+                    if t.starts_with("placed") {
+                        let (_, t) = t.split_once(" at 0x")?;
+                        u64::from_str_radix(t.split_once('"')?.0, 16).ok()
+                    } else if let Some(t) = t.strip_prefix("Constant(0x") {
+                        u64::from_str_radix(t.split_once(',')?.0, 16).ok()
+                    } else if let Some(t) = t.strip_prefix("buffer Some((") {
+                        t.split_once(',')?.0.parse().ok()
+                    } else {
+                        None
+                    }
+                });
             if let Some(at) = found {
                 args.push_str(&format!(
                     "peek {peek} {at:#x}: {}
