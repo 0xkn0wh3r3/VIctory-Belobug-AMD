@@ -311,7 +311,6 @@ mod tests {
     use crate::native::{ComputeIo, StageIo};
     use crate::{Container, HwStage, NativeProgram, ShaderError, io, ir, resource, structure};
 
-    const HOLDING: &str = "a lane mask holding lanes elsewhere read as data";
 
     fn build(words: &[u32], wave64: bool) -> Program {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -435,11 +434,11 @@ mod tests {
         ];
         for uses in idioms {
             let words = else_mask_spilled(uses);
-            // The spill reads the mask as a number where its lanes are not.
-            match translate(&words, false) {
-                Err(ShaderError::Unsupported { what, .. }) => assert_eq!(what, HOLDING),
-                r => panic!("{r:?}"),
-            }
+            // The spill reads the mask as a number where its lanes are not:
+            // the else-mask is a set operation, whose number comes from its
+            // sources' numbers (#269), so the program translates unforwarded
+            // too.
+            translate(&words, false).unwrap();
             translate(&words, true).unwrap();
         }
     }
