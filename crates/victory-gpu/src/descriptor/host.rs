@@ -2291,6 +2291,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     _ => None,
                 };
             };
+            if let Some(twin) = crate::resource::depth_twin(resource) {
+                return crate::twin::view(twin, desc.as_ref(), at).map(Some);
+            }
             let mut desc = desc.as_ref().map(uav_desc);
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;

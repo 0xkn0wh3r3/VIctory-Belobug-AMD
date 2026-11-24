@@ -786,6 +786,7 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        crate::twin::begin();
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
@@ -818,6 +819,11 @@ impl State {
         }
         list.count_work();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        // Depth textures it wrote as images get what it wrote; then the
+        // title's state goes back on the list.
+        if crate::twin::resolve(list) {
+            self.continue_in(list);
+        }
     }
 
     /// Diagnostics (`VICTORY_DROPPED=<n>`): the roots of the first dispatches
@@ -1493,6 +1499,7 @@ impl State {
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => {
+                    crate::twin::begin();
                     if !self.bind(list, p, true) {
                         false
                     } else {
@@ -1552,6 +1559,9 @@ impl State {
         if kind == DISPATCH {
             list.count_work();
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            if crate::twin::resolve(list) {
+                self.continue_in(list);
+            }
         } else {
             list.count_work();
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -1637,9 +1647,14 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
                 }
             }
         }
-        (View::Unordered(resource, _, _), ResourceType::Uav) => {
+        (View::Unordered(resource, _, desc), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            // Written through its twins, copied in after the dispatch.
+            if crate::resource::depth_twin(*resource as This).is_some() {
+                crate::twin::note(*resource as This, desc.as_ref());
+                return;
+            }
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
         }
         _ => {}

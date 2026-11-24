@@ -850,6 +850,9 @@ pub(crate) struct HostTexture {
     /// When a list last moved it to a state shaders or draws write in, in
     /// order: of textures in the same memory, the last holds its contents.
     pub(crate) written: std::sync::atomic::AtomicU64,
+    /// Planes shaders write as images, for depth textures the title also
+    /// writes so ([`crate::twin`]); made on the first such view.
+    pub(crate) twin: std::sync::OnceLock<Option<crate::twin::Twin>>,
 }
 
 /// Textures the host GPU writes, by the title memory they are placed in.
@@ -1055,6 +1058,21 @@ pub(crate) fn host_resource<'a>(
         return None;
     }
     resource(this).host.as_deref().map(|h| &h.texture)
+}
+
+/// The twins of a depth texture the title also writes as an image (see
+/// [`crate::twin`]), made on first use; `None` for other textures.
+#[cfg(windows)]
+pub(crate) fn depth_twin<'a>(this: This) -> Option<&'a crate::twin::Twin> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if !crate::twin::wanted(r.desc.format, r.desc.flags) {
+        return None;
+    }
+    let host = r.host.as_deref()?;
+    host.twin.get_or_init(|| crate::twin::make(&host.texture)).as_ref()
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -1383,6 +1401,7 @@ fn hand_out_resource(
                 slot,
                 skip,
                 written: Default::default(),
+                twin: Default::default(),
                 state: state.into(),
             })
         }),

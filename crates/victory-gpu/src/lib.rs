@@ -58,6 +58,8 @@ pub mod signature;
 #[cfg(windows)]
 mod compose;
 #[cfg(windows)]
+mod twin;
+#[cfg(windows)]
 mod texpool;
 #[cfg(windows)]
 mod texture;
