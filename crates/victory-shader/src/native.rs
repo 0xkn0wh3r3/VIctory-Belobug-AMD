@@ -351,6 +351,10 @@ pub enum RootType {
 }
 
 impl RootType {
+    /// Not the title's: the host's first view of memory by address
+    /// (`emit::lower`, `Lower::memory`), as user data.
+    pub const MEMORY: RootType = RootType::Other(0x4D45_4D);
+
     fn from_raw(raw: u32) -> Self {
         match raw {
             0 => RootType::Constants,

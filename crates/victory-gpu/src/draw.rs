@@ -682,6 +682,8 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
+            #[cfg(feature = "diagnostics")]
+            self.note_dropped(x, y, z);
             return;
         };
         if !p.compute {
@@ -710,6 +712,42 @@ impl State {
         unsafe { list.list.Dispatch(x, y, z) };
         list.count_work();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Diagnostics (`VICTORY_DROPPED=<n>`): the roots of the first dispatches
+    /// of each pipeline not run.
+    #[cfg(feature = "diagnostics")]
+    fn note_dropped(&self, x: u32, y: u32, z: u32) {
+        use std::fmt::Write;
+        static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let most = *MOST.get_or_init(|| {
+            std::env::var("VICTORY_DROPPED").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        });
+        static SEEN: std::sync::Mutex<Option<std::collections::HashMap<usize, u32>>> =
+            std::sync::Mutex::new(None);
+        {
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            let n = seen.get_or_insert_default().entry(self.pipeline).or_default();
+            if *n >= most {
+                return;
+            }
+            *n += 1;
+        }
+        let mut text = String::new();
+        for (i, root) in self.roots_ref(true).iter().enumerate() {
+            match root {
+                Root::View(a) => {
+                    let host = crate::shadow::find_reaching(*a, 1)
+                        .map(|s| if s.is_direct() { "in place" } else if s.is_sparse() { "sparse" } else { "copy" });
+                    let _ = write!(text, " {i}:view {a:#x} {host:?}");
+                }
+                Root::Constants(w) => {
+                    let _ = write!(text, " {i}:constants {w:x?}");
+                }
+                _ => {}
+            }
+        }
+        tracing::info!("dropped {} {x}x{y}x{z}{text}", crate::pipeline::names(self.pipeline as This));
     }
 
     /// What a draw or dispatch runs, for the device-removed report

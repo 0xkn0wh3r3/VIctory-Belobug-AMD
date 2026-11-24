@@ -560,6 +560,8 @@ struct Lower<'a> {
     section_out: HashSet<Value>,
     /// Values of whole-wave sections holding one lane's, the one read after.
     one_lane: HashSet<Value>,
+    /// Views of buffers accessed by address, by instruction.
+    made: HashMap<Site, V>,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -1274,6 +1276,7 @@ impl<'a> Lower<'a> {
             sections: HashMap::new(),
             section_out: HashSet::new(),
             one_lane: Default::default(),
+            made: Default::default(),
             code_table: None,
             scratch: None,
             counters: HashMap::new(),
@@ -1503,6 +1506,9 @@ impl<'a> Lower<'a> {
             return Err("a global load directly into LDS");
         }
         let name = inst.name();
+        if self.x.res.addresses && !self.scalar.contains_key(&(b, i)) {
+            return self.flat_memory(inst, b, i);
+        }
         let rest = name
             .strip_prefix("global_load_")
             .ok_or("a global store or atomic without root UAV address support")?;
@@ -2306,6 +2312,8 @@ impl<'a> Lower<'a> {
         match rp.root {
             RootType::ResourceHeap | RootType::SamplerHeap => return Val::I32(self.s.m.i32(0)),
             RootType::Constants | RootType::Table => {}
+            // Its address, for programs that use memory by address.
+            RootType::Descriptor if self.x.res.addresses => {}
             _ => return Val::Missing("a root descriptor"),
         }
         let index = u32::from(rp.user_data) + dword;
@@ -2338,6 +2346,283 @@ impl<'a> Lower<'a> {
             &[h, row],
         );
         Val::I32(self.s.m.extract(entry, r, index % 4))
+    }
+
+    /// The heap index of the host's first view of memory by address: the
+    /// map, then the memory it names.
+    fn memory_base(&mut self) -> V {
+        let layout = &self.x.native.layout;
+        let index = layout
+            .iter()
+            .map(|p| u32::from(p.user_data) + p.sgprs.max(1))
+            .max()
+            .unwrap_or(0);
+        self.user_reads.insert(
+            index,
+            UserData {
+                index,
+                slot: u8::MAX,
+                root: RootType::MEMORY,
+                dword: 0,
+            },
+        );
+        self.s.user_data = self.s.user_data.max(index + 1);
+        let h = match self.user_data {
+            Some(h) => h,
+            None => {
+                let h = self.s.user_data_handle();
+                self.user_data = Some(h);
+                h
+            }
+        };
+        let entry = self.s.entry;
+        let row = self.s.m.i32(index / 4);
+        let r = self.s.op(
+            entry,
+            "cbufferLoadLegacy.i32",
+            Attr::ReadOnly,
+            self.s.t.cbuf_ret,
+            59,
+            &[h, row],
+        );
+        self.s.m.extract(entry, r, index % 4)
+    }
+
+    /// The host's view of the title memory at `hi:lo` (40 bits) and the
+    /// byte in it. The map holds two dwords per MiB: which view, and the
+    /// byte in it of that MiB's start.
+    fn memory(&mut self, lo: V, hi: V, nonuniform: bool) -> (V, V) {
+        let c = self.cur;
+        let first = self.memory_base();
+        let map = self.s.heap_handle(c, first, false, false, (11, 0));
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let (k255, k12, k20, k3, low) =
+            (k(self, 255), k(self, 12), k(self, 20), k(self, 3), k(self, 0xF_FFFF));
+        let h = self.s.m.bin(c, Bin::And, hi, k255);
+        let h = self.s.m.bin(c, Bin::Shl, h, k12);
+        let l = self.s.m.bin(c, Bin::LShr, lo, k20);
+        let mib = self.s.m.bin(c, Bin::Or, h, l);
+        let at = self.s.m.bin(c, Bin::Shl, mib, k3);
+        let (mask, align, u) = (self.s.m.i8(3), self.s.m.i32(4), self.s.m.undef(self.s.t.i32));
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[map, at, u, mask, align],
+        );
+        let view = self.s.m.extract(c, r, 0);
+        let view = self.as_int(view);
+        let start = self.s.m.extract(c, r, 1);
+        let start = self.as_int(start);
+        let index = self.s.m.bin(c, Bin::Add, first, view);
+        let handle = self.s.heap_handle(c, index, false, nonuniform, (11 | 0x1000, 0));
+        let within = self.s.m.bin(c, Bin::And, lo, low);
+        (handle, self.s.m.bin(c, Bin::Add, start, within))
+    }
+
+    /// `hi:lo` plus `x` (sign-extended).
+    fn add_address(&mut self, (lo, hi): (V, V), x: V, signed: bool) -> (V, V) {
+        let c = self.cur;
+        let (r, carry) = self.add_sub_carry(c, true, lo, x, None);
+        let up = self.s.m.cast(c, Cast::ZExt, carry, self.s.t.i32);
+        let mut hi = self.s.m.bin(c, Bin::Add, hi, up);
+        if signed {
+            let k31 = self.s.m.i32(31);
+            let s = self.s.m.bin(c, Bin::AShr, x, k31);
+            hi = self.s.m.bin(c, Bin::Add, hi, s);
+        }
+        (r, hi)
+    }
+
+    /// `count` dwords of title memory at `hi:lo`.
+    fn memory_dwords(&mut self, at: (V, V), count: u32, nonuniform: bool) -> Vec<V> {
+        let (h, off) = self.memory(at.0, at.1, nonuniform);
+        let mut out = Vec::new();
+        let mut done = 0;
+        while done < count {
+            let n = (count - done).min(4);
+            let c = self.cur;
+            let d = self.s.m.i32(4 * done);
+            let a = self.s.m.bin(c, Bin::Add, off, d);
+            let (mask, align, u) =
+                (self.s.m.i8((1u8 << n) - 1), self.s.m.i32(4), self.s.m.undef(self.s.t.i32));
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, a, u, mask, align],
+            );
+            for k in 0..n {
+                let x = self.s.m.extract(c, r, k);
+                let x = self.as_int(x);
+                out.push(x);
+            }
+            done += n;
+        }
+        out
+    }
+
+    /// The address a global memory instruction gives each lane.
+    fn flat_at(&mut self, inst: &Inst) -> Result<(V, V), Why> {
+        let Fields::Flat {
+            addr, saddr, offset, ..
+        } = &inst.fields
+        else {
+            unreachable!()
+        };
+        let Some(Operand::Vector { reg, .. }) = *addr else {
+            return Err("a global address");
+        };
+        let lo = inst.read(Reg::V(reg)).ok_or("a global address")?;
+        let lo = self.i32_of(lo)?;
+        let mut at = match *saddr {
+            Some(Operand::Scalar { code, .. }) if code != NULL => {
+                let (a, b) = (
+                    inst.read(Reg::S(code)).ok_or("a global address")?,
+                    inst.read(Reg::S(code + 1)).ok_or("a global address")?,
+                );
+                let base = (self.i32_of(a)?, self.i32_of(b)?);
+                self.add_address(base, lo, false)
+            }
+            _ => {
+                let hi = inst.read(Reg::V(reg + 1)).ok_or("a global address")?;
+                (lo, self.i32_of(hi)?)
+            }
+        };
+        if *offset != 0 {
+            let x = self.s.m.i32(i32::from(*offset) as u32);
+            at = self.add_address(at, x, true);
+        }
+        Ok(at)
+    }
+
+    /// A global memory access by address.
+    fn flat_memory(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        let Fields::Flat { dst, data, .. } = &inst.fields else {
+            unreachable!()
+        };
+        let name = inst.name();
+        let guard = self.guard(b, i)?;
+        let at = self.flat_at(inst)?;
+        let dwords = |s: &str| match s {
+            "dword" => Some(1u32),
+            "dwordx2" => Some(2),
+            "dwordx3" => Some(3),
+            "dwordx4" => Some(4),
+            _ => None,
+        };
+        if let Some(rest) = name.strip_prefix("global_load_") {
+            let Some(Operand::Vector { reg, .. }) = *dst else {
+                return Err("a global load result");
+            };
+            if let Some((width, signed, half)) = subword_load(rest) {
+                let (h, off) = self.memory(at.0, at.1, true);
+                let x = self.read_subword(off, width, signed, |l, byte| {
+                    let u = l.s.m.undef(l.s.t.i32);
+                    Ok(l.raw_dword(h, [byte, u]))
+                })?;
+                self.write_subword_result(inst, reg, x, half, guard)?;
+                return Ok(());
+            }
+            let n = dwords(rest).ok_or(name)?;
+            let xs = self.memory_dwords(at, n, true);
+            for (k, x) in xs.into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
+        let data = data.as_ref().ok_or("global data")?;
+        if let Some(n) = name.strip_prefix("global_store_").and_then(dwords) {
+            let vals = self.vgprs(inst, data, n as u8)?;
+            let place = self.begin_guarded(guard);
+            let (h, off) = self.memory(at.0, at.1, true);
+            let iu = self.s.m.undef(self.s.t.i32);
+            let mut args = vec![h, off, iu];
+            args.extend(&vals);
+            args.resize(3 + 4, iu);
+            args.push(self.s.m.i8((1u8 << n) - 1));
+            args.push(self.s.m.i32(4));
+            let void = self.s.t.void;
+            self.s.op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+            self.end_guarded(place, &[]);
+            return Ok(());
+        }
+        let op = name.strip_prefix("global_atomic_").ok_or(name)?;
+        let code = match op {
+            "add" | "sub" => Some(0),
+            "and" => Some(1),
+            "or" => Some(2),
+            "xor" => Some(3),
+            "smin" => Some(4),
+            "smax" => Some(5),
+            "umin" => Some(6),
+            "umax" => Some(7),
+            "swap" => Some(8),
+            "cmpswap" | "fmin" | "fmax" => None,
+            _ => return Err(name),
+        };
+        let vals = self.vgprs(inst, data, if op == "cmpswap" { 2 } else { 1 })?;
+        let zero = self.s.m.i32(0);
+        let place = self.begin_guarded(guard);
+        let (h, off) = self.memory(at.0, at.1, true);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let coords = [off, iu, iu];
+        let r = match (op, code) {
+            ("cmpswap", _) => self.buffer_compare_exchange(h, coords, vals[1], vals[0], false),
+            // shortcut: no denormal or NaN rules of the console's.
+            ("fmin" | "fmax", _) => self.atomic_update(zero, |l, old| {
+                let (a, b) = (l.as_float(old), l.as_float(vals[0]));
+                let x = l.binary(if op == "fmin" { 36 } else { 35 }, a, b);
+                let x = l.as_int(x);
+                l.buffer_compare_exchange(h, coords, old, x, false)
+            }),
+            (_, Some(code)) => {
+                let code = self.s.m.i32(code);
+                let data = if op == "sub" {
+                    self.s.m.bin(self.cur, Bin::Sub, zero, vals[0])
+                } else {
+                    vals[0]
+                };
+                let i32t = self.s.t.i32;
+                self.s.op(
+                    self.cur,
+                    "atomicBinOp.i32",
+                    Attr::NoUnwind,
+                    i32t,
+                    78,
+                    &[h, code, off, iu, iu, data],
+                )
+            }
+            _ => return Err(name),
+        };
+        let r = self.end_guarded(place, &[(r, zero)])[0];
+        if let Some(Operand::Vector { reg, .. }) = *dst {
+            self.write(inst, Reg::V(reg), r, guard);
+        }
+        Ok(())
+    }
+
+    /// The host's view of a buffer whose descriptor the code makes, the byte
+    /// its base is at, and its stride.
+    fn made_buffer(&mut self, inst: &Inst, rsrc: &Operand) -> Result<(V, V, V), Why> {
+        let Operand::Scalar { code, .. } = *rsrc else {
+            return Err("a buffer descriptor");
+        };
+        let word = |l: &mut Self, k: u8| -> Result<V, Why> {
+            let v = inst.read(Reg::S(code + k)).ok_or("a buffer descriptor")?;
+            l.i32_of(v)
+        };
+        let (w0, w1) = (word(self, 0)?, word(self, 1)?);
+        let c = self.cur;
+        let (k16, k3fff) = (self.s.m.i32(16), self.s.m.i32(0x3FFF));
+        let s = self.s.m.bin(c, Bin::LShr, w1, k16);
+        let stride = self.s.m.bin(c, Bin::And, s, k3fff);
+        let (h, base) = self.memory(w0, w1, false);
+        Ok((h, base, stride))
     }
 
     /// Both dwords `(lo, hi)` of a lane mask's ballot, taken in the block
@@ -4949,6 +5234,37 @@ impl<'a> Lower<'a> {
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             if self.scalar.get(&site).is_none()
+                && self.x.res.addresses
+                && let Some(count) = name.strip_prefix("s_load_dword").and_then(smem_dwords)
+                && let Some(Operand::Scalar { code, .. }) = *data
+            {
+                let Fields::Smem {
+                    base: Operand::Scalar { code: at, .. },
+                    ..
+                } = inst.fields
+                else {
+                    return Err("a scalar load's address");
+                };
+                let (lo, hi) = (
+                    inst.read(Reg::S(at)).ok_or("a scalar load's address")?,
+                    inst.read(Reg::S(at + 1)).ok_or("a scalar load's address")?,
+                );
+                let mut address = (self.i32_of(lo)?, self.i32_of(hi)?);
+                if *offset != 0 {
+                    let x = self.s.m.i32(*offset as u32);
+                    address = self.add_address(address, x, true);
+                }
+                if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
+                    let so = self.operand(inst, soffset)?;
+                    address = self.add_address(address, so, false);
+                }
+                let xs = self.memory_dwords(address, count, false);
+                for (k, x) in xs.into_iter().enumerate() {
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+                return Ok(());
+            }
+            if self.scalar.get(&site).is_none()
                 && crate::resource::traces_rays(self.x.p)
                 && let Some(count) = name.strip_prefix("s_load_dword").and_then(smem_dwords)
                 && let Some(Operand::Scalar { code, .. }) = *data
@@ -4983,6 +5299,22 @@ impl<'a> Lower<'a> {
             .ok_or("an untracked descriptor")?;
         let kind = self.used_kind(src);
         let c = self.cur;
+        if self.by_address(src)
+            && let Fields::Smem { base, .. } = &inst.fields
+        {
+            let (h, start, _) = self.made_buffer(inst, base)?;
+            let mut addr = self.s.m.i32(*offset as u32);
+            if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
+                let so = self.operand(inst, soffset)?;
+                addr = self.s.m.bin(c, Bin::Add, addr, so);
+            }
+            let addr = self.s.m.bin(c, Bin::Add, addr, start);
+            let words = self.view_dwords(h, Some(0), addr, None, count);
+            for (k, x) in words.into_iter().enumerate() {
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
+        }
         let (base, extra) = self.built_offset(src)?;
         let offset = &((*offset as u32).wrapping_add(base) as i32);
         let mut addr = self.s.m.i32(*offset as u32);
@@ -5808,6 +6140,29 @@ impl<'a> Lower<'a> {
         Ok(Some(self.s.m.bin(c, Bin::Add, rows, off)))
     }
 
+    /// Whether a buffer is accessed by its address (see
+    /// [`crate::resource::track_with`]): no root view leads to it, or one
+    /// that is written through.
+    fn by_address(&self, src: &Source) -> bool {
+        match src {
+            Source::Address => true,
+            Source::Built { address, .. } => {
+                self.x.res.addresses
+                    && address.param != CODE
+                    && self
+                        .x
+                        .native
+                        .layout
+                        .get(address.param)
+                        .is_some_and(|rp| rp.root == RootType::Descriptor)
+                    && !self
+                        .used_kind(src)
+                        .is_some_and(|u| u.kind == ResourceType::Cbv)
+            }
+            _ => false,
+        }
+    }
+
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. }
@@ -5855,7 +6210,11 @@ impl<'a> Lower<'a> {
         sampler: bool,
         props: (u32, u32),
     ) -> Result<V, Why> {
+        if let Some(&h) = self.made.get(&site).filter(|_| self.by_address(src)) {
+            return Ok(h);
+        }
         match src {
+            Source::Address => Err("a buffer descriptor made in code"),
             Source::Loaded { load, first } => {
                 // The element type is part of the key: one UAV read as float
                 // and used atomically needs two handles (an atomic on a float
@@ -10353,7 +10712,26 @@ impl<'a> Lower<'a> {
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
         let stride = used.map_or(0, |u| u.stride);
-        let (base, extra) = self.built_offset(src)?;
+        if self.by_address(src)
+            && let Fields::Buffer { rsrc, .. } = &inst.fields
+        {
+            if typed && format.is_none() {
+                return Err("a typed buffer access by address");
+            }
+            let (h, start, stride) = self.made_buffer(inst, rsrc)?;
+            self.made.insert(site, h);
+            off = self.s.m.bin(c, Bin::Add, off, start);
+            if let Some(i) = index {
+                let rows = self.s.m.bin(c, Bin::Mul, i, stride);
+                off = self.s.m.bin(c, Bin::Add, off, rows);
+            }
+        }
+        let index = if self.by_address(src) { None } else { index };
+        let (base, extra) = if self.by_address(src) {
+            (0, None)
+        } else {
+            self.built_offset(src)?
+        };
         if base != 0 {
             let b = self.s.m.i32(base);
             off = self.s.m.bin(c, Bin::Add, off, b);
@@ -10432,7 +10810,7 @@ impl<'a> Lower<'a> {
             let coords = |byte| index.map_or([byte, iu], |i| [i, byte]);
             if let Some((width, signed, half)) = sub_load {
                 // Root SRVs have no size in DXIL.
-                let bounds = (!matches!(src, Source::Built { .. }))
+                let bounds = (!matches!(src, Source::Built { .. } | Source::Address))
                     .then(|| self.buffer_bounds(h, index, off, stride, width / 8));
                 let at = self.begin_guarded(bounds);
                 let x = self.read_subword(off, width, signed, |l, at| Ok(l.raw_dword(h, coords(at))))?;
@@ -11619,6 +11997,14 @@ impl<'a> Lower<'a> {
                 let arg = phi.args[n];
                 if self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
                     let _ = self.lazy_barycentric(arg);
+                }
+                // A root parameter no instruction read.
+                if !self.vals.contains_key(&arg)
+                    && let Some(&(param, dword)) = self.params.get(&arg)
+                    && self.read_phis.contains(&phi.value)
+                {
+                    let val = self.user(param, dword);
+                    self.vals.insert(arg, val);
                 }
                 // An edge from outside a loop takes the loop's final value.
                 let looked = match self.finals.get(&arg) {

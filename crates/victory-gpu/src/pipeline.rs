@@ -403,6 +403,15 @@ pub(crate) fn note_drop(this: This) {
     }
 }
 
+/// A title pipeline's shaders (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn names(this: This) -> String {
+    if this.is_null() {
+        return "none".into();
+    }
+    pipeline(this).shaders.iter().map(|s| format!("{} {}", s.name(), s.hash)).collect()
+}
+
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {

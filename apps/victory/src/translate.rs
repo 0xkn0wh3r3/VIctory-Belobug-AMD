@@ -375,11 +375,26 @@ fn translate(
         t.programs += 1;
         match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
             Ok(mut program) => {
+                if std::env::var_os("VICTORY_DISASM").is_some() {
+                    for (b, block) in program.blocks.iter().enumerate() {
+                        for i in &block.insts {
+                            println!("  {:#x} b{b} {} {:?}", i.machine.offset, i.name(), i.fields);
+                        }
+                    }
+                }
                 victory_shader::unspill::unspill(&mut program, &p.layout, p.stage);
                 victory_shader::sgpr_spill::forward(&mut program);
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
-                let res = match resource::track(&program, &p.layout, p.stage) {
+                // As `emit::translate_for`: by address where nothing else does.
+                let traces = resource::traces_rays(&program) && p.stage == HwStage::Cs;
+                let mut by_address = traces;
+                let mut tracked = resource::track_with(&program, &p.layout, p.stage, traces);
+                if tracked.is_err() && p.stage == HwStage::Cs {
+                    by_address = !traces;
+                    tracked = resource::track_with(&program, &p.layout, p.stage, by_address);
+                }
+                let res = match tracked {
                     Ok(r) => {
                         tally_resources(&p, &r, t);
                         Some(r)
@@ -433,7 +448,18 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(&container, &p, &program, &s, &i, &r, checks.target) {
+                    let mut made = emit::emit(&container, &p, &program, &s, &i, &r, checks.target);
+                    if matches!(made, Err(ShaderError::Unsupported { .. }))
+                        && p.stage == HwStage::Cs
+                        && let Ok(r) =
+                            resource::track_with(&program, &p.layout, p.stage, !by_address)
+                    {
+                        let other = emit::emit(&container, &p, &program, &s, &i, &r, checks.target);
+                        if other.is_ok() || !by_address {
+                            made = other;
+                        }
+                    }
+                    match made {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
@@ -618,6 +644,7 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
                 t.dynamic += usize::from(address.dynamic.is_some());
                 Some(address)
             }
+            resource::Source::Address => None,
             resource::Source::Constant(_) => {
                 t.constant += 1;
                 None

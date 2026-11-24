@@ -271,10 +271,20 @@ pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, Sha
     let mut p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
     crate::unspill::unspill(&mut p, &native.layout, native.stage);
     crate::sgpr_spill::forward(&mut p);
-    let res = resource::track(&p, &native.layout, native.stage)?;
+    let traces = resource::traces_rays(&p);
     let io = io::raise(&p, &native)?;
     let st = structure::structure(&p)?;
-    emit(&c, &native, &p, &st, &io, &res, target)
+    let with = |addresses: bool| {
+        let res = resource::track_with(&p, &native.layout, native.stage, addresses)?;
+        emit(&c, &native, &p, &st, &io, &res, target)
+    };
+    let compute = native.stage == HwStage::Cs;
+    let plain = match with(traces && compute) {
+        Err(ShaderError::Unsupported { .. }) if compute && !traces => with(true),
+        Err(ShaderError::Unsupported { .. }) if compute => with(false),
+        done => return done,
+    };
+    plain
 }
 
 /// Emits a program whose earlier stages already ran, for `target`.
@@ -302,7 +312,7 @@ pub fn emit(
     crate::sgpr_spill::forward(&mut p);
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
-    let res = resource::track(&p, &native.layout, native.stage)?;
+    let res = resource::track_with(&p, &native.layout, native.stage, res.addresses)?;
     emit_program(c, native, &p, &st, &io, &res, target)
 }
 

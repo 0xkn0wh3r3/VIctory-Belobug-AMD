@@ -878,7 +878,7 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
                 len = end - address,
                 "title memory not usable in place: copied"
             );
-            if count <= 3 {
+            if count <= 3 || address > 0xa_0000_0000 {
                 use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
                 let (mut at, mut text) = (address, String::new());
                 while at < end && text.len() < 1500 {

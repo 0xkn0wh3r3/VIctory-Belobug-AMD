@@ -57,6 +57,10 @@ pub enum Source {
         bits: u32,
         words: [u32; 2],
     },
+    /// A buffer descriptor the code makes around an address that is no root
+    /// parameter's, or written through one: the dwords the instruction reads
+    /// (only with [`Resources::addresses`]).
+    Address,
     /// Fixed in the code (an immediate sampler, say).
     Constant(Vec<u32>),
     /// Chosen by control flow: one source per predecessor of `block`, in
@@ -125,6 +129,9 @@ pub struct Resources {
     /// dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
     pub waterfall: Waterfall,
+    /// Memory is read and written by address where no root parameter or
+    /// table leads to it (see [`track_with`]).
+    pub addresses: bool,
 }
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
@@ -152,7 +159,7 @@ pub struct Waterfall {
 /// `stage`, to the root parameters in `layout`. Fails on the first one it
 /// cannot trace.
 /// Whether the program intersects rays with an acceleration structure.
-pub(crate) fn traces_rays(p: &Program) -> bool {
+pub fn traces_rays(p: &Program) -> bool {
     p.blocks
         .iter()
         .flat_map(|b| &b.insts)
@@ -160,6 +167,18 @@ pub(crate) fn traces_rays(p: &Program) -> bool {
 }
 
 pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resources, ShaderError> {
+    track_with(p, layout, stage, false)
+}
+
+/// [`track`]; with `addresses`, memory no root parameter or table leads to
+/// is accessed by its address (ray tracing programs, and those that build
+/// what they trace).
+pub fn track_with(
+    p: &Program,
+    layout: &[RootParam],
+    stage: HwStage,
+    addresses: bool,
+) -> Result<Resources, ShaderError> {
     let t = Tracer::new(p, layout, stage)?;
     let mut out = Resources {
         params: p
@@ -170,6 +189,7 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
                 Some((v, param, dword))
             })
             .collect(),
+        addresses,
         ..Resources::default()
     };
     // `v_readfirstlane_b32` results descriptors are read from.
@@ -186,7 +206,14 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
                 what,
             };
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
-                let source = t.descriptor(inst, op).map_err(fail)?;
+                let buffer = matches!(
+                    inst.fields,
+                    Fields::Buffer { .. } | Fields::Smem { .. }
+                );
+                let source = match t.descriptor(inst, op) {
+                    Err(_) if addresses && buffer => Source::Address,
+                    found => found.map_err(fail)?,
+                };
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
                 out.descriptors.push(Descriptor { site, role, source });
                 Ok(())
@@ -220,7 +247,7 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
                     match t.smem_address(inst, base, *offset, soffset) {
                         Ok(address) => out.scalar.push((site, address)),
-                        Err(_) if traces && inst.name().contains("_load_") => {}
+                        Err(_) if (traces || addresses) && inst.name().contains("_load_") => {}
                         Err(what) => return Err(fail(what)),
                     }
                 }
@@ -231,6 +258,8 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
                     ..
                 } if inst.name().starts_with("global_") => {
                     match t.flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset) {
+                        Ok(address) if addresses && address.param != CODE => {}
+                        Err(_) if addresses => {}
                         Ok(address) => out.scalar.push((site, address)),
                         Err(_) if traces && inst.name().starts_with("global_load_dword") => {}
                         Err(what) => return Err(fail(what)),
