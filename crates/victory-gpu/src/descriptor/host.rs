@@ -2574,7 +2574,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Views the host refuses are left null, as `HostHeap::mirror` leaves them.
         let mut placed = [0; 14];
         placed[0] = 1; // a buffer
-        if buffer_srv((start + 16, 128, srv), at(0)).is_none() {
+        if buffer_srv(start + 16, 128, srv, at(0)).is_none() {
             null_for(&View::Placed(false, placed, [0; 16]), at(0));
         }
         if buffer_uav(start + 272, 128, uav(written), at(1)).is_none() {

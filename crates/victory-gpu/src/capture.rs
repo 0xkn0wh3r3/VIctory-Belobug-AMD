@@ -19,6 +19,13 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
 /// too, and their draws traced at debug level.
 pub(crate) fn listed(n: u64) -> bool {
+    n == ASKED.load(std::sync::atomic::Ordering::Relaxed) || in_list(n)
+}
+
+/// The frame whose targets `wantall` in the folder asked for.
+static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn in_list(n: u64) -> bool {
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| {
         let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
@@ -32,7 +39,11 @@ pub(crate) fn listed(n: u64) -> bool {
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
     folder().is_some_and(|f| {
-        // `want` in the folder: the next frame, once.
+        // `wantall` in the folder: the targets of a frame soon, once;
+        // `want`: the next frame.
+        if std::fs::remove_file(f.join("wantall")).is_ok() {
+            ASKED.store(n + 2, std::sync::atomic::Ordering::Relaxed);
+        }
         n.is_power_of_two() || listed(n) || std::fs::remove_file(f.join("want")).is_ok()
     })
 }
