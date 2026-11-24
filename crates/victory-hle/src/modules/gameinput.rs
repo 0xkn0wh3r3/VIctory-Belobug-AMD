@@ -348,6 +348,11 @@ pub struct Hub {
     /// Apart from the state: XInput can be slow, and the title reads
     /// readings every frame.
     source: Mutex<Box<dyn Source>>,
+    /// Pending rumble motor speeds per host pad slot (the latest wins),
+    /// written by `set_rumble` under a lock of its own and flushed on the
+    /// poll thread, so the title never blocks behind `source` or
+    /// `XInputSetState`.
+    rumble: [Mutex<Option<Motors>>; PADS],
     state: Mutex<State>,
     /// A device callback returned.
     returned: Condvar,
@@ -379,6 +384,7 @@ impl Hub {
             },
             devices: std::array::from_fn(Device::new),
             source: Mutex::new(source),
+            rumble: std::array::from_fn(|_| Mutex::new(None)),
             state: Mutex::new(State {
                 slots: Default::default(),
                 callbacks: Vec::new(),
@@ -414,10 +420,16 @@ impl Hub {
         lock(&self.state)
     }
 
-    /// Reads the host once; device callbacks run on the calling thread.
+    /// Reads the host once and flushes pending rumble; device callbacks run on
+    /// the calling thread.
     fn poll(&self) {
         let (pads, keys) = {
             let mut source = lock(&self.source);
+            for (slot, pending) in self.rumble.iter().enumerate() {
+                if let Some(motors) = lock(pending).take() {
+                    source.rumble(slot, motors);
+                }
+            }
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             (pads, source.keys())
         };
@@ -833,7 +845,10 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
             return true;
         }
         state = match deadline {
-            None => hub.returned.wait(state).unwrap_or_else(PoisonError::into_inner),
+            None => hub
+                .returned
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner),
             Some(deadline) => {
                 let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                     return false;
@@ -944,7 +959,7 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
         left_trigger: speed(left_trigger),
         right_trigger: speed(right_trigger),
     };
-    lock(&device.hub().source).rumble(device.index, motors);
+    *lock(&device.hub().rumble[device.index]) = Some(motors);
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     tracing::warn!(
@@ -1261,8 +1276,13 @@ mod host {
             .collect()
     }
 
-    /// The foreground window is one of ours (the title's or our fallback).
-    fn focused() -> bool {
+    /// The foreground window is one of ours (the title's or our fallback), and
+    /// no modal system UI dialog is open (typing into it must not reach the
+    /// title).
+    pub(super) fn focused() -> bool {
+        if super::super::xgameui::dialog_open() {
+            return false;
+        }
         let mut process = 0;
         // SAFETY: plain queries; a null window gives process 0.
         unsafe {
@@ -1602,7 +1622,16 @@ mod tests {
         let mut token = 0;
         let context = (&raw const hub.object).cast_mut().cast();
         assert_eq!(
-            register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
+            register(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                1,
+                0,
+                context,
+                Some(slow),
+                &mut token
+            ),
             S_OK
         );
         host.lock().unwrap().pads[1] = Some(PadState::default());
@@ -1611,7 +1640,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
-        assert!(!unregister(&hub.object, token, 5000), "times out while it runs");
+        assert!(
+            !unregister(&hub.object, token, 5000),
+            "times out while it runs"
+        );
         let leave = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(50));
             LEAVE.store(true, Ordering::SeqCst);
@@ -1647,7 +1679,9 @@ mod tests {
         let rumble = slot::<Rumble, _>(device, 0x50);
         rumble(device, &[0.5, 1.0, 1.0, 1.0]);
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
+        hub.poll();
         rumble(device, std::ptr::null());
+        hub.poll();
         let full = Motors {
             low: 32767,
             high: 65535,
@@ -1670,7 +1704,9 @@ mod tests {
         let rumble = slot::<Rumble, _>(device, 0x50);
         // Out-of-range and NaN levels clamp or fall to off, like the grips.
         rumble(device, &[0.0, 0.0, 0.25, 2.0]);
+        hub.poll();
         rumble(device, &[0.0, 0.0, -1.0, f32::NAN]);
+        hub.poll();
         let expected = [
             (
                 1,
@@ -1702,5 +1738,42 @@ mod tests {
         assert_eq!(unsafe { &*reading }.refs.load(Ordering::Relaxed), 0);
         // SAFETY: boxed above and not freed.
         drop(unsafe { Box::from_raw(reading) });
+    }
+
+    #[test]
+    fn set_rumble_does_not_block_on_source_and_dialog_suppresses_focus() {
+        let (hub, host) = fake();
+        let device = &hub.devices[1] as *const Device;
+        type Rumble = extern "system" fn(*const Device, *const [f32; 4]);
+        let rumble = slot::<Rumble, _>(device, 0x50);
+
+        // Hold `hub.source` as the poll thread does during slow XInput/key queries;
+        // `set_rumble` must not block and should coalesce to the latest speeds.
+        {
+            let _held = lock(&hub.source);
+            rumble(device, &[0.25, 0.25, 0.0, 0.0]);
+            rumble(device, &[0.5, 1.0, 0.0, 0.0]);
+        }
+        assert!(host.lock().unwrap().rumble.is_empty());
+        hub.poll();
+        let latest = Motors {
+            low: 32767,
+            high: 65535,
+            ..Motors::default()
+        };
+        assert_eq!(host.lock().unwrap().rumble, [(1, latest)]);
+        // A second poll without a new rumble update sends nothing redundant.
+        hub.poll();
+        assert_eq!(host.lock().unwrap().rumble.len(), 1);
+
+        // While a modal `xgameui` dialog is open, host focus is suppressed.
+        assert!(!super::super::xgameui::dialog_open());
+        {
+            let _dialog = super::super::xgameui::DialogGuard::enter();
+            assert!(super::super::xgameui::dialog_open());
+            #[cfg(windows)]
+            assert!(!host::focused());
+        }
+        assert!(!super::super::xgameui::dialog_open());
     }
 }
