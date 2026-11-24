@@ -348,7 +348,7 @@ impl Host {
                 && options.DepthBoundsTestSupported.as_bool();
             let mut options16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
             let gpu_upload = !cfg!(test)
-                && std::env::var_os("VICTORY_NO_GPU_UPLOAD").is_none()
+                && std::env::var_os("VICTORY_GPU_UPLOAD").is_some_and(|v| v == "1")
                 && device
                     .CheckFeatureSupport(
                         D3D12_FEATURE_D3D12_OPTIONS16,
@@ -663,6 +663,14 @@ pub(crate) fn dred_on() -> bool {
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
+}
+
+/// Whether each noted command waits for those before it (`VICTORY_GPU_STEP`,
+/// diagnostics builds), so that a list stops at the command at fault.
+#[cfg(feature = "diagnostics")]
+fn step() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_STEP").is_some())
 }
 
 /// Whether submitted lists are not run on the host GPU (`VICTORY_NO_GPU_WORK`,
@@ -1066,7 +1074,7 @@ impl Host {
         let each = false;
         let can_async = !cfg!(test)
             && !each
-            && std::env::var_os("VICTORY_SYNC_GPU").is_none()
+            && std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1")
             && batch.bindless_writes.is_empty()
             && runs.iter().all(|list| {
                 let d = list.deferred();
@@ -1762,6 +1770,14 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
         if dred_on() {
+            if step() {
+                let barrier = D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    ..Default::default()
+                };
+                // SAFETY: an open list; the barrier names no resource.
+                unsafe { self.list.ResourceBarrier(&[barrier]) };
+            }
             let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
             if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
                 // SAFETY: an open list and our query heap.
@@ -3534,6 +3550,11 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
         .position(barrier)
         .map_or(history.len(), |b| (done + b).max(done + 1));
     let mut text = format!(", commands {from}..{to} between its barriers:");
+    let before = markers.iter().filter(|(at, _)| (*at as usize) < from);
+    for (at, marker) in before.rev().take(6) {
+        let short: String = marker.chars().take(90).collect();
+        text.push_str(&format!(" (before, {at}: {short})"));
+    }
     let mut shown = 0;
     for i in from..to {
         let op = history[i];
@@ -3547,6 +3568,43 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
             .and_then(|m| markers.iter().find(|(at, _)| *at as usize == m))
             .map_or("no marker", |(_, s)| s.as_str());
         text.push_str(&format!("; command {i} (op {}): {marker}", op.0));
+        // Its constants as they are now: the title may have overwritten them.
+        #[cfg(feature = "diagnostics")]
+        for c in marker.split("Constant(0x").skip(1).take(4) {
+            let mut parts = c.split([',', ')']);
+            let at = parts.next().and_then(|a| u64::from_str_radix(a, 16).ok());
+            let size = parts.next().and_then(|s| s.trim().parse::<usize>().ok());
+            if let (Some(at), Some(size)) = (at, size) {
+                let words = crate::shadow::words_text(at, size);
+                let same = c.contains(&words);
+                text.push_str(&format!(" NOW {at:#x} same={same} {words}"));
+                if shown == 1 {
+                    let mut slots: Vec<u32> = words
+                        .split(['[', ',', ']'])
+                        .filter_map(|w| u32::from_str_radix(w.trim(), 16).ok())
+                        .filter(|w| (0x1000..0x13_0000).contains(w))
+                        .collect();
+                    for u in marker.split(" u").skip(1) {
+                        let v = u.split_once("=0x").map(|(_, v)| v.split(' ').next().unwrap_or(""));
+                        if let Some(v) = v.and_then(|v| u32::from_str_radix(v.trim(), 16).ok())
+                            && v % 32 == 0
+                            && v >= 0x10000
+                        {
+                            slots.extend([0, 1, 2, 3, 6, 24, 25].map(|k| v / 32 + k));
+                        }
+                    }
+                    text.push_str(&crate::draw::report_slots(&slots));
+                }
+            }
+        }
+        // What an indirect command got, as the title's memory has it now.
+        if let Some(at) = marker
+            .strip_prefix("indirect kind ")
+            .and_then(|m| m.split(" at 0x").nth(1))
+            .and_then(|m| u64::from_str_radix(m.split(' ').next().unwrap_or(""), 16).ok())
+        {
+            text.push_str(&format!(" args now {}", crate::shadow::args_text(at)));
+        }
     }
     text
 }
