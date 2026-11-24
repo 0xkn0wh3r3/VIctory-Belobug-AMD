@@ -36,7 +36,7 @@ pub struct Address {
     /// or picked by a branch between offsets from the parameter): it holds
     /// the parameter's address plus a varying offset, so the byte offset
     /// from the parameter is `dynamic` minus the parameter's first dword,
-    /// plus `offset`. Never set for [`CODE`].
+    /// plus `offset`. For [`CODE`] it is the byte offset in the code.
     pub includes_base: bool,
 }
 
@@ -710,6 +710,14 @@ impl<'a> Tracer<'a> {
         {
             return self.pointer_address(d, s.offset.wrapping_add(extra.offset), hi);
         }
+        // A pointer into a table in the code taken from the first lane.
+        if s.base.is_none()
+            && let Some(d) = s.dynamic
+            && let Ok(a) = self.pointer_address(d, s.offset.wrapping_add(extra.offset), hi)
+            && a.param == CODE
+        {
+            return Ok(a);
+        }
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
             // A table in the code: the base is the next instruction's offset.
@@ -769,6 +777,15 @@ impl<'a> Tracer<'a> {
             .ok()
             .flatten()
             .ok_or(WHY)?;
+        if self.getpc(base).is_some() {
+            // The emitter has `s_getpc_b64` give the offset in the code.
+            return Ok(Address {
+                param: CODE,
+                offset,
+                dynamic: Some(d),
+                includes_base: true,
+            });
+        }
         let reg = self.inputs[base.0 as usize].ok_or(WHY)?;
         let (param, _) = self.param_of(reg).ok_or(WHY)?;
         let high = match self.layout[param].root {
@@ -807,11 +824,14 @@ impl<'a> Tracer<'a> {
             return Ok(None);
         }
         if let Some(base) = self.sum(t).base {
-            // Program-counter tables are not tracked through phis.
             return match self.inputs[base.0 as usize] {
                 Some(_) => Ok(Some(base)),
+                None if self.getpc(base).is_some() => Ok(Some(base)),
                 None => Err(()),
             };
+        }
+        if let Some(x) = self.first_lane_source(v) {
+            return self.pointer_base(self.vorigin(x), seen, budget);
         }
         if let Some((block, i)) = self.phis[v.0 as usize] {
             seen.push(v);
@@ -820,7 +840,13 @@ impl<'a> Tracer<'a> {
             for &a in &self.p.blocks[block].phis[i].args {
                 match self.pointer_base(self.vorigin(a), seen, budget) {
                     Ok(None) => {}
-                    Ok(Some(b)) if found.is_none_or(|f| f == b) => found = Some(b),
+                    Ok(Some(b))
+                        if found.is_none_or(|f| {
+                            f == b || self.getpc(f).is_some() && self.getpc(b).is_some()
+                        }) =>
+                    {
+                        found = Some(b)
+                    }
                     _ => {
                         result = Err(());
                         break;

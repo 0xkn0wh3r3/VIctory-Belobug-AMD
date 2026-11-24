@@ -1304,7 +1304,7 @@ impl<'a> Lower<'a> {
                         })
                     }))
                     .filter(|a| a.param == CODE)
-                    .map(|a| a.offset & !3)
+                    .map(|a| if a.includes_base { 0 } else { a.offset & !3 })
                     .min()
                     .ok_or("a code table")?;
                 let code = &self.x.native.code;
@@ -2231,7 +2231,7 @@ impl<'a> Lower<'a> {
             return Ok(Some(d));
         }
         if a.param == CODE {
-            return Err("an address from a phi");
+            return Ok(Some(d));
         }
         let base = match self.user(a.param, 0) {
             Val::I32(x) => x,
@@ -4533,6 +4533,14 @@ impl<'a> Lower<'a> {
                     self.set(hi, Val::I32(rh));
                     let s = nonzero(self, rl, rh);
                     self.set(scc, Val::Bit(s));
+                    Ok(())
+                }
+                "s_getpc_b64" => {
+                    // Addresses in the code are offsets in it.
+                    let next = self.s.m.i32(inst.machine.offset as u32 + 4);
+                    let zero = self.s.m.i32(0);
+                    self.set(lo, Val::I32(next));
+                    self.set(hi, Val::I32(zero));
                     Ok(())
                 }
                 "s_mov_b64" => {

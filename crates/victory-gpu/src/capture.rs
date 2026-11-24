@@ -377,6 +377,16 @@ fn dump_one(
         }
         let pitch = f.RowPitch as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        if std::env::var_os("VICTORY_DUMP_RAW").is_some()
+            && (d.Width >= 1200 || d.Width <= 160)
+            && let Some(folder) = folder()
+        {
+            let name = format!(
+                "raw-{i:03}-{}x{}-f{}-p{pitch}.raw",
+                f.Width, f.Height, f.Format.0
+            );
+            let _ = std::fs::write(std::path::Path::new(folder).join(name), rows);
+        }
         if let Some(rgba) = to_rgba(
             f.Format.0 as u32,
             f.Width as usize,
