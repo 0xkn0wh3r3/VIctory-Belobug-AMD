@@ -77,6 +77,10 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// The last bind could not make a table afresh (no free dynamic slots):
+    /// its shaders would index the title's slots, which hold other views, so
+    /// the draw or dispatch is dropped.
+    unmade_table: bool,
 }
 
 impl Drop for State {
@@ -345,6 +349,9 @@ impl State {
             return false;
         }
         self.bind(list, p, false);
+        if self.unmade_table {
+            return false;
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -404,6 +411,7 @@ impl State {
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+        self.unmade_table = false;
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -514,6 +522,10 @@ impl State {
             return;
         }
         self.bind(list, p, true);
+        if self.unmade_table {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -696,6 +708,7 @@ impl State {
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
+                self.unmade_table = true;
                 continue;
             };
             self.fresh_tables.insert(key, first);
@@ -990,7 +1003,7 @@ impl State {
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => {
                     self.bind(list, p, true);
-                    true
+                    !self.unmade_table
                 }
                 _ => false,
             },
