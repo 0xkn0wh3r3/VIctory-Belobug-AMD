@@ -274,6 +274,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             g.clean.remove(&block);
         }
     }
+    crate::shadow::remapped(at as u64, end as u64);
     crate::resource::evict_placed_textures(at as u64, end as u64);
     crate::descriptor::host::bindless_viewed_changed();
 }

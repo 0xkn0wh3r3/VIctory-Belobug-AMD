@@ -1,84 +1,70 @@
-//! Whether the host can make heaps of existing memory.
+//! Whether the host can make heaps of ranges of title memory.
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::Interface;
 use windows_sys::Win32::System::Memory::*;
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-fn buffer(size: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
+fn buffer(size: u64) -> D3D12_RESOURCE_DESC {
     D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: size,
-        Height: 1,
-        DepthOrArraySize: 1,
-        MipLevels: 1,
+        Width: size, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        Flags: flags,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
         ..Default::default()
     }
 }
 
 #[test]
-fn existing_memory() {
+#[ignore = "host capability probe"]
+fn ranges_of_title_memory() {
     let host = crate::host::host().unwrap();
-    let device: ID3D12Device3 = host.device.cast().unwrap();
-    const N: usize = 4 << 20;
+    let device = host.device.cast::<ID3D12Device13>();
+    println!("device13 {:?}", device.as_ref().err());
+    let Ok(device) = device else { return };
+    const M: usize = 1 << 20;
     unsafe {
-        let private = VirtualAlloc(std::ptr::null(), N, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        let watched = VirtualAlloc(std::ptr::null(), N, MEM_RESERVE | MEM_COMMIT | 0x20_0000, PAGE_READWRITE);
-        let partial = VirtualAlloc(std::ptr::null(), N, MEM_RESERVE, PAGE_NOACCESS);
-        VirtualAlloc(partial, N / 4, MEM_COMMIT, PAGE_READWRITE);
-        let section = |kind| CreateFileMappingW(windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | kind, 0, N as u32, std::ptr::null());
-        let committed = section(SEC_COMMIT);
-        let reserved = section(SEC_RESERVE);
-        let view = MapViewOfFile(committed, FILE_MAP_ALL_ACCESS, 0, 0, N).Value;
-        let rview = MapViewOfFile(reserved, FILE_MAP_ALL_ACCESS, 0, 0, N).Value;
-        VirtualAlloc(rview, N / 2, MEM_COMMIT, PAGE_READWRITE);
-        let mut heaps: Vec<(&str, Option<ID3D12Heap>, *mut u8)> = Vec::new();
-        for (name, at) in [("private", private), ("watched", watched), ("partial", partial), ("view", view), ("reserved view", rview)] {
-            let r = device.OpenExistingHeapFromAddress::<ID3D12Heap>(at);
-            println!("{name}: address {:?}", r.as_ref().err());
-            heaps.push((name, r.ok(), at.cast()));
+        // Private, committed in the middle.
+        let part = VirtualAlloc(std::ptr::null(), 16 * M, MEM_RESERVE | 0x20_0000, PAGE_NOACCESS).cast::<u8>();
+        VirtualAlloc(part.add(4 * M).cast(), 2 * M, MEM_COMMIT, PAGE_READWRITE);
+        VirtualAlloc(part.add(6 * M).cast(), 2 * M, MEM_COMMIT, PAGE_READWRITE);
+        // Views of scattered pages side by side.
+        let place = VirtualAlloc2(GetCurrentProcess(), std::ptr::null(), 8 * M, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0).cast::<u8>();
+        let section = CreateFileMappingW(windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | SEC_RESERVE, 2, 0, std::ptr::null());
+        for (k, off) in [(0usize, 5u64), (1, 3), (2, 900), (3, 4000)] {
+            let at = place.add(k * M);
+            VirtualFree(at.cast(), M, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            let v = MapViewOfFile3(section, GetCurrentProcess(), at.cast(), off << 20, M, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0);
+            VirtualAlloc(at.cast(), M, MEM_COMMIT, PAGE_READWRITE);
+            println!("view {k} {:?}", v.Value as usize == at as usize);
         }
-        for (name, handle, at) in [("section", committed, view), ("reserved section", reserved, rview)] {
-            let r = device.OpenExistingHeapFromFileMapping::<ID3D12Heap>(windows::Win32::Foundation::HANDLE(handle));
-            println!("{name}: file mapping {:?}", r.as_ref().err());
-            heaps.push((name, r.ok(), at.cast()));
+        let rust = vec![1u8; 4 * M];
+        let aligned = (rust.as_ptr() as usize).next_multiple_of(65536) as *mut u8;
+        for (name, at, len) in [
+            ("private whole committed", part.add(4 * M), 4 * M),
+            ("private inner", part.add(5 * M), 2 * M),
+            ("one view", place, M),
+            ("views", place, 4 * M),
+            ("views inner", place.add(M / 2), 2 * M),
+            ("host heap", aligned, 2 * M),
+        ] {
+            let heap = device.OpenExistingHeapFromAddress1::<ID3D12Heap>(at.cast(), len);
+            println!("{name}: {:?}", heap.as_ref().err().map(|e| e.code()));
+            let Ok(heap) = heap else { continue };
+            println!("  size {:#x}", heap.GetDesc().SizeInBytes);
+            let mut r: Option<ID3D12Resource> = None;
+            let made = host.device.CreatePlacedResource(&heap, 0, &buffer(len as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut r);
+            println!("  placed {:?}", made.err());
+            let Some(r) = r else { continue };
+            let list = host.new_list().unwrap();
+            let (s, p) = host.upload_buffer(0x1000).unwrap();
+            p.write_bytes(0xcd, 0x1000);
+            let to = len - 0x3000;
+            list.list.CopyBufferRegion(&r, to as u64, &s, 0, 0x1000);
+            list.close();
+            host.execute(&[&list]);
+            println!("  read {:#x} removed {:?}", at.add(to + 8).read(), host.device.GetDeviceRemovedReason().err());
         }
-        for (name, heap, at) in &heaps {
-            let Some(heap) = heap else { continue };
-            let d = heap.GetDesc();
-            println!("{name}: size {:#x} flags {:#x} type {} page {} pool {}", d.SizeInBytes, d.Flags.0, d.Properties.Type.0, d.Properties.CPUPageProperty.0, d.Properties.MemoryPoolPreference.0);
-            for (what, flags) in [
-                ("plain", D3D12_RESOURCE_FLAG_NONE),
-                ("uav", D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                ("cross", D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER),
-                ("cross uav", D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-            ] {
-                let mut r: Option<ID3D12Resource> = None;
-                let made = host.device.CreatePlacedResource(heap, 0, &buffer(N as u64, flags), D3D12_RESOURCE_STATE_COMMON, None, &mut r);
-                println!("  placed {what}: {made:?}");
-                let Some(r) = r else { continue };
-                if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 { continue; }
-                // The GPU writes it, the CPU sees it.
-                let list = host.new_list().unwrap();
-                let src = host.upload_buffer(0x1_0000);
-                if let Some((s, p)) = src {
-                    p.write_bytes(0xab, 0x1_0000);
-                    list.list.CopyBufferRegion(&r, 0x1000, &s, 0, 0x1000);
-                    list.close();
-                    host.execute(&[&list]);
-                    println!("  read back {:#x}", at.add(0x1800).read());
-                }
-            }
-            // A reserved buffer over it.
-            let mut res: Option<ID3D12Resource> = None;
-            let made = host.device.CreateReservedResource(&buffer(64 << 20, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), D3D12_RESOURCE_STATE_COMMON, None, &mut res);
-            println!("  tiled uav: {made:?}");
-            let mut res2: Option<ID3D12Resource> = None;
-            let made = host.device.CreateReservedResource(&buffer(64 << 20, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER), D3D12_RESOURCE_STATE_COMMON, None, &mut res2);
-            println!("  tiled uav cross: {made:?}");
-        }
-        println!("removed: {:?}", host.device.GetDeviceRemovedReason());
     }
 }

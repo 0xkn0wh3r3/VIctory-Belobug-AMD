@@ -43,6 +43,18 @@ pub(crate) struct Shadow {
     /// The copy's bytes before the submission ran, from an offset on,
     /// covering the ranges its shaders write: what the GPU wrote differs.
     before: Mutex<Before>,
+    /// The buffer is the title's memory itself ([`direct`]): nothing is
+    /// copied either way.
+    direct: Option<Direct>,
+}
+
+struct Direct {
+    heap: windows::Win32::Graphics::Direct3D12::ID3D12Heap,
+    /// The same memory from other 64 KiB starts, for views whose elements
+    /// do not fall on multiples of their size from this one's.
+    aliases: Mutex<Vec<(u64, Arc<Shadow>)>>,
+    /// The title mapped other memory there since.
+    dead: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -143,6 +155,9 @@ unsafe impl Sync for Shadow {}
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if self.direct.is_some() {
+            return;
+        }
         // SAFETY: a live resource.
         let bytes = unsafe { self.buffer.GetDesc() }.Width;
         crate::memstat::sub(&crate::memstat::SHADOWS, bytes);
@@ -176,6 +191,10 @@ impl Shadow {
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        if self.direct.is_some() {
+
+            return;
+        }
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
     }
@@ -196,7 +215,44 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             before: Mutex::default(),
+            direct: None,
         }
+    }
+
+    /// Whether the buffer is the title's memory itself.
+    pub(crate) fn is_direct(&self) -> bool {
+        self.direct.is_some()
+    }
+
+    /// Whether the title mapped other memory there since.
+    pub(crate) fn is_dead(&self) -> bool {
+        self.direct
+            .as_ref()
+            .is_some_and(|d| d.dead.load(Ordering::Acquire))
+    }
+
+    /// This memory from a start `address` is a multiple of `element` bytes
+    /// after.
+    fn on_element(self: &Arc<Self>, address: u64, element: u64) -> Option<Arc<Shadow>> {
+        if element == 0 || (address - self.start) % element == 0 {
+            return Some(self.clone());
+        }
+        let direct = self.direct.as_ref()?;
+        let (page, first) = (PAGE as u64, self.start);
+        let mut base = first + page;
+        while base <= address && base - first <= 4096 * page {
+            if (address - base) % element == 0 {
+                let mut aliases = direct.aliases.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some((_, s)) = aliases.iter().find(|(b, _)| *b == base) {
+                    return Some(s.clone());
+                }
+                let made = Arc::new(placed(&direct.heap, base - first, base, first + self.len - base)?);
+                aliases.push((base, made.clone()));
+                return Some(made);
+            }
+            base += page;
+        }
+        None
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -216,6 +272,9 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        if self.direct.is_some() {
+            return;
+        }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
     }
@@ -227,6 +286,9 @@ impl Shadow {
     /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
     /// ~2.3 million page faults per world frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
+        if self.direct.is_some() {
+            return;
+        }
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -268,6 +330,9 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        if self.direct.is_some() {
+            return 0;
+        }
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let Before {
             snapshot,
@@ -352,6 +417,9 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        if self.direct.is_some() {
+            return 0;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -454,6 +522,262 @@ impl Shadow {
     }
 }
 
+/// Windows of title memory the host GPU reads and writes in place, by start:
+/// each a run of committed pages of one allocation.
+static DIRECT: Mutex<BTreeMap<u64, Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+
+fn windows_of_memory() -> std::sync::MutexGuard<'static, BTreeMap<u64, Arc<Shadow>>> {
+    DIRECT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Buffers of windows gone since (by interface address): views of them are
+/// made again.
+static GONE: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// Whether a host buffer is one of a window gone since.
+pub(crate) fn gone(buffer: &ID3D12Resource) -> bool {
+    use windows::core::Interface;
+    let gone = GONE.lock().unwrap_or_else(|e| e.into_inner());
+    !gone.is_empty() && gone.contains(&(buffer.as_raw() as usize))
+}
+
+/// A buffer over part of a heap.
+fn placed(
+    heap: &windows::Win32::Graphics::Direct3D12::ID3D12Heap,
+    offset: u64,
+    start: u64,
+    len: u64,
+) -> Option<Shadow> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: len,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: a live heap that holds the range.
+    let made = unsafe {
+        host()?.device.CreatePlacedResource(
+            heap,
+            offset,
+            &desc,
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut buffer,
+        )
+    };
+    if let Err(error) = made {
+        tracing::warn!(%error, start = format_args!("{start:#x}"), len, "no buffer over title memory");
+        return None;
+    }
+    let buffer = buffer?;
+    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} in place"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    Some(Shadow {
+        buffer,
+        data: start as *mut u8,
+        gpu,
+        start,
+        len,
+        copied: Mutex::default(),
+        watched: AtomicU8::new(NOT_WATCHED),
+        pending: Mutex::default(),
+        before: Mutex::default(),
+        direct: Some(Direct {
+            heap: heap.clone(),
+            aliases: Mutex::default(),
+            dead: std::sync::atomic::AtomicBool::new(false),
+        }),
+    })
+}
+
+/// How far a window reaches at most (host heaps end below 4 GiB).
+const WINDOW_REACH: u64 = 1 << 30;
+
+/// The run of committed pages of one allocation that holds `[from, to)`, in
+/// whole 64 KiB pages.
+fn run_of(from: u64, to: u64) -> Option<(u64, u64)> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_IMAGE, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
+    };
+    let query = |at: u64| {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: a query of our own address space.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        (n != 0
+            && info.State == MEM_COMMIT
+            && info.Type != MEM_IMAGE
+            && matches!(info.Protect, PAGE_READWRITE | PAGE_READONLY))
+        .then_some(info)
+    };
+    let first = query(from)?;
+    let allocation = first.AllocationBase as u64;
+    let low = (from & !(WINDOW_REACH - 1)).max(allocation);
+    let high = to.checked_next_multiple_of(WINDOW_REACH)?;
+    let mut start = first.BaseAddress as u64;
+    let mut end = start + first.RegionSize as u64;
+    while end < high
+        && let Some(i) = query(end)
+        && i.AllocationBase as u64 == allocation
+    {
+        end += i.RegionSize as u64;
+    }
+    while start > low
+        && let Some(i) = query(start - 1)
+        && i.AllocationBase as u64 == allocation
+    {
+        start = i.BaseAddress as u64;
+    }
+    let page = PAGE as u64;
+    let (start, end) = (start.max(low).next_multiple_of(page), end.min(high) & !(page - 1));
+    (start <= from && end >= to).then_some((start, end))
+}
+
+/// The window of title memory holding `[address, end)`, made on first use.
+/// `None` where the host GPU cannot use the memory in place: parts of it
+/// not committed, or of several allocations (views of physical pages).
+fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
+    use windows::Win32::Graphics::Direct3D12::{ID3D12Device13, ID3D12Heap};
+    use windows::core::Interface;
+    static DEVICE: std::sync::OnceLock<Option<ID3D12Device13>> = std::sync::OnceLock::new();
+    if cfg!(test) {
+        return None;
+    }
+    let device = DEVICE.get_or_init(|| {
+        // Diagnostics: copies, as without this.
+        let on = std::env::var_os("VICTORY_COPY_MEMORY").is_none();
+        let device: Option<ID3D12Device13> = if on {
+            host().and_then(|h| h.device.cast().ok())
+        } else {
+            None
+        };
+        tracing::info!(on = device.is_some(), "title memory used in place by the host GPU");
+        device
+    });
+    let device = device.as_ref()?;
+    let mut map = windows_of_memory();
+    if let Some(s) = map
+        .range(..=address)
+        .rev()
+        .take(8)
+        .map(|(_, s)| s)
+        .find(|s| s.start + s.len >= end)
+    {
+        return Some(s.clone());
+    }
+    // Asked over and over for the same memory: not looked at each time.
+    static REFUSED: Mutex<BTreeMap<u64, (u64, u64)>> = Mutex::new(BTreeMap::new());
+    let frame = crate::queue::presented();
+    let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(e, f)) = refused.get(&address)
+        && e == end
+        && f + 30 > frame
+    {
+        return None;
+    }
+    let page = PAGE as u64;
+    let window = run_of(address & !(page - 1), end.next_multiple_of(page)).and_then(|(start, stop)| {
+        // Read-only guards would refuse the GPU's writes.
+        crate::watch::writing(start as usize, (stop - start) as usize);
+        // SAFETY: committed memory; the heap keeps its pages.
+        let heap: Result<ID3D12Heap, _> = unsafe {
+            device.OpenExistingHeapFromAddress1(start as *const _, (stop - start) as usize)
+        };
+        match heap {
+            Ok(heap) => placed(&heap, 0, start, stop - start),
+            Err(error) => {
+                tracing::warn!(%error, start = format_args!("{start:#x}"), len = stop - start, "title memory refused by the host GPU");
+                None
+            }
+        }
+    });
+    let Some(window) = window else {
+        static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if count <= 16 || count.is_power_of_two() {
+            tracing::info!(
+                count,
+                address = format_args!("{address:#x}"),
+                len = end - address,
+                "title memory not usable in place: copied"
+            );
+        }
+        refused.insert(address, (end, frame));
+        return None;
+    };
+    let count = map.len() + 1;
+    if count <= 16 || count.is_power_of_two() {
+        tracing::info!(
+            count,
+            start = format_args!("{:#x}", window.start),
+            len = window.len,
+            "title memory in place"
+        );
+    }
+    let window = Arc::new(window);
+    map.insert(window.start, window.clone());
+    Some(window)
+}
+
+/// The title mapped or unmapped memory in `[start, end)`.
+pub(crate) fn remapped(start: u64, end: u64) {
+    use windows::core::Interface;
+    let mut map = windows_of_memory();
+    if map.is_empty() {
+        return;
+    }
+    let over: Vec<u64> = map
+        .range(..end)
+        .filter(|(_, s)| s.start + s.len > start)
+        .map(|(k, _)| *k)
+        .collect();
+    for key in over {
+        let Some(s) = map.remove(&key) else { continue };
+        let mut gone = GONE.lock().unwrap_or_else(|e| e.into_inner());
+        gone.insert(s.buffer.as_raw() as usize);
+        if let Some(d) = &s.direct {
+            d.dead.store(true, Ordering::Release);
+            for (_, a) in d.aliases.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                gone.insert(a.buffer.as_raw() as usize);
+                if let Some(d) = &a.direct {
+                    d.dead.store(true, Ordering::Release);
+                }
+            }
+        }
+        // shortcut: kept for good, pages too (`GONE` names its buffers by
+        // address); drop them with their last view if the title remaps much.
+        std::mem::forget(s);
+        static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if count.is_power_of_two() {
+            tracing::info!(count, "title memory in place was mapped anew");
+        }
+    }
+}
+
+/// The memory behind a buffer view with elements of `element` bytes, of
+/// `len` bytes at `address`.
+pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
+    let shadow = find(address, len)?;
+    if !shadow.is_direct() {
+        return Some(shadow);
+    }
+    shadow.on_element(address, element).or_else(|| {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(address = format_args!("{address:#x}"), element, "a view off its elements: copied");
+        });
+        find_copy(address, len)
+    })
+}
+
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
@@ -505,6 +829,14 @@ pub(crate) fn in_buffer(address: u64, len: u64) -> bool {
 /// the innermost, made now.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
+    if let Some(window) = direct(address, end) {
+        return Some(window);
+    }
+    find_copy(address, len)
+}
+
+fn find_copy(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let holding: Vec<((u64, usize), bool)> = map
         .range(..=(address, usize::MAX))
@@ -554,6 +886,9 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// `reach` bytes after `address`. A window ending sooner than the data read
 /// through the view is a GPU page fault.
 pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
+    if let Some(window) = direct(address, address.checked_add(1)?) {
+        return Some(window);
+    }
     let in_buffer = buffers()
         .range(..=(address, usize::MAX))
         .rev()

@@ -217,6 +217,8 @@ struct SlotUse {
     bounce: Option<(usize, u64, u32)>,
     /// The host resource it views.
     retained: Option<ID3D12Resource>,
+    /// The title memory it views in place.
+    direct: Option<Arc<crate::shadow::Shadow>>,
     /// It views a placed texture: the texture's object (0 for none), made
     /// again when the texture is evicted.
     placed: Option<usize>,
@@ -811,7 +813,16 @@ impl HostHeap {
         let is_buf = !self.sampler && view.is_buffer();
         {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            if made[index as usize] != key {
+            let gone = is_buf
+                && for_draw
+                && self
+                    .kept
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(index as usize)
+                    .and_then(Option::as_ref)
+                    .is_some_and(crate::shadow::gone);
+            if made[index as usize] != key || gone {
                 let later = !for_draw && is_buf;
                 made[index as usize] = if later { 0 } else { key };
                 let kept = if later {
@@ -1308,7 +1319,7 @@ impl HostHeap {
             b.checked.1 != epochs.1 && b.looked[0] != frame
         };
         let live = evictions.then(crate::resource::placed_live);
-        let (mut todo, check) = {
+        let (mut todo, check, remade) = {
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
             let b = &mut *b;
             // Released views and evicted textures are looked for once a frame.
@@ -1331,6 +1342,7 @@ impl HostHeap {
                 b.checked = epochs;
                 b.looked[0] = frame;
             }
+            let mut remade: Vec<u32> = Vec::new();
             let mut dirty = BTreeSet::new();
             while dirty.len() < 4 * SLOT_CHUNK
                 && let Some(i) = b.dirty.pop_first()
@@ -1341,7 +1353,11 @@ impl HostHeap {
                 let evicted = live
                     .zip(u.placed)
                     .is_some_and(|(l, t)| !l.contains(&t));
-                if evicted || viewed && u.unmapped {
+                let gone = viewed && u.direct.as_ref().is_some_and(|s| s.is_dead());
+                if gone {
+                    remade.push(i);
+                }
+                if evicted || gone || viewed && u.unmapped {
                     dirty.insert(i);
                 }
             }
@@ -1358,8 +1374,14 @@ impl HostHeap {
                 .into_iter()
                 .map(|i| (i, b.slots.get(&i).copied()))
                 .collect();
-            (todo, check)
+            (todo, check, remade)
         };
+        if !remade.is_empty() {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            for i in remade {
+                made[i as usize] = 0;
+            }
+        }
         todo.extend(stale_views(&check).into_iter().map(|(i, v)| (i, Some(v))));
         let (started, left) = (std::time::Instant::now(), self.budget_left(0));
         let mut made_any = false;
@@ -1450,7 +1472,10 @@ impl HostHeap {
                     Some(res) => slot.retained = Some(res),
                     None => return unmapped(&view),
                 }
-                slot.read = reads.pop();
+                match reads.pop() {
+                    Some((s, _, _)) if s.is_direct() => slot.direct = Some(s),
+                    read => slot.read = read,
+                }
                 slot.bounce = bounces.pop();
             }
             View::Placed(false, resource, desc) if resource[0] != 1 => {
@@ -1482,7 +1507,9 @@ impl HostHeap {
                 slot.retained = self.ensure_buffer_slot(index, key, &view);
                 if let Some(shadow) = crate::shadow::find(address, len) {
                     let clamped = len.min(shadow.left(address)) as usize;
-                    if clamped > 0 {
+                    if shadow.is_direct() {
+                        slot.direct = Some(shadow);
+                    } else if clamped > 0 {
                         slot.read = Some((shadow.clone(), address as usize, clamped));
                         if matches!(view, View::Unordered(..) | View::Placed(true, ..)) {
                             if clamped <= WRITE_CAP {
@@ -1710,8 +1737,8 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
     let element = element_size(&desc);
+    let shadow = crate::shadow::for_view(address, len, element)?;
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let offset = shadow.offset(address);
@@ -1771,7 +1798,7 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
+    let shadow = crate::shadow::for_view(address, len, uav_element_size(&desc).unwrap_or(0))?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
