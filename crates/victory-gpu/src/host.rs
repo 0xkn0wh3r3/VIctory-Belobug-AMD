@@ -1238,7 +1238,12 @@ impl HostList {
         format!("{} ({work} in all)", texts.join(" "))
     }
 
-    /// Counts a draw or dispatch (for the log).
+    /// Whether the list has work: draws, dispatches, clears or copies.
+    pub(crate) fn worked(&self) -> bool {
+        *self.work.lock().unwrap_or_else(|e| e.into_inner()) > 0
+    }
+
+    /// Counts a draw, dispatch, clear or copy.
     pub(crate) fn count_work(&self) {
         *self.work.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     }

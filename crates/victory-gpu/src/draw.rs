@@ -51,6 +51,19 @@ pub(crate) struct IndexView {
     format: u32,
 }
 
+/// Fixed-function state and the views bound for output.
+#[derive(Default)]
+struct Fixed {
+    viewports: Vec<D3D12_VIEWPORT>,
+    scissors: Vec<RECT>,
+    blend: Option<Option<[f32; 4]>>,
+    stencil: Option<u32>,
+    views: Option<(Vec<crate::descriptor::RtvRecord>, Option<crate::descriptor::RtvRecord>)>,
+}
+
+// SAFETY: the views only name title resources.
+unsafe impl Send for Fixed {}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -66,6 +79,9 @@ pub(crate) struct State {
     depth: usize,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
+    /// What was set on the host list at once, for the one a cut list goes on
+    /// in.
+    fixed: Fixed,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -245,21 +261,80 @@ impl State {
         self.index = view.copied().unwrap_or_default();
     }
 
+    /// Goes on in another host list, open: gives it the state set so far.
+    pub(crate) fn continue_in(&mut self, list: &HostList) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+        // Making one refreshes what it names, which is each list's own work.
+        self.fresh_tables.clear();
+        if self.topology != 0 {
+            self.set_topology(list, self.topology);
+        }
+        if !self.fixed.viewports.is_empty() {
+            viewports(list, &self.fixed.viewports);
+        }
+        if !self.fixed.scissors.is_empty() {
+            scissors(list, &self.fixed.scissors);
+        }
+        if let Some(factor) = &self.fixed.blend {
+            blend_factor(list, factor.as_ref());
+        }
+        if let Some(reference) = self.fixed.stencil {
+            stencil_ref(list, reference);
+        }
+        if let Some((targets, depth)) = self.fixed.views.take() {
+            self.bind_targets(list, targets, depth);
+        }
+    }
+
+    pub(crate) fn set_viewports(&mut self, list: &HostList, items: &[D3D12_VIEWPORT]) {
+        self.fixed.viewports = items.to_vec();
+        viewports(list, items);
+    }
+
+    pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
+        self.fixed.scissors = rects.to_vec();
+        scissors(list, rects);
+    }
+
+    pub(crate) fn set_blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
+        self.fixed.blend = Some(factor.copied());
+        blend_factor(list, factor);
+    }
+
+    pub(crate) fn set_stencil_ref(&mut self, list: &HostList, reference: u32) {
+        self.fixed.stencil = Some(reference);
+        stencil_ref(list, reference);
+    }
+
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        let mut targets = Vec::new();
+        for &h in handles {
+            match crate::descriptor::rtv_record(h) {
+                Some(record) => targets.push(record),
+                None => once!(
+                    handle = format_args!("{h:#x}"),
+                    "render target without a recorded view"
+                ),
+            }
+        }
+        self.bind_targets(list, targets, crate::descriptor::dsv_record(depth));
+    }
+
+    fn bind_targets(
+        &mut self,
+        list: &HostList,
+        targets: Vec<crate::descriptor::RtvRecord>,
+        depth: Option<crate::descriptor::RtvRecord>,
+    ) {
         let Some(host) = crate::host::host() else {
             return;
         };
         self.targets.clear();
         let mut rtvs = Vec::new();
-        for &h in handles {
-            let Some(record) = crate::descriptor::rtv_record(h) else {
-                once!(
-                    handle = format_args!("{h:#x}"),
-                    "render target without a recorded view"
-                );
-                continue;
-            };
+        for record in &targets {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
             };
@@ -269,7 +344,7 @@ impl State {
             rtvs.push(host.rtv(texture, record.desc().as_ref()));
         }
         self.depth = 0;
-        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
+        let dsv = depth.and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
@@ -285,6 +360,7 @@ impl State {
                 dsv.as_ref().map(std::ptr::from_ref),
             )
         };
+        self.fixed.views = Some((targets, depth));
     }
 
     /// The user-data value of a root argument, as translated shaders read
@@ -1190,22 +1266,22 @@ const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
 
 /// Fixed-function state, straight onto the host list.
-pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
     // SAFETY: an open list.
     unsafe { list.list.RSSetViewports(viewports) };
 }
 
-pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
+fn scissors(list: &HostList, rects: &[RECT]) {
     // SAFETY: an open list.
     unsafe { list.list.RSSetScissorRects(rects) };
 }
 
-pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
+fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetBlendFactor(factor) };
 }
 
-pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
+fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
 }

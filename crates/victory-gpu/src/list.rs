@@ -121,6 +121,10 @@ struct List {
     /// use a list on one thread at a time.
     #[cfg(windows)]
     host: std::cell::UnsafeCell<Option<Arc<crate::host::HostList>>>,
+    /// The recording before its last wait that followed work, cut there so
+    /// that work runs first.
+    #[cfg(windows)]
+    parts: std::cell::UnsafeCell<Vec<Arc<crate::host::HostList>>>,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
 }
@@ -167,13 +171,40 @@ impl std::ops::Deref for Submitted {
 /// What a submission of a title list runs, however the title goes on to use
 /// the list.
 #[cfg(windows)]
-pub(crate) fn submitted(this: This) -> Option<Submitted> {
+pub(crate) fn submitted(this: This) -> Vec<Submitted> {
     if this.is_null() {
-        return None;
+        return Vec::new();
     }
-    // SAFETY: the title passes one of our lists.
-    let host = unsafe { &*(*this.cast::<List>()).host.get() };
-    host.clone().map(Submitted)
+    // SAFETY: the title passes one of our lists, closed.
+    let (parts, host) = unsafe {
+        let list = &*this.cast::<List>();
+        (&*list.parts.get(), &*list.host.get())
+    };
+    parts.iter().chain(host).cloned().map(Submitted).collect()
+}
+
+/// Cuts a list's recording before a wait, if work precedes it: the rest goes
+/// into another host list, with the state the title set.
+#[cfg(windows)]
+fn cut(this: This) {
+    if !host_list(this).is_some_and(|l| l.worked()) {
+        return;
+    }
+    let Some(next) = spare() else { return };
+    // SAFETY: one of our lists; the title uses it on one thread at a time,
+    // and no reference to the host list is in use here.
+    let (host, parts, state) = unsafe {
+        let list = &*this.cast::<List>();
+        (&mut *list.host.get(), &mut *list.parts.get(), &list.state)
+    };
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(old) = host.replace(next) {
+        old.close();
+        parts.push(old);
+    }
+    if let Some(next) = host {
+        state.continue_in(next);
+    }
 }
 
 /// Host lists the title's lists were parted from while a submission of them
@@ -181,15 +212,14 @@ pub(crate) fn submitted(this: This) -> Option<Submitted> {
 #[cfg(windows)]
 static PARTED: std::sync::Mutex<Vec<Submitted>> = std::sync::Mutex::new(Vec::new());
 
-/// A host list in place of one still to run, open.
+/// A host list to record into, open: one that has run, or a new one.
 #[cfg(windows)]
-fn replacement(old: Arc<crate::host::HostList>) -> Option<Arc<crate::host::HostList>> {
+fn spare() -> Option<Arc<crate::host::HostList>> {
     let mut parted = PARTED.lock().unwrap_or_else(|e| e.into_inner());
     let spare = parted
         .iter()
         .position(|l| Arc::strong_count(&l.0) == 1)
         .map(|i| parted.swap_remove(i).0);
-    parted.push(Submitted(old));
     drop(parted);
     if let Some(list) = spare {
         list.release_kept();
@@ -306,6 +336,8 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
             })
             .into(),
         #[cfg(windows)]
+        parts: Default::default(),
+        #[cfg(windows)]
         state: Default::default(),
     });
     object::hand_out(LIST, list, iid, &LIST_IIDS, out)
@@ -355,11 +387,18 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
             (&mut *list.host.get(), &list.state)
         };
         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: as above.
+        let parts = unsafe { &mut *(*this.cast::<List>()).parts.get() };
+        {
+            let mut parted = PARTED.lock().unwrap_or_else(|e| e.into_inner());
+            parted.extend(parts.drain(..).map(Submitted));
+        }
         if let Some(old) = host.take_if(|h| Arc::strong_count(h) > 1) {
             // A submission of it is still to run, with the memory and the
             // descriptors it was recorded with.
             old.keep_until_run(Box::new((std::mem::take(&mut *uploads), std::mem::take(&mut *state))));
-            *host = replacement(old);
+            PARTED.lock().unwrap_or_else(|e| e.into_inner()).push(Submitted(old));
+            *host = spare();
             if host.is_none() {
                 return crate::object::E_OUTOFMEMORY;
             }
@@ -1032,7 +1071,7 @@ extern "system" fn ignored_state(_: This) {}
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, host_list, with_state};
+    use super::{This, with_state};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -1054,25 +1093,17 @@ mod state {
         count: u32,
         viewports: *const D3D12_VIEWPORT,
     ) {
-        if let Some(list) = host_list(this) {
-            crate::draw::viewports(list, items(viewports, count));
-        }
+        with_state(this, |list, s| s.set_viewports(list, items(viewports, count)));
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
-        if let Some(list) = host_list(this) {
-            crate::draw::scissors(list, items(rects, count));
-        }
+        with_state(this, |list, s| s.set_scissors(list, items(rects, count)));
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
-        if let Some(list) = host_list(this) {
-            // SAFETY: the title passes four floats or null.
-            crate::draw::blend_factor(list, unsafe { factor.as_ref() });
-        }
+        // SAFETY: the title passes four floats or null.
+        with_state(this, |list, s| s.set_blend_factor(list, unsafe { factor.as_ref() }));
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
-        if let Some(list) = host_list(this) {
-            crate::draw::stencil_ref(list, reference);
-        }
+        with_state(this, |list, s| s.set_stencil_ref(list, reference));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
@@ -1351,6 +1382,8 @@ extern "system" fn wait_value32(this: This, address: u64, comparison: u32, refer
 /// Keeps the wait, waited for when the list is submitted.
 fn note_wait(this: This, address: u64, comparison: u32, reference: u64, bytes: usize) {
     #[cfg(windows)]
+    cut(this);
+    #[cfg(windows)]
     if let Some(list) = host_list(this) {
         list.note_wait(crate::memwait::Wait {
             address: address as usize,
@@ -1537,6 +1570,50 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn lists_are_cut_at_waits_that_follow_work() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let (mut allocator, mut list) = (null, null);
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        assert_eq!(new_list(0, allocator, &LIST_IIDS[0], &mut list), S_OK);
+        let memory = [0u64; 2];
+        let at = |i: usize| (&raw const memory[i]) as u64;
+        let value = |i: usize| {
+            // SAFETY: inside the array.
+            unsafe { (at(i) as *const u64).read_volatile() }
+        };
+        for _ in 0..2 {
+            // SAFETY: inside the array.
+            unsafe { (at(0) as *mut [u64; 2]).write_volatile([0; 2]) };
+            state::stencil_ref(list, 3);
+            // No work yet: not cut.
+            wait_value(list, at(0), 7, 0);
+            assert_eq!(submitted(list).len(), 1);
+            host_list(list).unwrap().count_work();
+            write64(list, at(0), 1, 0, 0);
+            wait_value(list, at(1), 7, 4);
+            assert_eq!(submitted(list).len(), 2);
+            assert_eq!(close(list), S_OK);
+            let parts = submitted(list);
+            assert!(parts[0].unmet().is_empty() && parts[1].unmet().len() == 1);
+            crate::host::host().unwrap().execute(&[&*parts[0]]);
+            assert_eq!(value(0), 1);
+            // Reset while the second part is still to run.
+            assert_eq!(reset(list, allocator, null), S_OK);
+            assert_eq!(submitted(list).len(), 1);
+            // SAFETY: inside the array.
+            unsafe { (at(1) as *mut u64).write_volatile(4) };
+            assert!(parts[1].unmet().is_empty());
+            crate::host::host().unwrap().execute(&[&*parts[1]]);
+        }
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
