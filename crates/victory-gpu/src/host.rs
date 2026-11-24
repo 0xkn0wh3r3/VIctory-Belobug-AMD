@@ -181,7 +181,13 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            match fastest_adapter() {
+                Ok(adapter) => D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+                Err(e) => {
+                    tracing::warn!(error = %e, "no adapter preference; the default is used");
+                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                }
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug
@@ -223,6 +229,25 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
         })
+    }
+}
+
+/// The adapter Windows ranks fastest, so a machine with an integrated GPU
+/// too runs on its discrete one.
+fn fastest_adapter() -> windows::core::Result<IDXGIAdapter1> {
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        let adapter: IDXGIAdapter1 =
+            factory.EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)?;
+        let desc = adapter.GetDesc1()?;
+        let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+        tracing::info!(
+            name = String::from_utf16_lossy(&desc.Description[..end]),
+            vram_mb = desc.DedicatedVideoMemory >> 20,
+            "host adapter"
+        );
+        Ok(adapter)
     }
 }
 
