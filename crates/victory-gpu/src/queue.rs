@@ -164,8 +164,48 @@ extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
     crate::fence::signal(fence, value)
 }
 /// Nothing runs on the queue, so waiting for a fence never blocks it.
-extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
-    if fence.is_null() { E_INVALIDARG } else { S_OK }
+extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
+    if fence.is_null() {
+        return E_INVALIDARG;
+    }
+    #[cfg(feature = "diagnostics")]
+    note_wait(this, fence, value);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (this, value);
+    S_OK
+}
+
+/// Diagnostics: counts queue waits, and those for a value the fence has not
+/// reached: what the queue runs next runs too early.
+#[cfg(feature = "diagnostics")]
+fn note_wait(queue: This, fence: This, value: u64) {
+    static WAITS: AtomicU64 = AtomicU64::new(0);
+    static UNMET: AtomicU64 = AtomicU64::new(0);
+    let waits = WAITS.fetch_add(1, Ordering::Relaxed) + 1;
+    let reached = crate::fence::completed(fence);
+    if reached < value {
+        let unmet = UNMET.fetch_add(1, Ordering::Relaxed) + 1;
+        if unmet.is_power_of_two() {
+            // SAFETY: one of our queues; its type is at +0x10.
+            let kind = unsafe { queue.cast::<u8>().add(0x10).cast::<u32>().read() };
+            tracing::info!(
+                unmet,
+                waits,
+                frame = FRAMES.load(Ordering::Relaxed),
+                kind,
+                reached,
+                value,
+                "a queue wait not met yet"
+            );
+        }
+    } else if waits.is_power_of_two() {
+        tracing::info!(
+            waits,
+            unmet = UNMET.load(Ordering::Relaxed),
+            frame = FRAMES.load(Ordering::Relaxed),
+            "queue waits"
+        );
+    }
 }
 /// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
 extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
