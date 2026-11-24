@@ -184,7 +184,7 @@ struct Bindless {
 /// slots not made yet read nothing (null views) for a few frames, as
 /// streaming pops in; making all of them at once stalled frames for
 /// seconds.
-const SLOT_BUDGET_US: u64 = 8_000;
+const SLOT_BUDGET_US: u64 = 60_000;
 /// Slots taken to make at once (the rest wait without being looked at).
 const SLOT_CHUNK: usize = 256;
 
@@ -195,7 +195,7 @@ impl Bindless {
         let (at, left) = self
             .budget
             .get_or_insert((now, [SLOT_BUDGET_US; 2]));
-        let add = now.duration_since(*at).as_micros() as u64 / 8;
+        let add = now.duration_since(*at).as_micros() as u64 / 3;
         if add > 0 {
             *at = now;
             for l in left.iter_mut() {

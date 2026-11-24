@@ -1913,7 +1913,22 @@ impl<'a> Lower<'a> {
                 }
                 Reg::S(_) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
-                    None => Val::Missing("a hardware SGPR input"),
+                    // Compute: past the user SGPRs the hardware sets only
+                    // the group's, which are known. Others no one set (a
+                    // path that does not need them); they read as zero, as
+                    // VGPRs do. In a pixel program the hardware's come
+                    // within the first few after the 32 user SGPRs.
+                    None if self.s.threads.is_some() && self.s.mesh.is_none()
+                        || self.s.pixel && matches!(reg, Reg::S(n) if n >= 40) =>
+                    {
+                        Val::I32(self.s.m.i32(0))
+                    }
+                    None => {
+                        if std::env::var_os("VICTORY_WHY").is_some() {
+                            eprintln!("input {reg:?}");
+                        }
+                        Val::Missing("a hardware SGPR input")
+                    }
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
                 Reg::V(_) => match io_inputs.get(&v) {
@@ -3813,6 +3828,33 @@ impl<'a> Lower<'a> {
                 self.read_lane(x, src)
             };
             let reg = dst_reg.ok_or("a swizzle result")?;
+            self.write(inst, Reg::V(reg), r, guard);
+            return Ok(());
+        }
+        if name == "ds_bpermute_b32" {
+            // Each lane reads the data of the lane it names (times 4): 0 if
+            // that one does not run this.
+            self.cross_lane(false)?;
+            if self.split {
+                return Err("a lane permutation in a wave64 program split in halves");
+            }
+            let at = self.vgprs(inst, addr.as_ref().ok_or("a permutation address")?, 1)?[0];
+            let x = self.vgprs(inst, data.first().ok_or("permutation data")?, 1)?[0];
+            let (by, two, last) = (
+                self.s.m.i32(offset),
+                self.s.m.i32(2),
+                self.s.m.i32(self.wave() - 1),
+            );
+            let at = self.s.m.bin(c, Bin::Add, at, by);
+            let at = self.s.m.bin(c, Bin::LShr, at, two);
+            let src = self.s.m.bin(c, Bin::And, at, last);
+            let z = self.s.m.i32(0);
+            let x = match guard {
+                Some(g) => self.s.m.select(c, g, x, z),
+                None => x,
+            };
+            let r = self.read_lane(x, src);
+            let reg = dst_reg.ok_or("a permutation result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
