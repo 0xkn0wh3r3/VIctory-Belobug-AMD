@@ -535,6 +535,10 @@ struct Lower<'a> {
     /// Pixel inputs holding 16-bit values: row, whether two per dword, and
     /// the row packed after it.
     half_inputs: HashMap<u8, (bool, Option<u8>)>,
+    /// Multi-element 16-bit rows whose trailing element overflows a 4-dword
+    /// `pack2` attribute and spills into a free dword of a later `pack2`
+    /// attribute: `(attr_row, half_index) -> (sig_row, col)`.
+    half_input_spills: HashMap<(u8, u8), (u8, u8)>,
     /// How lane masks become data.
     mask_data: MaskData,
     /// The instruction being lowered may read lane masks as data.
@@ -969,6 +973,68 @@ fn half_inputs(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, (bool, Option
     out
 }
 
+/// Elements from multi-element 16-bit signature rows that overflow a 4-dword
+/// `pack2` attribute (because each element starts on a whole dword) and spill
+/// into free dwords of a subsequent `pack2` attribute.
+fn half_input_spills(
+    half_inputs: &HashMap<u8, (bool, Option<u8>)>,
+    inputs: &[SigElement],
+) -> HashMap<(u8, u8), (u8, u8)> {
+    let row_elems = |r: u8| -> Vec<&SigElement> {
+        let mut v: Vec<_> = inputs
+            .iter()
+            .filter(|e| e.half && e.row == Some(u32::from(r)))
+            .collect();
+        v.sort_by_key(|e| e.col);
+        v
+    };
+    let extent = |r: u8| -> u8 {
+        inputs
+            .iter()
+            .filter(|e| e.row == Some(u32::from(r)))
+            .map(|e| e.col + e.cols)
+            .max()
+            .unwrap_or(0)
+    };
+    let mut rows: Vec<(u8, Option<u8>)> = half_inputs
+        .iter()
+        .filter_map(|(&a, &(pack2, b))| pack2.then_some((a, b)))
+        .collect();
+    rows.sort_by_key(|&(a, _)| a);
+    let mut pending: Vec<(u8, u8, u8)> = Vec::new();
+    let mut out = HashMap::new();
+    for (a, b) in rows {
+        let mut elems_a = row_elems(a);
+        let dwords_b: u8 = b
+            .map(|r| row_elems(r).iter().map(|e| e.cols.div_ceil(2)).sum())
+            .unwrap_or(0);
+        let mut dwords_a: u8 = elems_a.iter().map(|e| e.cols.div_ceil(2)).sum();
+        while elems_a.len() > 1 && dwords_a + dwords_b > 4 {
+            let spill = elems_a.pop().unwrap();
+            dwords_a -= spill.cols.div_ceil(2);
+            pending.push((a, spill.col, spill.cols));
+        }
+        let mut used = extent(a).div_ceil(2) + b.map_or(0, |r| extent(r).div_ceil(2));
+        if used < 4 && !pending.is_empty() {
+            let mut idx = 0;
+            while idx < pending.len() && used < 4 {
+                let (sr, sc, scols) = pending[idx];
+                let need = scols.div_ceil(2);
+                if used + need <= 4 {
+                    for k in 0..scols {
+                        out.insert((a, used * 2 + k), (sr, sc + k));
+                    }
+                    used += need;
+                    pending.remove(idx);
+                } else {
+                    idx += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -1251,7 +1317,11 @@ impl<'a> Lower<'a> {
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
-            half_inputs: half_inputs(&x.native.io, &x.inputs),
+            half_inputs: {
+                let hi = half_inputs(&x.native.io, &x.inputs);
+                hi
+            },
+            half_input_spills: half_input_spills(&half_inputs(&x.native.io, &x.inputs), &x.inputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs | HwStage::Ms => MaskData::Host,
@@ -2996,6 +3066,36 @@ impl<'a> Lower<'a> {
     /// Whether some lane of the mask with low dword `lo` is set, as data
     /// (SCC of the operation writing it): its ballot is not zero.
     fn mask_any(&mut self, lo: Value) -> Result<V, Why> {
+        // When `lo` is the new EXEC written in block `b` (e.g. `s_*_wrexec_*` or
+        // `s_*_saveexec_*`) and `b` exits via `s_cbranch_execz`/`execnz` without
+        // rewriting EXEC, a block entered solely through one branch edge knows
+        // whether `lo != 0` without balloting lanes from elsewhere.
+        if let Some(&b) = self.def_block.get(&lo) {
+            let blk = &self.x.p.blocks[b];
+            if let crate::ir::Exit::Branch { taken, not_taken } = blk.exit
+                && taken != not_taken
+                && self.x.p.blocks[self.cur_ir].preds.as_slice() == [b]
+                && let Some((idx, def)) = blk
+                    .insts
+                    .iter()
+                    .enumerate()
+                    .find(|(_, inst)| inst.writes.iter().any(|&(_, w)| w == lo))
+                && (def.write(Reg::S(EXEC)) == Some(lo) || def.name().contains("_wrexec_"))
+                && !blk.insts[idx + 1..]
+                    .iter()
+                    .any(|inst| inst.write(Reg::S(EXEC)).is_some())
+                && let Some(term) = blk.insts.last()
+            {
+                let nonzero = match term.name() {
+                    "s_cbranch_execnz" => Some(self.cur_ir == taken),
+                    "s_cbranch_execz" => Some(self.cur_ir == not_taken),
+                    _ => None,
+                };
+                if let Some(bit) = nonzero {
+                    return Ok(self.s.m.int_const(self.s.t.i1, i64::from(bit)));
+                }
+            }
+        }
         let x = self.mask_dword(lo)?;
         let (_, y) = self.ballots[&lo];
         let c = self.cur;
@@ -7754,9 +7854,9 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a mixed-precision result");
                 };
-                let old = match inst.read(Reg::V(reg)) {
-                    Some(o) => self.i32_of(o)?,
-                    None => self.s.m.i32(0),
+                let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+                    Some(Ok(o)) => o,
+                    _ => self.s.m.i32(0),
                 };
                 let h = self
                     .s
@@ -9955,6 +10055,7 @@ impl<'a> Lower<'a> {
                 let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
                     let src = if pack2 {
                         packed_half(&l.s.inputs, attribute.row, b, h)
+                            .or_else(|| l.half_input_spills.get(&(attribute.row, h)).copied())
                     } else {
                         h.is_multiple_of(2).then_some((attribute.row, h / 2))
                     };

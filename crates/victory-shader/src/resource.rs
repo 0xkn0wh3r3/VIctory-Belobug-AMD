@@ -970,13 +970,43 @@ impl<'a> Tracer<'a> {
     /// borrow.
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
         let want = high.map_or(Term::Const(0), Term::Value);
-        hi == want
-            || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
-                |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
-            ))
-            || matches!(hi, Term::Value(v) if self.sop2(v, &["s_subb_u32"]).is_some_and(
-                |(_, [a, b])| a == want && b == Term::Const(0)
-            ))
+        let direct = |t: Term| {
+            t == want
+                || matches!(t, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
+                    |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
+                ))
+                || matches!(t, Term::Value(v) if self.sop2(v, &["s_subb_u32"]).is_some_and(
+                    |(_, [a, b])| a == want && b == Term::Const(0)
+                ))
+        };
+        if direct(hi) {
+            return true;
+        }
+        // A high half written on one branch (e.g. `s_mov_b32 s25, 0` inside an
+        // early-skip block) merges with the uninitialized entry SGPR at the join.
+        let Term::Value(v) = hi else { return false };
+        let Some((b, k)) = self.phis[v.0 as usize] else {
+            return false;
+        };
+        let phi = &self.p.blocks[b].phis[k];
+        let mut has_match = false;
+        for &arg in &phi.args {
+            if arg == v {
+                continue;
+            }
+            let t = self.origin(arg);
+            if direct(t) {
+                has_match = true;
+            } else if let Term::Value(u) = t
+                && let Some(reg) = self.inputs[u.0 as usize]
+                && self.param_of(reg).is_none()
+            {
+                // Uninitialized scratch SGPR from an untaken/dead path.
+            } else {
+                return false;
+            }
+        }
+        has_match
     }
 
     /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
@@ -1604,12 +1634,11 @@ impl<'a> Tracer<'a> {
                 Term::Const(_) => None,
             })
             .collect();
-        let Some(mask) = picks.iter().flatten().map(|p| p.0).next() else {
+        // Peel the outermost (highest-SSA) mask first; any word selected by a
+        // different mask stays intact for the recursive `per_lane` call.
+        let Some(mask) = picks.iter().flatten().map(|p| p.0).max() else {
             return Ok(None);
         };
-        if picks.iter().flatten().any(|p| p.0 != mask) {
-            return Err("a descriptor chosen per lane by several masks");
-        }
         if joins.len() >= MAX_JOINS {
             return Err("a descriptor joined too often");
         }
@@ -1619,14 +1648,14 @@ impl<'a> Tracer<'a> {
                 .iter()
                 .zip(&picks)
                 .map(|(w, p)| match p {
-                    Some((_, t, f)) => {
+                    Some((m, t, f)) if *m == mask => {
                         if set {
                             *t
                         } else {
                             *f
                         }
                     }
-                    None => *w,
+                    _ => *w,
                 })
                 .collect()
         };
