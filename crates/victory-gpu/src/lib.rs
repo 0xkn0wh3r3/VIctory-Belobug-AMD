@@ -57,8 +57,6 @@ pub mod signature;
 mod texture;
 #[cfg(windows)]
 mod watch;
-#[cfg(all(test, windows))]
-mod unified_test;
 
 #[cfg(windows)]
 pub use host::on_failure;
