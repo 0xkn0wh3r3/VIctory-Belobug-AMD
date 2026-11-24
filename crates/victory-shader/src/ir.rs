@@ -19,7 +19,8 @@ use crate::ShaderError;
 use crate::gfx10::{self, Fields, Flow, Instruction, Operand};
 
 /// One register dword. Scalar codes as in [`Operand::Scalar`]: 0-105 SGPRs,
-/// 106/107 VCC, 108-123 trap temporaries, 124 M0, 126/127 EXEC.
+/// 106/107 VCC, 108-123 trap temporaries, 124 M0, 126/127 EXEC, 128 and up
+/// SGPRs spilled to VGPR lanes (see `unspill`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Reg {
     S(u8),
@@ -195,6 +196,9 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             });
         }
     }
+    if !wave64 {
+        unspill(&mut blocks);
+    }
     link(&mut blocks);
     if !blocks[0].preds.is_empty() {
         return Err(ShaderError::Unsupported {
@@ -205,7 +209,18 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
     split_irreducible(&mut blocks)?;
 
     let order = reverse_postorder(&blocks);
-    let (live_in, live_out) = liveness(&blocks, &order);
+    let (mut live_in, mut live_out) = liveness(&blocks, &order);
+    // A spilled SGPR that some path reads before any write is zero there.
+    let unset: Vec<Inst> = members(&live_in[0])
+        .filter_map(|reg| match reg {
+            Reg::S(c) if SPILLS.contains(&c) => Some(zero(c, blocks[0].offset)),
+            _ => None,
+        })
+        .collect();
+    if !unset.is_empty() {
+        blocks[0].insts.splice(0..0, unset);
+        (live_in, live_out) = liveness(&blocks, &order);
+    }
     let mut values = 0u32;
     let mut new_value = || {
         values += 1;
@@ -272,23 +287,23 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
 
 /// Placeholder before renaming.
 const NONE: Value = Value(u32::MAX);
-/// SGPR codes 0-127, SCC, VGPRs 0-255.
-const REGS: usize = 128 + 1 + 256;
+/// SGPR codes 0-255, SCC, VGPRs 0-255.
+const REGS: usize = 256 + 1 + 256;
 type RegSet = [u64; REGS.div_ceil(64)];
 
 fn index(reg: Reg) -> usize {
     match reg {
         Reg::S(c) => usize::from(c),
-        Reg::Scc => 128,
-        Reg::V(r) => 129 + usize::from(r),
+        Reg::Scc => 256,
+        Reg::V(r) => 257 + usize::from(r),
     }
 }
 
 fn reg_at(i: usize) -> Reg {
     match i {
-        0..128 => Reg::S(i as u8),
-        128 => Reg::Scc,
-        _ => Reg::V((i - 129) as u8),
+        0..256 => Reg::S(i as u8),
+        256 => Reg::Scc,
+        _ => Reg::V((i - 257) as u8),
     }
 }
 
@@ -307,6 +322,121 @@ fn members(set: &RegSet) -> impl Iterator<Item = Reg> + '_ {
     (0..REGS)
         .filter(|&i| set[i / 64] >> (i % 64) & 1 != 0)
         .map(reg_at)
+}
+
+/// Scalar codes of spilled SGPRs.
+const SPILLS: std::ops::Range<u8> = 128..254;
+
+/// SOP1 opcode.
+const S_MOV_B32: u16 = 3;
+
+/// The VGPR and lane of a `v_writelane_b32` (`true`) or `v_readlane_b32`
+/// (`false`) of a constant lane.
+fn spill(inst: &Inst) -> Option<(u8, u32, bool)> {
+    let Fields::Valu(v) = &inst.fields else {
+        return None;
+    };
+    let write = match inst.name() {
+        "v_writelane_b32" => true,
+        "v_readlane_b32" => false,
+        _ => return None,
+    };
+    let vector = if write { v.dst.as_ref() } else { v.src.first() };
+    let (Some(&Operand::Vector { reg, .. }), Some(&Operand::Const(c @ 128..=159))) =
+        (vector, v.src.get(1))
+    else {
+        return None;
+    };
+    Some((reg, u32::from(c) - 128, write))
+}
+
+/// Compilers out of SGPRs keep some in lanes of VGPRs they use for nothing
+/// else. Each such lane becomes a scalar register of its own and its reads
+/// and writes become `s_mov_b32`, so that what it holds (a lane mask, say)
+/// is followed like any scalar. 32-lane waves only: 64-lane masks are pairs,
+/// moved together.
+fn unspill(blocks: &mut [Block]) {
+    let mut used = [false; 256];
+    for inst in blocks.iter().flat_map(|b| &b.insts) {
+        // Of a lane access, the spilled register itself is no other use.
+        let own = spill(inst).map(|s| Reg::V(s.0));
+        for &(reg, _) in inst.reads.iter().chain(&inst.writes) {
+            if let Reg::V(v) = reg
+                && Some(reg) != own
+            {
+                used[usize::from(v)] = true;
+            }
+        }
+    }
+    let mut lanes: Vec<(u8, u32)> = Vec::new();
+    for inst in blocks.iter().flat_map(|b| &b.insts) {
+        if let Some((reg, lane, _)) = spill(inst)
+            && !used[usize::from(reg)]
+            && !lanes.contains(&(reg, lane))
+        {
+            lanes.push((reg, lane));
+        }
+    }
+    // All lanes of a register or none.
+    while lanes.len() > SPILLS.len() {
+        let Some(&(reg, _)) = lanes.last() else { break };
+        lanes.retain(|l| l.0 != reg);
+    }
+    for inst in blocks.iter_mut().flat_map(|b| &mut b.insts) {
+        let Some((reg, lane, write)) = spill(inst) else {
+            continue;
+        };
+        let Some(at) = lanes.iter().position(|&l| l == (reg, lane)) else {
+            continue;
+        };
+        let Fields::Valu(v) = &inst.fields else {
+            continue;
+        };
+        let slot = SPILLS.start + at as u8;
+        let operand = Operand::Scalar { code: slot, dwords: 1 };
+        let (dst, src) = if write {
+            (Some(operand), v.src[0])
+        } else {
+            (v.dst, operand)
+        };
+        let slot = (Reg::S(slot), NONE);
+        if write {
+            inst.reads.clear();
+            // Only fails out of bounds, which `effects` checked.
+            let mut regs = Vec::new();
+            let _ = add_regs(&src, 1, &mut regs);
+            inst.reads.extend(regs.into_iter().map(|r| (r, NONE)));
+            inst.writes = vec![slot];
+        } else {
+            inst.reads = vec![slot];
+        }
+        inst.machine.encoding = gfx10::Encoding::Sop1;
+        inst.machine.opcode = S_MOV_B32;
+        inst.fields = Fields::Sop {
+            dst,
+            src: vec![src],
+            imm: None,
+        };
+    }
+}
+
+/// `s_mov_b32 code, 0` at `offset`.
+fn zero(code: u8, offset: usize) -> Inst {
+    Inst {
+        machine: Instruction {
+            offset,
+            encoding: gfx10::Encoding::Sop1,
+            opcode: S_MOV_B32,
+            words: Vec::new(),
+        },
+        fields: Fields::Sop {
+            dst: Some(Operand::Scalar { code, dwords: 1 }),
+            src: vec![Operand::Const(128)],
+            imm: None,
+        },
+        reads: Vec::new(),
+        writes: vec![(Reg::S(code), NONE)],
+    }
 }
 
 /// `outs` is sorted by register, and holds every register live out.
@@ -1041,6 +1171,38 @@ mod tests {
 
     fn input(p: &Program, reg: Reg) -> Value {
         p.inputs.iter().find(|i| i.0 == reg).expect("input").1
+    }
+
+    /// Lanes of a VGPR used for nothing else are scalars of their own; a
+    /// VGPR used otherwise too keeps its lane accesses.
+    #[test]
+    fn spilled_lanes_become_scalars() {
+        let mut code = vec![
+            0xD761_0005,
+            0x0001_0609, // v_writelane_b32 v5, s9, 3
+            0xD761_0005,
+            0x0001_080A, // v_writelane_b32 v5, s10, 4
+            0xD760_0002,
+            0x0001_0705, // v_readlane_b32 s2, v5, 3
+            S_ENDPGM,
+        ];
+        let p = build_words(&code, false);
+        let i = &p.blocks[0].insts;
+        assert!(i[..3].iter().all(|i| i.name() == "s_mov_b32"));
+        assert_eq!(i[0].reads, [(Reg::S(9), input(&p, Reg::S(9)))]);
+        assert_eq!(i[2].reads[0].1, i[0].writes[0].1);
+        assert_ne!(i[0].writes[0].0, i[1].writes[0].0);
+        // 64-lane waves keep them.
+        let p = build_words(&code, true);
+        assert_eq!(p.blocks[0].insts[0].name(), "v_writelane_b32");
+        code.insert(6, 0x7E00_0305); // v_mov_b32 v0, v5
+        let p = build_words(&code, false);
+        assert_eq!(p.blocks[0].insts[0].name(), "v_writelane_b32");
+        // Read before any write: zero.
+        let p = build_words(&[0xD760_0002, 0x0001_0705, S_ENDPGM], false);
+        let i = &p.blocks[0].insts;
+        assert_eq!(i[1].reads[0].1, i[0].writes[0].1);
+        assert!(p.inputs.iter().all(|i| !matches!(i.0, Reg::V(_))));
     }
 
     #[test]

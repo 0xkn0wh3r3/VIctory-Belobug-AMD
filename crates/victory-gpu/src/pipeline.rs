@@ -108,6 +108,10 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let done = translate(&self.container);
+                #[cfg(feature = "diagnostics")]
+                if done.is_err() {
+                    dump(self);
+                }
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
@@ -126,6 +130,21 @@ impl Shader {
                 done.ok()
             })
             .as_ref()
+    }
+}
+
+/// Diagnostics (`VICTORY_SHADER_DUMP=<dir>`, outside the repository): saves
+/// a shader that does not translate, for `victory translate`.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dump(shader: &Shader) {
+    let Some(dir) = std::env::var_os("VICTORY_SHADER_DUMP").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let path = dir.join(format!("{}-{}.dxbc", shader.stage, shader.hash));
+    if let Err(error) = victory_core::ensure_outside_repo(&path) {
+        tracing::warn!(%error, "shader not saved");
+    } else if let Err(error) = std::fs::write(&path, &shader.container) {
+        tracing::warn!(%error, "shader not saved");
     }
 }
 
