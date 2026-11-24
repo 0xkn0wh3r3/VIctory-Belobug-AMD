@@ -354,6 +354,12 @@ impl RootType {
     /// Not the title's: the host's first view of memory by address
     /// (`emit::lower`, `Lower::memory`), as user data.
     pub const MEMORY: RootType = RootType::Other(0x4D45_4D);
+    /// Not the title's: what the host adds to the group's x, as user data
+    /// (a dispatch of more groups than the host's most is many of its).
+    pub const GROUPS: RootType = RootType::Other(0x4752_5053);
+    /// Not the title's: the threads in x that run, as user data; its
+    /// `dword` is the threads of a group in x.
+    pub const THREADS: RootType = RootType::Other(0x5448_5244);
 
     fn from_raw(raw: u32) -> Self {
         match raw {

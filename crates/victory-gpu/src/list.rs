@@ -1143,14 +1143,21 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `DispatchX(x, y, z, flags)`: a dispatch with the GPU's initiator flags,
+/// of which the host needs to know if `x` counts threads (as the
+/// ray-tracing builder's does); another picks 32-lane waves, as the
+/// program's own flags do.
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+    const USE_THREAD_DIMENSIONS: u32 = 0x20;
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    if flags & USE_THREAD_DIMENSIONS != 0 {
+        state::dispatch_threads(this, x, y, z);
+    } else {
+        state::dispatch(this, x, y, z);
+    }
     #[cfg(not(windows))]
     {
-        let _ = (this, x, y, z);
+        let _ = (this, x, y, z, flags);
         count_dispatch();
     }
 }
@@ -1516,7 +1523,12 @@ mod state {
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        with_state(this, |list, s| s.dispatch(list, x, y, z, false));
+    }
+    /// A dispatch whose `x` counts threads.
+    pub(super) extern "system" fn dispatch_threads(this: This, x: u32, y: u32, z: u32) {
+        super::count_dispatch();
+        with_state(this, |list, s| s.dispatch(list, x, y, z, true));
     }
     /// The groups a mesh dispatch of `x` × `y` × `z` groups runs: the
     /// title's mesh programs read only the x group id, so `x` (y and z

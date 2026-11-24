@@ -179,7 +179,10 @@ impl Shader {
             .get_or_init(|| {
                 let done = translate(&self.container);
                 #[cfg(feature = "diagnostics")]
-                if done.is_err() {
+                if done.is_err()
+                    || std::env::var("VICTORY_SHADER_HASHES")
+                        .is_ok_and(|l| l.split(',').any(|h| h == self.hash))
+                {
                     dump(self);
                 }
                 match &done {

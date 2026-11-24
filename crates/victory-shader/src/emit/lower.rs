@@ -560,6 +560,8 @@ struct Lower<'a> {
     section_out: HashSet<Value>,
     /// Values of whole-wave sections holding one lane's, the one read after.
     one_lane: HashSet<Value>,
+    /// Memory by address is written too, for other groups to read.
+    coherent: Option<bool>,
     /// Views of buffers accessed by address, by instruction.
     made: HashMap<Site, V>,
     /// The program's constant table (the code from the first byte read
@@ -1276,6 +1278,7 @@ impl<'a> Lower<'a> {
             sections: HashMap::new(),
             section_out: HashSet::new(),
             one_lane: Default::default(),
+            coherent: None,
             made: Default::default(),
             code_table: None,
             scratch: None,
@@ -1884,6 +1887,27 @@ impl<'a> Lower<'a> {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
         }
+        // Dispatches count threads too: the last group's others do not run.
+        if self.x.res.addresses
+            && self.s.mesh.is_none()
+            && let Some([x, ..]) = self.s.threads
+        {
+            let e = self.s.entry;
+            let zero = self.s.m.i32(0);
+            let i32t = self.s.t.i32;
+            let id = self.s.op(e, "threadId.i32", Attr::ReadNone, i32t, 93, &[zero]);
+            let start = self.host_data(1, RootType::GROUPS, 0);
+            let group = self.s.m.i32(x);
+            let start = self.s.m.bin(e, Bin::Mul, start, group);
+            let id = self.s.m.bin(e, Bin::Add, id, start);
+            let most = self.host_data(2, RootType::THREADS, x);
+            let runs = self.s.m.cmp(e, pred::IULT, id, most);
+            let stop = self.abort_block();
+            let go = self.s.m.new_block();
+            self.s.m.terminate(e, Term::CondBr(runs, go, stop));
+            self.cur = go;
+            self.block[order[0]] = Some(go);
+        }
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
@@ -2014,6 +2038,13 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
+            Input::GroupId(0) if self.x.res.addresses => {
+                let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
+                    unreachable!()
+                };
+                let first = self.host_data(1, RootType::GROUPS, 0);
+                return Val::I32(self.s.m.bin(self.s.entry, Bin::Add, g, first));
+            }
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
@@ -2351,19 +2382,25 @@ impl<'a> Lower<'a> {
     /// The heap index of the host's first view of memory by address: the
     /// map, then the memory it names.
     fn memory_base(&mut self) -> V {
+        self.host_data(0, RootType::MEMORY, 0)
+    }
+
+    /// User data the host adds behind the title's: the `nth` such dword.
+    fn host_data(&mut self, nth: u32, root: RootType, dword: u32) -> V {
         let layout = &self.x.native.layout;
         let index = layout
             .iter()
             .map(|p| u32::from(p.user_data) + p.sgprs.max(1))
             .max()
-            .unwrap_or(0);
+            .unwrap_or(0)
+            + nth;
         self.user_reads.insert(
             index,
             UserData {
                 index,
                 slot: u8::MAX,
-                root: RootType::MEMORY,
-                dword: 0,
+                root,
+                dword,
             },
         );
         self.s.user_data = self.s.user_data.max(index + 1);
@@ -2417,7 +2454,16 @@ impl<'a> Lower<'a> {
         let start = self.s.m.extract(c, r, 1);
         let start = self.as_int(start);
         let index = self.s.m.bin(c, Bin::Add, first, view);
-        let handle = self.s.heap_handle(c, index, false, nonuniform, (11 | 0x1000, 0));
+        // Builders read what other groups of the dispatch wrote.
+        let p = self.x.p;
+        let shared = *self.coherent.get_or_insert_with(|| {
+            p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+                let n = i.name();
+                n.starts_with("global_store") || n.starts_with("global_atomic")
+            })
+        });
+        let shared = if shared { 0x4000 } else { 0 };
+        let handle = self.s.heap_handle(c, index, false, nonuniform, (11 | 0x1000 | shared, 0));
         let within = self.s.m.bin(c, Bin::And, lo, low);
         (handle, self.s.m.bin(c, Bin::Add, start, within))
     }
@@ -2574,12 +2620,42 @@ impl<'a> Lower<'a> {
         let r = match (op, code) {
             ("cmpswap", _) => self.buffer_compare_exchange(h, coords, vals[1], vals[0], false),
             // shortcut: no denormal or NaN rules of the console's.
-            ("fmin" | "fmax", _) => self.atomic_update(zero, |l, old| {
-                let (a, b) = (l.as_float(old), l.as_float(vals[0]));
-                let x = l.binary(if op == "fmin" { 36 } else { 35 }, a, b);
-                let x = l.as_int(x);
-                l.buffer_compare_exchange(h, coords, old, x, false)
-            }),
+            ("fmin" | "fmax", _) => {
+                // Not exchanged where nothing changes: a whole scene's lanes
+                // meet at its bounds.
+                let head = self.cur;
+                let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+                let ret = self.s.t.res_ret;
+                let first = self.s.op(
+                    head,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    ret,
+                    139,
+                    &[h, off, iu, mask, align],
+                );
+                let first = self.s.m.extract(head, first, 0);
+                let first = self.as_int(first);
+                let retry = self.s.m.new_block();
+                let change = self.s.m.new_block();
+                let done = self.s.m.new_block();
+                self.s.m.terminate(head, Term::Br(retry));
+                self.cur = retry;
+                let i32t = self.s.t.i32;
+                let expected = self.s.m.phi(retry, i32t);
+                let (a, b) = (self.as_float(expected), self.as_float(vals[0]));
+                let x = self.binary(if op == "fmin" { 36 } else { 35 }, a, b);
+                let x = self.as_int(x);
+                let same = self.s.m.cmp(retry, pred::EQ, x, expected);
+                self.s.m.terminate(retry, Term::CondBr(same, done, change));
+                self.cur = change;
+                let old = self.buffer_compare_exchange(h, coords, expected, x, false);
+                let ok = self.s.m.cmp(change, pred::EQ, old, expected);
+                self.s.m.set_phi(expected, vec![(first, head), (old, change)]);
+                self.s.m.terminate(change, Term::CondBr(ok, done, retry));
+                self.cur = done;
+                expected
+            }
             (_, Some(code)) => {
                 let code = self.s.m.i32(code);
                 let data = if op == "sub" {

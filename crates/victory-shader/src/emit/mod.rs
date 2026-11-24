@@ -157,6 +157,23 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
+/// Whether programs that reach memory by address (ray tracing and what
+/// builds its structures) translate: `VICTORY_RAYS=1`.
+// shortcut: off until they run without stopping the host GPU.
+pub fn rays() -> bool {
+    static RAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *RAYS.get_or_init(|| cfg!(test) || std::env::var("VICTORY_RAYS").is_ok_and(|v| v == "1"))
+}
+
+/// Slots of the host's largest view heaps (the title's 2^20 and some, and
+/// `victory-gpu`'s own).
+const VIEW_SLOTS: u32 = 1_769_472;
+
+/// Whether heap indices are kept below [`VIEW_SLOTS`].
+fn limits_indices() -> bool {
+    rays() && !cfg!(test)
+}
+
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
@@ -278,7 +295,7 @@ pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, Sha
         let res = resource::track_with(&p, &native.layout, native.stage, addresses)?;
         emit(&c, &native, &p, &st, &io, &res, target)
     };
-    let compute = native.stage == HwStage::Cs;
+    let compute = native.stage == HwStage::Cs && rays();
     let plain = match with(traces && compute) {
         Err(ShaderError::Unsupported { .. }) if compute && !traces => with(true),
         Err(ShaderError::Unsupported { .. }) if compute => with(false),

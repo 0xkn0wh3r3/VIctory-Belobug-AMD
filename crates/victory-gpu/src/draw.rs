@@ -663,6 +663,13 @@ impl State {
                         values[u.index as usize] = memory.unwrap_or(0);
                         continue;
                     }
+                    if u.root == RootType::THREADS {
+                        values[u.index as usize] = u32::MAX;
+                        continue;
+                    }
+                    if u.root == RootType::GROUPS {
+                        continue;
+                    }
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
                         None => self.user_value(compute, u.slot, u.root, u.dword),
@@ -727,7 +734,10 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+    /// With `threads`, `x` counts threads, not groups (the console's
+    /// `USE_THREAD_DIMENSIONS`).
+    // shortcut: y and z stay groups; such dispatches are one-dimensional.
+    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, threads: bool) {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -750,7 +760,28 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !dispatch_fits(x, y, z) {
+        let limit = p.stages.first().and_then(|s| {
+            let data = &s.translated().host.user_data;
+            let t = data.iter().find(|u| u.root == RootType::THREADS)?;
+            Some((s.user_data?.0, t.index, t.dword))
+        });
+        let (x, most) = match limit {
+            Some((_, _, group)) if threads => (x.div_ceil(group.max(1)), Some(x)),
+            _ => (x, None),
+        };
+        if threads && limit.is_none() {
+            once!(name = p.name, x, y, z, "a dispatch of threads runs as groups: dropped");
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // Programs that take their groups' start from us run in parts.
+        let start = p.stages.first().and_then(|s| {
+            let groups = s.translated().host.user_data.iter().find(|u| u.root == RootType::GROUPS);
+            Some((s.user_data?.0, groups?.index))
+        });
+        if !dispatch_fits(if start.is_some() { 1 } else { x }, y, z) {
+            #[cfg(feature = "diagnostics")]
+            tracing::info!(name = p.name, x, "past the group limits");
             once!(x, y, z, "a dispatch past the host's group limits dropped");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
@@ -768,8 +799,23 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true, false));
         #[cfg(feature = "diagnostics")]
         crate::capture::pass(list, self.targets.first().copied().unwrap_or(0), || self.op_text(format!("dispatch {x}x{y}x{z}"), true, true));
+        if let (Some((param, index, _)), Some(most)) = (limit, most) {
+            // SAFETY: an open list; a dword of the program's user data.
+            unsafe { list.list.SetComputeRoot32BitConstant(param, most, index) };
+        }
         // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        unsafe { list.list.Dispatch(x.min(MAX_GROUPS), y, z) };
+        if let Some((param, index)) = start {
+            let mut at = MAX_GROUPS;
+            while at < x {
+                // SAFETY: as before; a dword of the program's user data.
+                unsafe {
+                    list.list.SetComputeRoot32BitConstant(param, at, index);
+                    list.list.Dispatch((x - at).min(MAX_GROUPS), y, z);
+                }
+                at += MAX_GROUPS;
+            }
+        }
         list.count_work();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }

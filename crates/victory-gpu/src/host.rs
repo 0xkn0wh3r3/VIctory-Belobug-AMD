@@ -3127,7 +3127,7 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
     let mut shown = 0;
     for i in from..to {
         let op = history[i];
-        if op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER || shown == 12 {
+        if op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER || shown == 100 {
             continue;
         }
         shown += 1;
