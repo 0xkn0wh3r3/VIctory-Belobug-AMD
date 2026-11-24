@@ -427,6 +427,31 @@ pub(crate) fn dump_targets(frame: u64) {
 ", crate::shadow::args_text(at)));
             }
         }
+        // `VICTORY_PEEK=<program>:<table+slot>:<hex offset>,...`: what a placed
+        // buffer a program reads holds.
+        for peek in std::env::var("VICTORY_PEEK").unwrap_or_default().split(',') {
+            let mut parts = peek.split(':');
+            let (Some(program), Some(slot), Some(offset)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let offset = u64::from_str_radix(offset, 16).unwrap_or(0);
+            let found = passes
+                .iter()
+                .find(|(_, t)| t.contains(program))
+                .and_then(|(_, t)| t.split_once(&format!("{slot}: placed")))
+                .and_then(|(_, t)| t.split_once(" at 0x"))
+                .and_then(|(_, t)| t.split_once('"'))
+                .and_then(|(t, _)| u64::from_str_radix(t, 16).ok());
+            if let Some(at) = found {
+                args.push_str(&format!(
+                    "peek {peek} {at:#x}: {}
+",
+                    crate::shadow::args_text(at + offset)
+                ));
+            }
+        }
         let _ = std::fs::write(folder.join("args.txt"), args);
         let _ = std::fs::write(folder.join("passes.txt"), text.join("
 "));
