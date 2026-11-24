@@ -2138,6 +2138,42 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     true
 }
 
+/// `d` made a view of a texture without the `skip` largest mips.
+fn without_mips(d: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, skip: u32) {
+    let cut = |first: &mut u32, levels: &mut u32, clamp: Option<&mut f32>| {
+        if *levels != u32::MAX {
+            let end = (*first + *levels).saturating_sub(skip).max(1);
+            *levels = end - first.saturating_sub(skip).min(end - 1);
+        }
+        *first = first.saturating_sub(skip);
+        if let Some(clamp) = clamp {
+            *clamp = (*clamp - skip as f32).max(0.0);
+        }
+    };
+    // SAFETY: the member the dimension names.
+    unsafe {
+        match d.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let t = &mut d.Anonymous.Texture2D;
+                cut(&mut t.MostDetailedMip, &mut t.MipLevels, Some(&mut t.ResourceMinLODClamp));
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let t = &mut d.Anonymous.Texture2DArray;
+                cut(&mut t.MostDetailedMip, &mut t.MipLevels, Some(&mut t.ResourceMinLODClamp));
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let t = &mut d.Anonymous.TextureCube;
+                cut(&mut t.MostDetailedMip, &mut t.MipLevels, Some(&mut t.ResourceMinLODClamp));
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let t = &mut d.Anonymous.TextureCubeArray;
+                cut(&mut t.MostDetailedMip, &mut t.MipLevels, Some(&mut t.ResourceMinLODClamp));
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -2172,6 +2208,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 let mut desc = desc.as_ref().map(srv_desc);
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
+                }
+                let skip = crate::resource::skipped_mips(resource);
+                if skip > 0
+                    && let Some(d) = &mut desc
+                {
+                    without_mips(d, skip);
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {

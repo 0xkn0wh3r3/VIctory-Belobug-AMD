@@ -845,6 +845,8 @@ pub(crate) struct HostTexture {
     pub(crate) bytes: u64,
     /// Its memory, if in a shared heap.
     pub(crate) slot: Option<crate::texpool::Slot>,
+    /// The title's largest mips it goes without ([`over_cap`]).
+    pub(crate) skip: u32,
 }
 
 #[cfg(windows)]
@@ -938,6 +940,81 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     resource(this).host.clone()
 }
 
+#[cfg(windows)]
+thread_local! {
+    /// The texture being made is one the title placed in memory it streams.
+    static STREAMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// How much of the video memory we may use is in use, in percent, as last
+/// asked a little while ago.
+#[cfg(windows)]
+fn video_memory_percent() -> u64 {
+    static LAST: std::sync::Mutex<(Option<std::time::Instant>, u64)> =
+        std::sync::Mutex::new((None, 0));
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.0.is_none_or(|at| at.elapsed() > std::time::Duration::from_millis(50)) {
+        last.0 = Some(std::time::Instant::now());
+        if let Some([(used, budget), _]) = crate::host::video_memory() {
+            last.1 = used * 100 / budget.max(1);
+        }
+    }
+    last.1
+}
+
+/// How many of a streamed texture's largest mips to do without, for none of
+/// its sides to pass `VICTORY_TEXTURE_MAX`: by default 1024, 512 and then 256 as
+/// video memory fills up. All textures together did not fit, and paging them
+/// cost seconds a frame, or the driver failed.
+#[cfg(windows)]
+fn over_cap(d: &ResourceDesc) -> u32 {
+    static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    if !STREAMED.get() {
+        return 0;
+    }
+    let max = set.unwrap_or_else(|| match video_memory_percent() {
+        0..70 => 1024,
+        70..85 => 512,
+        _ => 256,
+    });
+    const TEXTURE2D: u32 = 3;
+    let block = (70..=84).contains(&d.format) || (94..=99).contains(&d.format);
+    if cfg!(test)
+        || max == 0
+        || d.dimension != TEXTURE2D
+        || d.flags & 7 != 0
+        || !block
+        || d.mip_levels < 2
+    {
+        return 0;
+    }
+    let mut skip = 0;
+    while (d.width.max(u64::from(d.height)) >> skip) > max
+        && skip + 1 < u32::from(d.mip_levels)
+        && (d.width >> (skip + 1)).is_multiple_of(4)
+        && (d.height >> (skip + 1)).is_multiple_of(4)
+        && d.width >> (skip + 1) > 0
+        && d.height >> (skip + 1) > 0
+    {
+        skip += 1;
+    }
+    skip
+}
+
+/// The title's largest mips the host copy of a texture goes without.
+#[cfg(windows)]
+pub(crate) fn skipped_mips(this: This) -> u32 {
+    if this.is_null() || resource(this).desc.dimension == BUFFER {
+        return 0;
+    }
+    resource(this).host.as_ref().map_or(0, |h| h.skip)
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]
@@ -948,6 +1025,7 @@ fn host_texture(
 ) -> Option<(
     windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     Option<crate::texpool::Slot>,
+    u32,
 )> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
@@ -958,6 +1036,10 @@ fn host_texture(
     let mut d = *desc;
     d.layout = 0;
     d.alignment = 0;
+    let skip = over_cap(&d);
+    d.width >>= skip;
+    d.height >>= skip;
+    d.mip_levels -= skip as u16;
     d.flags &= PC_FLAGS;
     // PC refuses depth targets that are also unordered-access (the console
     // allows both; Grand Theft Auto VI's shadow maps ask for it).
@@ -1032,7 +1114,7 @@ fn host_texture(
         crate::host::texture_state(state),
     ) as i32);
     if let Some((texture, slot)) = crate::texpool::place(&host.device, &desc, first) {
-        return Some((texture, Some(slot)));
+        return Some((texture, Some(slot), skip));
     }
     let mut made = create(&d, &mut texture);
     // Not every host GPU offers every use of every format (NVIDIA: no
@@ -1066,7 +1148,7 @@ fn host_texture(
             )
         });
     }
-    texture.map(|t| (t, None))
+    texture.map(|t| (t, None, skip))
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -1132,7 +1214,7 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: host.map(|(texture, slot)| {
+        host: host.map(|(texture, slot, skip)| {
             let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
             let bytes = allocation_bytes(&texture);
             crate::memstat::add(&crate::memstat::HOST_TEXTURES, bytes);
@@ -1143,6 +1225,7 @@ fn hand_out_resource(
                 texture,
                 bytes,
                 slot,
+                skip,
                 state: state.into(),
             })
         }),
@@ -1331,7 +1414,9 @@ pub(crate) extern "system" fn create_at_address(
         creation_nodes: 1,
         visible_nodes: 1,
     };
-    hand_out_resource(
+    #[cfg(windows)]
+    STREAMED.set(true);
+    let made = hand_out_resource(
         desc,
         DEFAULT,
         0,
@@ -1340,7 +1425,10 @@ pub(crate) extern "system" fn create_at_address(
         clear,
         iid,
         out,
-    )
+    );
+    #[cfg(windows)]
+    STREAMED.set(false);
+    made
 }
 
 /// Textures the title placed in its own memory and views without a

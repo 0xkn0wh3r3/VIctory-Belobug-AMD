@@ -47,8 +47,9 @@ pub(crate) struct Staging {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
-    /// Mips per array slice.
+    /// Mips per array slice, and the title's larger ones left out.
     mips: u32,
+    skip: u32,
     memory: *const u8,
     last: Mutex<Last>,
     #[cfg(test)]
@@ -324,7 +325,7 @@ impl Staging {
             );
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            let (mip, slice) = (i as u32 % self.mips + self.skip, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;
@@ -492,6 +493,7 @@ fn create_staging(
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        skip: crate::resource::skipped_mips(resource),
         memory,
         last: Mutex::default(),
         #[cfg(test)]
@@ -557,6 +559,7 @@ mod tests {
         }
         let copy = Arc::new(HostTexture {
             slot: None,
+            skip: 0,
             texture: resource.unwrap(),
             state: AtomicU32::new(D3D12_RESOURCE_STATE_COMMON.0 as u32),
             bytes: 0,

@@ -592,6 +592,10 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            // shortcut: not between textures without their largest mips.
+            if crate::resource::skipped_mips(dst) + crate::resource::skipped_mips(src) > 0 {
+                return;
+            }
             ensure_state(&list, dst, COPY_DEST);
             ensure_state(&list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
@@ -784,6 +788,9 @@ extern "system" fn copy_texture_region(
             let Some((buffer, staging)) = list.readback(host, staging_bytes) else {
                 return;
             };
+            if crate::resource::skipped_mips(src.resource) > 0 {
+                return;
+            }
             crate::texture::upload(&list, src.resource, from_tex);
             ensure_state(&list, src.resource, COPY_SOURCE);
             let mut to_location = dst;
@@ -867,8 +874,15 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if crate::resource::skipped_mips(src.resource) > 0 {
+                return;
+            }
             ensure_state(&list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
+        }
+        // shortcut: as in `copy_resource`.
+        if crate::resource::skipped_mips(dst.resource) > 0 {
+            return;
         }
         ensure_state(&list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
