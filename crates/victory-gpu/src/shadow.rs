@@ -390,7 +390,10 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let gone = buffers().remove(&(start, resource));
+    if let Some(shadow) = gone.and_then(|e| e.shadow) {
+        crate::host::retire(shadow);
+    }
 }
 
 /// The copy of the innermost title buffer holding `[address, address +

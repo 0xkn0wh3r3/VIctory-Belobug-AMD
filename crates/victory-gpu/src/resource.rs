@@ -973,6 +973,9 @@ impl Drop for Resource {
                 );
             }
         }
+        if let Some(texture) = self.host.take() {
+            crate::host::retire(texture);
+        }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension == BUFFER {

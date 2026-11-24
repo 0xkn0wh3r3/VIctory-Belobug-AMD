@@ -87,6 +87,35 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
 /// draws nothing at seconds per frame.
 static ON_FAILURE: OnceLock<fn(&str) -> !> = OnceLock::new();
 
+/// Host objects nothing of ours names any more, with the frame that was so
+/// in. Shaders index descriptor heaps directly, so a submission running on
+/// the GPU may still read what another thread's write just took out of a
+/// slot; freed at once, that read is a page fault.
+static RETIRED: Mutex<std::collections::VecDeque<(u64, Box<dyn std::any::Any + Send>)>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// Frames a retired object is held for.
+const RETIRED_FRAMES: u64 = 4;
+
+/// Frees `object` some frames from now.
+pub(crate) fn retire(object: impl std::any::Any + Send) {
+    let frame = crate::queue::presented();
+    let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    retired.push_back((frame, Box::new(object)));
+}
+
+/// Frees what was retired [`RETIRED_FRAMES`] frames before `frame`.
+pub(crate) fn free_retired(frame: u64) {
+    let free: Vec<_> = {
+        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        let n = retired.iter().take_while(|r| r.0 + RETIRED_FRAMES <= frame).count();
+        retired.drain(..n).collect()
+    };
+    // Outside the lock, and with no submission running.
+    let _running = host().map(|h| h.submitted.lock().unwrap_or_else(|e| e.into_inner()));
+    drop(free);
+}
+
 /// Sets what a host GPU failure does (the runtime's crash report).
 pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
