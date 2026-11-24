@@ -136,6 +136,8 @@ pub(crate) struct Psv<'a> {
     pub prims: &'a [SigElement],
     /// Mesh: its state and the group-shared bytes it declares.
     pub mesh: Option<(super::shader::Mesh, u32)>,
+    /// Geometry: triangles to strips (see `Shader::rectangles`).
+    pub rectangles: bool,
     pub bindings: &'a [Binding],
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
@@ -179,6 +181,14 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[26] = vectors(p.prims) as u8;
         info[27] = mesh.topology;
         info[30] = p.prims.len() as u8;
+    }
+    if p.rectangles {
+        // Triangles in, triangle strips out, stream 0, a position.
+        for (k, n) in [3u32, 5, 1].into_iter().enumerate() {
+            info[4 * k..4 * k + 4].copy_from_slice(&n.to_le_bytes());
+        }
+        info[12] = 1;
+        info[26..28].copy_from_slice(&(super::shader::RECTANGLE_VERTICES as u16).to_le_bytes());
     }
     out.extend(info);
     u32s(&mut out, &[p.bindings.len() as u32]);

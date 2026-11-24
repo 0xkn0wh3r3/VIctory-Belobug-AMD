@@ -35,6 +35,9 @@ pub(crate) struct Types {
     pub res_ret: Ty,
 }
 
+/// The vertices a rectangle's geometry shader emits.
+pub(crate) const RECTANGLE_VERTICES: u32 = 6;
+
 /// What a mesh shader declares beyond its thread-group size.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Mesh {
@@ -54,6 +57,9 @@ pub(crate) struct Shader {
     pub prims: Vec<SigElement>,
     /// A mesh shader (`threads` is its thread-group size).
     pub mesh: Option<Mesh>,
+    /// A geometry shader from triangles to two-triangle strips
+    /// (`rectangle`).
+    pub rectangles: bool,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
@@ -112,6 +118,7 @@ impl Shader {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh: None,
+            rectangles: false,
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
@@ -455,6 +462,10 @@ impl Shader {
                     });
                 }
             }
+            // Geometry shaders list four streams; ours use the first.
+            if self.rectangles {
+                view.extend([0; 3]);
+            }
             let arr = self.m.array(view.len() as u32, self.t.i32);
             let elems: Vec<V> = view.iter().map(|&v| self.m.i32(v)).collect();
             let arr = self.m.aggregate(arr, &elems);
@@ -505,6 +516,13 @@ impl Shader {
                 }
             }
         }
+        // Geometry state (tag 1): triangles in, six vertices at most, stream
+        // 0, triangle strips out, one instance.
+        if self.rectangles {
+            props.push(i32c(&mut self, 1));
+            let state = [3, RECTANGLE_VERTICES, 1, 5, 1].map(|n| Some(i32c(&mut self, n)));
+            props.push(self.m.md_node(state.to_vec()));
+        }
         if let Some(n) = self.wave_size {
             props.push(i32c(&mut self, 11));
             let n = Some(i32c(&mut self, n));
@@ -526,9 +544,10 @@ impl Shader {
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
         self.m.named_md("dx.valver", vec![version]);
-        // Program kinds: 0 pixel, 1 vertex, 5 compute, 13 mesh.
+        // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
+            _ if self.rectangles => ("gs", 2),
             (Some(_), _) => ("cs", 5u32),
             (None, true) => ("ps", 0),
             (None, false) => ("vs", 1),
@@ -579,6 +598,7 @@ impl Shader {
             outputs: &self.outputs,
             prims: &self.prims,
             mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
+            rectangles: self.rectangles,
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,

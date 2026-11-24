@@ -82,6 +82,7 @@ mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+mod rectangle;
 mod sampler;
 mod shader;
 #[cfg(windows)]
@@ -94,6 +95,7 @@ use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
+pub use rectangle::rectangle_geometry;
 pub use sampler::StaticSampler;
 pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 

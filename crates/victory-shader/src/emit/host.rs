@@ -256,6 +256,29 @@ impl Host {
         vs: &[u8],
         ps: &[u8],
     ) -> Result<ID3D12PipelineState, String> {
+        self.pipeline_through(root, vs, &[], ps)
+    }
+
+    /// A graphics pipeline with the geometry shader `gs` between the two.
+    #[cfg(test)]
+    pub fn geometry_pipeline(
+        &self,
+        vs: &HostShader,
+        gs: &[u8],
+        ps: &HostShader,
+    ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+        let root = self.root_signature(vs, ps)?;
+        let pso = self.pipeline_through(&root, &vs.dxil, gs, &ps.dxil)?;
+        Ok((root, pso))
+    }
+
+    fn pipeline_through(
+        &self,
+        root: &ID3D12RootSignature,
+        vs: &[u8],
+        gs: &[u8],
+        ps: &[u8],
+    ) -> Result<ID3D12PipelineState, String> {
         let inputs = sig(vs, FourCC::ISG1)?;
         let names: Vec<CString> = inputs
             .iter()
@@ -286,6 +309,14 @@ impl Host {
             PS: D3D12_SHADER_BYTECODE {
                 pShaderBytecode: ps.as_ptr().cast(),
                 BytecodeLength: ps.len(),
+            },
+            GS: if gs.is_empty() {
+                D3D12_SHADER_BYTECODE::default()
+            } else {
+                D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: gs.as_ptr().cast(),
+                    BytecodeLength: gs.len(),
+                }
             },
             SampleMask: u32::MAX,
             RasterizerState: D3D12_RASTERIZER_DESC {

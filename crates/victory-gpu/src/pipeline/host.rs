@@ -273,6 +273,9 @@ pub(crate) struct HostPipeline {
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
     pub(crate) inputs: Vec<Input>,
+    /// Draws rectangle lists as they are, through a geometry shader that
+    /// adds the fourth vertex.
+    pub(crate) rectangles: bool,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
 }
@@ -451,6 +454,7 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                rectangles: false,
             });
         }
         let Some(g) = g else {
@@ -483,14 +487,28 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                rectangles: false,
             });
         }
 
+        // Rectangles whose vertices come from no buffer (an index into a
+        // tile list, say): those from buffers are expanded on the CPU (see
+        // `draw`).
+        let gs = (g.topology.0 == RECTANGLES && g.inputs.is_empty())
+            .then(|| stages.first().and_then(|(s, _)| s.translated()))
+            .flatten()
+            .and_then(|t| victory_shader::emit::rectangle_geometry(&t.host.dxil));
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
             PS: code(1),
+            GS: gs.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
+                D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: gs.as_ptr().cast(),
+                    BytecodeLength: gs.len(),
+                }
+            }),
             BlendState: g.blend,
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
@@ -513,7 +531,7 @@ impl HostPipeline {
             ..Default::default()
         };
         let name = super::library::name(
-            "graphics",
+            if gs.is_some() { "rectangles" } else { "graphics" },
             &root_blob,
             &[&code_bytes(&code(0)), &code_bytes(&code(1))],
             &state,
@@ -553,6 +571,7 @@ impl HostPipeline {
             name: format!("{shaders:?}"),
             slots: g.slots(),
             inputs: g.elements(),
+            rectangles: gs.is_some(),
         })
     }
 }

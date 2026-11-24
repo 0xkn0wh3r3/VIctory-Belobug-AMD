@@ -818,7 +818,7 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
-        let rects = self.topology == RECTANGLES;
+        let rects = self.topology == RECTANGLES && !self.draws_rectangles();
         let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
         if ran {
             // Rectangles were expanded into their own vertex buffers.
@@ -841,6 +841,11 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+
+    /// The pipeline takes rectangle lists as they are.
+    fn draws_rectangles(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rectangles)
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
@@ -909,10 +914,11 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
-        if self.topology == RECTANGLES {
+        let rects = self.topology == RECTANGLES && !self.draws_rectangles();
+        if rects {
             once!("indexed rectangles not drawn");
         }
-        let ran = self.topology != RECTANGLES && self.prepare(list, true);
+        let ran = !rects && self.prepare(list, true);
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
@@ -993,7 +999,10 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+            DRAW | INDEXED => {
+                (self.topology != RECTANGLES || self.draws_rectangles())
+                    && self.prepare(list, kind == INDEXED)
+            }
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),
