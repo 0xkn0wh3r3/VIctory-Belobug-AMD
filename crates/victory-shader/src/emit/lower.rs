@@ -7895,7 +7895,12 @@ impl<'a> Lower<'a> {
             // each direction starting a dword.
             let whole = usize::from(f.o) + usize::from(f.b) + usize::from(f.c);
             let bias_at = (usize::from(f.o), a16.then_some(0));
-            let grads = if f.d { spatial } else { 0 };
+            // A cube's gradients are those of its two face coordinates.
+            let grads = match (f.d, kind) {
+                (false, _) => 0,
+                (true, 5) => 2,
+                (true, _) => spatial,
+            };
             let g16 = f.g16;
             let per_direction = if g16 { grads.div_ceil(2) } else { grads };
             let grad_at = |dir: usize, k: usize| {
@@ -8011,14 +8016,15 @@ impl<'a> Lower<'a> {
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
                 *slot = float(self, coord_at(k))?;
             }
+            let face = cs[2];
             if kind == 5 {
-                if *unorm || f.d || op == 81 {
-                    return Err("a cube sample with texel coordinates, gradients or a level query");
+                if *unorm || op == 81 {
+                    return Err("a cube sample with texel coordinates or a level query");
                 }
                 if f.o {
                     return Err("a texel offset on a cube image");
                 }
-                let dir = self.cube_direction(cs[0], cs[1], cs[2]);
+                let dir = self.cube_direction(cs[0], cs[1], face);
                 cs[..3].copy_from_slice(&dir);
             }
             if *unorm {
@@ -8182,9 +8188,16 @@ impl<'a> Lower<'a> {
                     // per quad; the host's per pixel is the same when the
                     // gradients agree across the quad.
                     let mut g = vec![fu; 6];
-                    for k in 0..spatial {
+                    for k in 0..grads {
                         g[k] = float(self, grad_at(0, k))?;
                         g[3 + k] = float(self, grad_at(1, k))?;
+                    }
+                    if kind == 5 {
+                        // The host takes the gradients of the direction.
+                        let x = self.cube_gradient(g[0], g[1], face);
+                        let y = self.cube_gradient(g[3], g[4], face);
+                        g[..3].copy_from_slice(&x);
+                        g[3..].copy_from_slice(&y);
                     }
                     args.extend(&os);
                     args.extend(g);
@@ -8420,16 +8433,49 @@ impl<'a> Lower<'a> {
         let (one, mone) = (k(self, 1.0), k(self, -1.0));
         let f = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
         // Per face +x, -x, +y, -y, +z, -z.
-        let table = [
-            [one, mone, u, u, u, nu],
-            [nv, nv, one, mone, nv, nv],
-            [nu, u, v, nv, one, mone],
-        ];
+        self.cube_face(
+            f,
+            [
+                [one, mone, u, u, u, nu],
+                [nv, nv, one, mone, nv, nv],
+                [nu, u, v, nv, one, mone],
+            ],
+        )
+    }
+
+    /// The gradient of [`Self::cube_direction`] for the gradients `ds`, `dt`
+    /// of the face coordinates: the direction is linear in them (twice
+    /// each, signed per face) and constant along the face's own axis.
+    fn cube_gradient(&mut self, ds: V, dt: V, face: V) -> [V; 3] {
+        let c = self.cur;
+        let two = self.s.m.f32(2.0f32.to_bits());
+        let u = self.s.m.bin(c, Bin::Mul, ds, two);
+        let v = self.s.m.bin(c, Bin::Mul, dt, two);
+        let z = self.s.m.f32(0x8000_0000);
+        let (nu, nv) = (
+            self.s.m.bin(c, Bin::Sub, z, u),
+            self.s.m.bin(c, Bin::Sub, z, v),
+        );
+        let o = self.s.m.f32(0);
+        let f = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
+        self.cube_face(
+            f,
+            [
+                [o, o, u, u, u, nu],
+                [nv, nv, o, o, nv, nv],
+                [nu, u, v, nv, o, o],
+            ],
+        )
+    }
+
+    /// Each row's entry for the face (an integer, +x -x +y -y +z -z).
+    fn cube_face(&mut self, face: V, table: [[V; 6]; 3]) -> [V; 3] {
+        let c = self.cur;
         table.map(|row| {
             let mut r = row[0];
             for (n, &x) in row.iter().enumerate().skip(1) {
                 let kn = self.s.m.i32(n as u32);
-                let is = self.s.m.cmp(c, pred::EQ, f, kn);
+                let is = self.s.m.cmp(c, pred::EQ, face, kn);
                 r = self.s.m.select(c, is, x, r);
             }
             r
@@ -10322,6 +10368,114 @@ mod tests {
         assert_eq!(buffer_format(0), None);
         assert_eq!(buffer_format(36), None);
         assert_eq!(buffer_format(78), None);
+    }
+
+    /// Lowers a pixel program that loads a sampler and an image from two
+    /// tables, samples v[0:3] from the address at v2 on with the two-dword
+    /// instruction `sample`, and exports the result.
+    fn lower_sample(sample: [u32; 2]) -> Result<Vec<u8>, crate::ShaderError> {
+        let words = [
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0204,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[8:9], null
+            0xF40C_0001,
+            0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+            sample[0],
+            sample[1],
+            0xF800_180F,
+            0x0302_0100, // exp mrt0, v0, v1, v2, v3 done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let table = |user_data, slot| RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let used = |kind, dwords, user_data, slot| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords,
+            user_data,
+            slot,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![table(8, 0), table(9, 1)],
+            used: vec![
+                used(ResourceType::Sampler, 4, 8, 0),
+                used(ResourceType::Srv, 8, 9, 1),
+            ],
+            io: StageIo::Ps {
+                inputs: Vec::new(),
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: Vec::new(),
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs)?;
+        let res = crate::resource::track(&p, &native.layout, native.stage)?;
+        let io = crate::io::raise(&p, &native)?;
+        let st = crate::structure::structure(&p)?;
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: vec![target],
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .map(|l| l.dxil)
+    }
+
+    /// MIMG words: opcode, all four channels, the dimension; data v0,
+    /// address v2, image s[0:7], sampler s[8:11].
+    fn mimg(opcode: u32, dim: u32) -> [u32; 2] {
+        [0xF000_0F00 | opcode << 18 | dim << 3, 0x0040_0002]
+    }
+
+    const SAMPLE_D: u32 = 0x22;
+    const SAMPLE_D_CL: u32 = 0x23;
+    const DIM_2D: u32 = 1;
+    const DIM_CUBE: u32 = 3;
+
+    #[test]
+    fn gradient_samples_lower_on_planes_and_cubes() {
+        for (opcode, dim) in [
+            (SAMPLE_D, DIM_2D),
+            (SAMPLE_D, DIM_CUBE),
+            (SAMPLE_D_CL, DIM_2D),
+            (SAMPLE_D_CL, DIM_CUBE),
+        ] {
+            if let Err(e) = lower_sample(mimg(opcode, dim)) {
+                panic!("opcode {opcode:#x} on dimension {dim}: {e:?}");
+            }
+        }
     }
 
     #[test]
