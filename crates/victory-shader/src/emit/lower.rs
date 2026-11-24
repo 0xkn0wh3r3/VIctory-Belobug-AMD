@@ -1107,6 +1107,9 @@ impl<'a> Lower<'a> {
         self.fill_phis()?;
         if self.s.pixel {
             settle_position_mode(&mut self.s.inputs);
+            settle_row_modes(&mut self.s.inputs, true).map_err(|w| unsupported(0, w))?;
+        } else {
+            settle_row_modes(&mut self.s.outputs, false).map_err(|w| unsupported(0, w))?;
         }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
@@ -6210,8 +6213,9 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether the program reads attribute row `row` per vertex (an
-    /// interpolation with computed barycentrics, or P10 or P20): then its
-    /// element is declared constant and read with `attributeAtVertex`.
+    /// interpolation with computed barycentrics, or P10 or P20), or the row
+    /// must be constant for another of its elements: then its elements are
+    /// declared constant and read with `attributeAtVertex`.
     fn per_vertex(&self, row: u8) -> bool {
         self.x.io.interps.iter().any(|(_, i)| match *i {
             Interp::Weighted { attribute } => attribute.row == row,
@@ -6219,7 +6223,49 @@ impl<'a> Lower<'a> {
                 attribute.row == row && vertex != 2 && self.interpolated(row)
             }
             Interp::Interpolated { .. } => false,
-        })
+        }) || self.constant_row(row)
+    }
+
+    /// Whether row `row` holds an element that must be constant (an
+    /// integer, `SV_IsFrontFace`, a provoking-vertex read) next to an
+    /// interpolated one. DXIL wants one interpolation mode per packed row,
+    /// and the row keeps the console's register (the stages link by it), so
+    /// its interpolated elements are weighed from their vertices instead.
+    fn constant_row(&self, row: u8) -> bool {
+        let interps = || {
+            self.x
+                .io
+                .interps
+                .iter()
+                .filter(move |(_, i)| match *i {
+                    Interp::Interpolated { attribute, .. }
+                    | Interp::Vertex { attribute, .. }
+                    | Interp::Weighted { attribute } => attribute.row == row,
+                })
+                .map(|(_, i)| i)
+        };
+        let interpolated = interps().any(|i| matches!(i, Interp::Interpolated { .. }));
+        if !interpolated {
+            return false;
+        }
+        let flat_read = interps().any(|i| matches!(i, Interp::Vertex { vertex: 2, .. }));
+        // The signature rows the hardware row carries (a second one for
+        // packed 16-bit pairs).
+        let rows: Vec<u32> = match &self.x.native.io {
+            StageIo::Ps { inputs, .. } => inputs
+                .iter()
+                .filter(|i| i.row == row && i.fp16)
+                .map(|i| u32::from(i.row2))
+                .chain([u32::from(row)])
+                .collect(),
+            _ => vec![u32::from(row)],
+        };
+        let integer = self
+            .x
+            .inputs
+            .iter()
+            .any(|e| e.row.is_some_and(|r| rows.contains(&r)) && e.comp != 9);
+        flat_read || integer
     }
 
     /// Whether the program interpolates attribute row `row` (so the
@@ -7724,6 +7770,53 @@ impl<'a> Lower<'a> {
 
 /// The DXIL interpolation mode of a kind of barycentrics (none for the
 /// pull model).
+/// Gives the elements of each packed row one interpolation mode, as DXIL
+/// requires ("interpolation mode that differs from another element packed
+/// into the same row"). Elements whose mode is fixed (pixel inputs that
+/// are read, integers and `SV_IsFrontFace`, which are constant, and the
+/// position) set the row's mode; the others, floats nobody reads (vertex
+/// outputs: any float), take it. Rows stay where the console put them:
+/// the host links stages by register. A pixel row read two ways is an
+/// error rather than a shader the validator rejects; `per_vertex` makes
+/// rows with a constant element constant beforehand.
+pub(super) fn settle_row_modes(elements: &mut [SigElement], pixel: bool) -> Result<(), Why> {
+    // Packed elements only: barycentrics, sample index and coverage are not.
+    let packed = |e: &SigElement| e.row.is_some() && !matches!(e.kind, 12 | 14 | 15 | 28 | 30);
+    let fixed = |e: &SigElement| e.comp != 9 || e.kind == 3 || (pixel && e.usage != 0);
+    let mut rows: Vec<u32> = elements
+        .iter()
+        .filter(|e| packed(e))
+        .filter_map(|e| e.row)
+        .collect();
+    rows.sort_unstable();
+    rows.dedup();
+    for row in rows {
+        let in_row = |e: &SigElement| packed(e) && e.row == Some(row);
+        let mut modes: Vec<u8> = elements
+            .iter()
+            .filter(|e| in_row(e) && fixed(e))
+            .map(|e| e.interp)
+            .collect();
+        modes.sort_unstable();
+        modes.dedup();
+        let mode = match modes[..] {
+            [m] => m,
+            // Nothing fixed: the first element's.
+            [] => match elements.iter().find(|e| in_row(e)) {
+                Some(e) => e.interp,
+                None => continue,
+            },
+            _ if pixel => return Err("input elements of one row interpolated two ways"),
+            // Vertex outputs: the host interpolates by the pixel inputs' modes.
+            _ => continue,
+        };
+        for e in elements.iter_mut().filter(|e| in_row(e) && !fixed(e)) {
+            e.interp = mode;
+        }
+    }
+    Ok(())
+}
+
 /// A pixel program under conservative depth declares its position centroid
 /// (`emit`); one that runs per sample (an `SV_SampleIndex` input or a
 /// per-sample interpolation) declares it per sample instead.

@@ -278,6 +278,10 @@ fn emit_program(
             (28, _) => 2,
             (0 | 6 | 7, 9) => 2,
             (0, _) => 1,
+            // Integer system values (primitive id, array indices) are
+            // constant pixel inputs, as DXC declares them, so they share
+            // a row with the front face or a constant attribute.
+            (_, c) if pixel && c != 9 => 1,
             _ => 0,
         };
     }
@@ -887,6 +891,132 @@ mod barycentric_tests {
         // Plain depth or none: noperspective center, as DXC declares it.
         let shader = pixel_sig(&words, PERSP_CENTER, &inputs, &[target]).unwrap();
         assert!(psv_inputs(&shader).contains(&(3, Some(1), 4)));
+    }
+
+    /// Every packed row of a pixel shader's inputs has one mode.
+    fn assert_one_mode_per_row(shader: &HostShader) {
+        let els = psv_inputs(shader);
+        for &(kind, row, mode) in &els {
+            let Some(row) = row else { continue };
+            for &(k, r, m) in &els {
+                assert!(
+                    r != Some(row) || m == mode,
+                    "row {row}: {kind}/{mode} vs {k}/{m}"
+                );
+            }
+        }
+    }
+
+    fn texcoord(index: u32, col: u8, cols: u8, comp: u8) -> SigElement {
+        SigElement {
+            index,
+            col,
+            cols,
+            comp,
+            ..element("TEXCOORD", 0, 0)
+        }
+    }
+
+    /// An attribute read with centroid barycentrics shares its row with
+    /// one nobody reads: the unread one takes the centroid mode.
+    #[test]
+    fn an_unread_element_takes_its_rows_mode() {
+        const PERSP_CENTROID: u32 = 1 << 2;
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let mut target = element("SV_Target", 16, 0);
+        target.usage = 15;
+        let inputs = [texcoord(0, 0, 2, 9), texcoord(1, 2, 2, 9)];
+        let shader = pixel_sig(&words, PERSP_CENTROID, &inputs, &[target]).unwrap();
+        assert_one_mode_per_row(&shader);
+        let modes: Vec<u8> = psv_inputs(&shader).iter().map(|e| e.2).collect();
+        assert_eq!(modes, [3, 3]);
+        validate(&shader);
+    }
+
+    /// An interpolated float packed with an integer (constant) element: the
+    /// row stays where it is and becomes constant, the float weighed from
+    /// its vertices with `SV_Barycentrics`.
+    #[test]
+    fn an_integer_in_the_row_makes_it_constant() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let mut target = element("SV_Target", 16, 0);
+        target.usage = 15;
+        let mut face = element("SV_IsFrontFace", 13, 0);
+        (face.col, face.cols, face.comp) = (3, 1, 5);
+        for other in [texcoord(1, 2, 1, 5), face] {
+            let inputs = [texcoord(0, 0, 2, 9), other];
+            let shader = pixel_sig(&words, PERSP_CENTER, &inputs, &[target.clone()]).unwrap();
+            assert_one_mode_per_row(&shader);
+            let els = psv_inputs(&shader);
+            assert!(els.iter().any(|e| e.0 == 28), "{els:?}");
+            assert!(
+                els.iter().filter(|e| e.1 == Some(0)).all(|e| e.2 == 1),
+                "{els:?}"
+            );
+            validate(&shader);
+        }
+    }
+
+    /// A row read both flat (P0) and interpolated becomes constant.
+    #[test]
+    fn a_flat_and_an_interpolated_read_make_the_row_constant() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0xC816_0202, // v_interp_mov_f32 v5, p0, attr0.z
+            v_add_f32(2, 2, 5),
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let mut target = element("SV_Target", 16, 0);
+        target.usage = 15;
+        let inputs = [texcoord(0, 0, 2, 9), texcoord(1, 2, 2, 9)];
+        let shader = pixel_sig(&words, PERSP_CENTER, &inputs, &[target]).unwrap();
+        assert_one_mode_per_row(&shader);
+        assert!(
+            psv_inputs(&shader)
+                .iter()
+                .filter(|e| e.0 == 0)
+                .all(|e| e.2 == 1)
+        );
+        validate(&shader);
+    }
+
+    /// The settling rules on their own: unread floats follow the fixed
+    /// element; two fixed modes in a pixel row are an error; vertex outputs
+    /// packing an integer make their floats constant.
+    #[test]
+    fn row_modes_settle() {
+        use super::lower::settle_row_modes;
+        let mut read = texcoord(0, 0, 2, 9);
+        (read.interp, read.usage) = (6, 1);
+        let mut unread = texcoord(1, 2, 2, 9);
+        unread.interp = 2;
+        let mut els = vec![read.clone(), unread.clone()];
+        settle_row_modes(&mut els, true).unwrap();
+        assert_eq!((els[0].interp, els[1].interp), (6, 6));
+        let mut int = texcoord(1, 2, 1, 5);
+        int.interp = 1;
+        assert!(settle_row_modes(&mut [read, int.clone()], true).is_err());
+        let mut els = vec![unread, int];
+        settle_row_modes(&mut els, false).unwrap();
+        assert_eq!((els[0].interp, els[1].interp), (1, 1));
     }
 
     /// Per sample, the conservative-depth position is per sample too.
