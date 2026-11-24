@@ -65,6 +65,12 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
+/// Bytes of the snapshot memory kept for reuse.
+pub(crate) fn pool_bytes() -> u64 {
+    let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    pool.iter().map(|v| v.capacity() as u64).sum()
+}
+
 /// Bytes the pool keeps at most: snapshots of the world's 174 MB heap
 /// would otherwise keep 8 of that size (1.4 GB of host memory) for good.
 const POOL_BYTES: usize = 512 << 20;
@@ -91,6 +97,15 @@ unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
 
+impl Drop for Shadow {
+    fn drop(&mut self) {
+        // SAFETY: a live resource.
+        let bytes = unsafe { self.buffer.GetDesc() }.Width;
+        crate::memstat::sub(&crate::memstat::SHADOWS, bytes);
+        crate::memstat::sub(&crate::memstat::SHADOW_COUNT, 1);
+    }
+}
+
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
@@ -116,6 +131,10 @@ impl Shadow {
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
+        // SAFETY: a live resource.
+        let bytes = unsafe { buffer.GetDesc() }.Width;
+        crate::memstat::add(&crate::memstat::SHADOWS, bytes);
+        crate::memstat::add(&crate::memstat::SHADOW_COUNT, 1);
         Shadow {
             buffer,
             data,
@@ -163,7 +182,8 @@ impl Shadow {
             .push((address, address + len));
         let (from, to) = self.inside(address, len);
         // SAFETY: inside the mapping.
-        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+        let host =
+            |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (start, end) = match &*before {
             Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),

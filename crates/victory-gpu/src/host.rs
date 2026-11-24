@@ -119,8 +119,38 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
+static HOST: OnceLock<Option<Host>> = OnceLock::new();
+
+/// The host GPU's memory use as its driver reports it, `[(used, budget)]`
+/// in video memory and in system memory; `None` before the device is
+/// made (asking does not make it).
+pub(crate) fn video_memory() -> Option<[(u64, u64); 2]> {
+    static ADAPTER: OnceLock<Option<IDXGIAdapter3>> = OnceLock::new();
+    let host = HOST.get()?.as_ref()?;
+    let adapter = ADAPTER
+        .get_or_init(|| {
+            // SAFETY: plain DXGI queries on a live device.
+            unsafe {
+                let luid = host.device.GetAdapterLuid();
+                let factory: IDXGIFactory4 =
+                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+                factory.EnumAdapterByLuid::<IDXGIAdapter3>(luid).ok()
+            }
+        })
+        .as_ref()?;
+    let query = |group| {
+        let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        // SAFETY: node 0 of the device's own adapter, a sized out structure.
+        unsafe { adapter.QueryVideoMemoryInfo(0, group, &mut info) }.ok()?;
+        Some((info.CurrentUsage, info.Budget))
+    };
+    Some([
+        query(DXGI_MEMORY_SEGMENT_GROUP_LOCAL)?,
+        query(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)?,
+    ])
+}
+
 pub(crate) fn host() -> Option<&'static Host> {
-    static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
         Err(e) => {
