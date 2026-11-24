@@ -1,11 +1,16 @@
 //! Command queues. Submitted lists run on the host GPU and are waited for,
-//! so fence signals complete at once.
+//! so fence signals complete at once, unless a wait holds the queue back
+//! (`timeline`).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::fence::Held;
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
+use crate::timeline::{Op, Timeline};
 
 const QUEUE_IIDS: [Iid; 4] = [
     guid(
@@ -34,6 +39,7 @@ struct Queue {
     object: Object,
     kind: u32,
     desc: QueueDesc,
+    timeline: Arc<Timeline>,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
@@ -61,6 +67,7 @@ pub(crate) extern "system" fn create(
         },
         kind: desc.kind,
         desc,
+        timeline: Timeline::new(),
     });
     object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
 }
@@ -110,8 +117,35 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Queue>(this)
 }
 
-/// Runs the lists' host lists and waits for them (decision 0007).
-extern "system" fn execute(_: This, count: u32, lists: *const This) {
+/// Lists submitted together, run and waited for (decision 0007).
+#[cfg(windows)]
+struct Submission {
+    host: &'static crate::host::Host,
+    runs: VecDeque<crate::list::Submitted>,
+}
+
+#[cfg(windows)]
+impl crate::timeline::Lists for Submission {
+    fn ready(&self) -> usize {
+        self.runs.iter().take_while(|l| l.unmet().is_empty()).count()
+    }
+    fn len(&self) -> usize {
+        self.runs.len()
+    }
+    fn early(&mut self) -> bool {
+        self.runs.front().is_some_and(|l| l.write_early())
+    }
+    fn take(&mut self, n: usize) -> Box<dyn FnOnce()> {
+        let (host, runs) = (self.host, self.runs.drain(..n).collect::<Vec<_>>());
+        Box::new(move || host.execute(&runs.iter().map(|l| &**l).collect::<Vec<_>>()))
+    }
+    fn waits(&self) -> String {
+        self.runs.iter().map(|l| l.script()).collect::<Vec<_>>().join(" || ")
+    }
+}
+
+/// Runs the lists once what they wait for is there.
+extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
@@ -119,11 +153,10 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
-        let host_lists: Vec<_> = lists
-            .iter()
-            .filter_map(|&l| crate::list::host_list(l))
-            .collect();
-        host.execute(&host_lists);
+        let runs: VecDeque<_> = lists.iter().filter_map(|&l| crate::list::submitted(l)).collect();
+        queue(this)
+            .timeline
+            .submit(Op::Lists(Box::new(Submission { host, runs })));
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);
@@ -157,57 +190,26 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
-extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
+extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
-    crate::fence::signal(fence, value)
+    queue(this)
+        .timeline
+        .submit(Op::Signal(Held::new(fence), value));
+    S_OK
 }
-/// Nothing runs on the queue, so waiting for a fence never blocks it.
+/// Holds back the queue's later work until the fence reaches the value.
 extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
-    #[cfg(feature = "diagnostics")]
-    note_wait(this, fence, value);
-    #[cfg(not(feature = "diagnostics"))]
-    let _ = (this, value);
+    queue(this)
+        .timeline
+        .submit(Op::Wait(Held::new(fence), value));
     S_OK
 }
 
-/// Diagnostics: counts queue waits, and those for a value the fence has not
-/// reached: what the queue runs next runs too early.
-#[cfg(feature = "diagnostics")]
-fn note_wait(queue: This, fence: This, value: u64) {
-    static WAITS: AtomicU64 = AtomicU64::new(0);
-    static UNMET: AtomicU64 = AtomicU64::new(0);
-    let waits = WAITS.fetch_add(1, Ordering::Relaxed) + 1;
-    let reached = crate::fence::completed(fence);
-    if reached < value {
-        let unmet = UNMET.fetch_add(1, Ordering::Relaxed) + 1;
-        if unmet.is_power_of_two() {
-            // SAFETY: one of our queues; its type is at +0x10.
-            let kind = unsafe { queue.cast::<u8>().add(0x10).cast::<u32>().read() };
-            tracing::info!(
-                unmet,
-                waits,
-                frame = FRAMES.load(Ordering::Relaxed),
-                kind,
-                reached,
-                value,
-                "a queue wait not met yet"
-            );
-        }
-    } else if waits.is_power_of_two() {
-        tracing::info!(
-            waits,
-            unmet = UNMET.load(Ordering::Relaxed),
-            frame = FRAMES.load(Ordering::Relaxed),
-            "queue waits"
-        );
-    }
-}
-/// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
 extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
@@ -276,11 +278,31 @@ pub(crate) fn presented() -> u64 {
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
 extern "system" fn present(
-    _: This,
+    this: This,
     planes: u32,
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    let mut shown = None;
+    if planes > 0
+        // SAFETY: the title passes `planes` plane descriptions.
+        && let Some(plane) = unsafe { plane_parameters.as_ref() }
+        && plane.count > 0
+        && !plane.resources.is_null()
+    {
+        // SAFETY: the plane lists `count` resources.
+        let resource = unsafe { *plane.resources };
+        shown = (!resource.is_null()).then(|| object::Ref::new(resource));
+    }
+    // After the work the queue holds back.
+    queue(this)
+        .timeline
+        .submit(Op::Work(Box::new(move || show(shown))));
+    S_OK
+}
+
+/// Shows a frame.
+fn show(shown: Option<object::Ref>) {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
     crate::host::free_retired(frame);
@@ -317,13 +339,7 @@ extern "system" fn present(
         crate::capture::dump_targets(frame);
     }
     #[cfg(windows)]
-    if planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
+    if let Some(resource) = shown.as_ref().map(object::Ref::get)
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
@@ -338,8 +354,7 @@ extern "system" fn present(
         let _ = shown;
     }
     #[cfg(not(windows))]
-    let _ = (planes, plane_parameters);
-    S_OK
+    let _ = shown;
 }
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
@@ -379,6 +394,7 @@ fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
 /// `start` on, 1 pool page `start` each, 2 unmapped, 3 left as they are)
 /// and how many.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct PageRange {
     kind: u32,
     start: u32,
@@ -400,10 +416,10 @@ const PAGE: u64 = 64 << 10;
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. Grand Theft Auto VI streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
-/// one constant page or of unmapped pages). Done at once: every earlier
-/// submission has run.
+/// one constant page or of unmapped pages). Done after every earlier
+/// submission: at once if none is held back.
 extern "system" fn copy_page_mappings(
-    _: This,
+    this: This,
     count: u32,
     batches: *const PageBatch,
     pool: u64,
@@ -420,14 +436,37 @@ extern "system" fn copy_page_mappings(
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
+    // The title's arrays are its own again once this returns.
+    let batches: Vec<(u64, Vec<PageRange>)> = batches
+        .into_iter()
+        .flatten()
+        .filter(|b| !b.ranges.is_null())
+        .map(|b| {
+            // SAFETY: each batch holds `count` ranges.
+            let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
+            (b.destination, ranges.to_vec())
+        })
+        .collect();
+    let timeline = &queue(this).timeline;
+    if timeline.idle() {
+        map_pages(map, &batches, pool, pool_pages);
+    } else {
+        timeline.submit(Op::Work(Box::new(move || {
+            map_pages(map, &batches, pool, pool_pages);
+        })));
+    }
+    S_OK
+}
+
+fn map_pages(
+    map: crate::resource::PageMapper,
+    batches: &[(u64, Vec<PageRange>)],
+    pool: u64,
+    pool_pages: u32,
+) {
     let mut ok = true;
-    for b in batches.into_iter().flatten() {
-        if b.ranges.is_null() {
-            continue;
-        }
-        // SAFETY: each batch holds `count` ranges.
-        let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
-        let mut at = b.destination;
+    for (destination, ranges) in batches {
+        let mut at = *destination;
         for r in ranges {
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
@@ -446,7 +485,6 @@ extern "system" fn copy_page_mappings(
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
     }
-    S_OK
 }
 
 extern "system" fn desc(this: This, out: *mut QueueDesc) {

@@ -10,6 +10,8 @@
 //! written yet log once with their caller, so a run lists what to do next.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+#[cfg(windows)]
+use std::sync::Arc;
 use std::mem::offset_of;
 
 use crate::object::{
@@ -115,8 +117,10 @@ struct List {
     /// [`allocate_upload`], kept until the list is reset; the host list the
     /// calls record into (decision 0007), and the draw state the title set.
     uploads: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// Replaced at a reset while a submission of it is still to run; titles
+    /// use a list on one thread at a time.
     #[cfg(windows)]
-    host: Option<crate::host::HostList>,
+    host: std::cell::UnsafeCell<Option<Arc<crate::host::HostList>>>,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
 }
@@ -140,7 +144,82 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
         return None;
     }
     // SAFETY: the title passes one of our lists.
-    unsafe { (*this.cast::<List>()).host.as_ref() }
+    unsafe { (*(*this.cast::<List>()).host.get()).as_deref() }
+}
+
+/// A title list's recording, submitted.
+#[cfg(windows)]
+pub(crate) struct Submitted(Arc<crate::host::HostList>);
+
+// SAFETY: host lists are free-threaded objects, recorded by one thread and,
+// once closed, run by one.
+#[cfg(windows)]
+unsafe impl Send for Submitted {}
+
+#[cfg(windows)]
+impl std::ops::Deref for Submitted {
+    type Target = crate::host::HostList;
+    fn deref(&self) -> &crate::host::HostList {
+        &self.0
+    }
+}
+
+/// What a submission of a title list runs, however the title goes on to use
+/// the list.
+#[cfg(windows)]
+pub(crate) fn submitted(this: This) -> Option<Submitted> {
+    if this.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes one of our lists.
+    let host = unsafe { &*(*this.cast::<List>()).host.get() };
+    host.clone().map(Submitted)
+}
+
+/// Host lists the title's lists were parted from while a submission of them
+/// was still to run, reused once it has.
+#[cfg(windows)]
+static PARTED: std::sync::Mutex<Vec<Submitted>> = std::sync::Mutex::new(Vec::new());
+
+/// A host list in place of one still to run, open.
+#[cfg(windows)]
+fn replacement(old: Arc<crate::host::HostList>) -> Option<Arc<crate::host::HostList>> {
+    let mut parted = PARTED.lock().unwrap_or_else(|e| e.into_inner());
+    let spare = parted
+        .iter()
+        .position(|l| Arc::strong_count(&l.0) == 1)
+        .map(|i| parted.swap_remove(i).0);
+    parted.push(Submitted(old));
+    drop(parted);
+    if let Some(list) = spare {
+        list.release_kept();
+        list.reset();
+        return Some(list);
+    }
+    let made = crate::host::host()?.new_list();
+    match made {
+        #[allow(clippy::arc_with_non_send_sync)] // see `Submitted`
+        Ok(list) => Some(Arc::new(list)),
+        Err(error) => {
+            tracing::warn!(%error, "no host command list");
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for List {
+    fn drop(&mut self) {
+        // What a submission still to run needs of the list.
+        if let Some(host) = self.host.get_mut()
+            && Arc::strong_count(host) > 1
+        {
+            host.keep_until_run(Box::new((
+                std::mem::take(&mut self.uploads),
+                std::mem::take(&mut self.state),
+            )));
+        }
+    }
 }
 
 pub(crate) extern "system" fn create_allocator(
@@ -216,13 +295,16 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().and_then(|h| match h.new_list() {
-            Ok(list) => Some(list),
-            Err(e) => {
-                tracing::warn!(error = %e, "no host command list");
-                None
-            }
-        }),
+        #[allow(clippy::arc_with_non_send_sync)] // see `Submitted`
+        host: crate::host::host()
+            .and_then(|h| match h.new_list() {
+                Ok(list) => Some(Arc::new(list)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no host command list");
+                    None
+                }
+            })
+            .into(),
         #[cfg(windows)]
         state: Default::default(),
     });
@@ -262,15 +344,32 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
-    // Every submission of the list has run (submissions are waited for).
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    let mut uploads = uploads.lock().unwrap_or_else(|e| e.into_inner());
     #[cfg(windows)]
-    with_state(this, |host, state| {
-        host.reset();
+    {
+        // SAFETY: as above; the title uses a list on one thread at a time.
+        let (host, state) = unsafe {
+            let list = &*this.cast::<List>();
+            (&mut *list.host.get(), &list.state)
+        };
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(old) = host.take_if(|h| Arc::strong_count(h) > 1) {
+            // A submission of it is still to run, with the memory and the
+            // descriptors it was recorded with.
+            old.keep_until_run(Box::new((std::mem::take(&mut *uploads), std::mem::take(&mut *state))));
+            *host = replacement(old);
+            if host.is_none() {
+                return crate::object::E_OUTOFMEMORY;
+            }
+        } else if let Some(host) = host {
+            host.reset();
+        }
         state.reset(pipeline);
-    });
+    }
+    uploads.clear();
+    drop(uploads);
     #[cfg(not(windows))]
     let _ = (this, pipeline);
     S_OK
@@ -426,6 +525,10 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        list.count_work();
+    }
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
@@ -437,6 +540,10 @@ extern "system" fn copy_buffer_region(
 }
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        list.count_work();
+    }
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
@@ -490,6 +597,10 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        list.count_work();
+    }
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -607,6 +718,10 @@ extern "system" fn resolve(
     format: u32,
 ) {
     #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        list.count_work();
+    }
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
@@ -675,6 +790,10 @@ extern "system" fn clear_rtv(
     rects: *const Rect,
 ) {
     #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        list.count_work();
+    }
+    #[cfg(windows)]
     {
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
         else {
@@ -725,6 +844,10 @@ extern "system" fn clear_dsv(
     rects: *const Rect,
 ) {
     #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        list.count_work();
+    }
+    #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
@@ -757,6 +880,10 @@ extern "system" fn clear_dsv(
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        list.count_work();
+    }
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
@@ -1213,17 +1340,26 @@ pub(crate) fn take_counts() -> (u64, u64) {
 }
 
 /// A GPU wait for a memory value `(address, comparison, reference, ...)`.
-/// Lists run one after another and to completion, so a value another queue
-/// or the CPU has to write first cannot be waited for; nothing to do.
-extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _reference: u64) {
-    #[cfg(feature = "diagnostics")]
-    {
-        static WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let waits = WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if waits.is_power_of_two() {
-            tracing::info!(waits, "GPU waits for memory values (not waited for)");
-        }
+/// Another queue or the CPU writes the value: the submission waits for it
+/// before its list runs (`queue::execute`).
+extern "system" fn wait_value(this: This, address: u64, comparison: u32, reference: u64) {
+    note_wait(this, address, comparison, reference, 8);
+}
+extern "system" fn wait_value32(this: This, address: u64, comparison: u32, reference: u32) {
+    note_wait(this, address, comparison, u64::from(reference), 4);
+}
+/// Keeps the wait, waited for when the list is submitted.
+fn note_wait(this: This, address: u64, comparison: u32, reference: u64, bytes: usize) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        list.note_wait(crate::memwait::Wait {
+            address: address as usize,
+            comparison,
+            reference,
+            bytes,
+        });
     }
+    let _ = (this, address, comparison, reference, bytes);
 }
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
@@ -1327,7 +1463,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (68, ignored_state as *const ()),             // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
-    (71, wait_value as *const ()),                // 0x238, 32 bits
+    (71, wait_value32 as *const ()),              // 0x238, 32 bits
     (72, wait_value as *const ()),                // 0x240, 64 bits
     (73, ignored_state as *const ()),             // 0x248 pixel shader depth order
     (83, copy_texture_region_x as *const ()),     // 0x298

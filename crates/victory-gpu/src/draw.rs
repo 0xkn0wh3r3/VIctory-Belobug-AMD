@@ -526,6 +526,7 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        list.count_work();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -578,6 +579,7 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    list.count_work();
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -834,6 +836,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            list.count_work();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -927,6 +930,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            list.count_work();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1040,8 +1044,10 @@ impl State {
         };
         crate::indirect::done(list, &args.buffer);
         if kind == DISPATCH {
+            list.count_work();
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
+            list.count_work();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true

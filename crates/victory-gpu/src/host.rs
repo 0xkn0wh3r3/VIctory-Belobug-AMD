@@ -311,6 +311,50 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 mod tests {
     use super::*;
 
+    /// A list with no work before its waits, as the title's queues meet one
+    /// another halfway: each write goes as soon as the waits before it are
+    /// met, and work holds the later ones back.
+    #[test]
+    fn writes_before_an_unmet_wait_go_early() {
+        let Some(host) = host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        let mut memory = [0u64; 4];
+        let at = memory.as_mut_ptr();
+        // SAFETY: inside the array.
+        let slot = |i: usize| unsafe { at.add(i) };
+        let wait = |i: usize| crate::memwait::Wait {
+            address: slot(i) as usize,
+            comparison: 7,
+            reference: 5,
+            bytes: 8,
+        };
+        let write = |i: usize| list.defer_write(slot(i).cast(), crate::queue::Written::Value(5), 8);
+        // SAFETY: as above.
+        let value = |i: usize| unsafe { slot(i).read_volatile() };
+        list.note_wait(wait(0));
+        write(1);
+        list.note_wait(wait(2));
+        list.count_work();
+        write(3);
+        assert!(!list.write_early() && value(1) == 0);
+        // SAFETY: as above.
+        unsafe { slot(0).write_volatile(5) };
+        assert_eq!(list.unmet(), [wait(2)]);
+        assert!(list.write_early() && !list.write_early());
+        assert_eq!((value(1), value(3)), (5, 0));
+        // SAFETY: as above.
+        unsafe { slot(2).write_volatile(5) };
+        assert!(list.unmet().is_empty() && !list.write_early());
+        // Run: what is left, then all of it anew for another submission.
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(value(3), 5);
+        // SAFETY: as above.
+        unsafe { slot(1).write_volatile(0) };
+        host.execute(&[&list]);
+        assert_eq!(value(1), 5);
+    }
+
     #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
@@ -353,6 +397,11 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    /// What the title's list held for this recording, if the title reset or
+    /// released it while a submission of it was still to run.
+    kept: Mutex<Vec<Box<dyn std::any::Any + Send>>>,
+    /// Draws and dispatches recorded.
+    work: Mutex<usize>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
@@ -397,6 +446,14 @@ pub(crate) fn dred_on() -> bool {
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
+}
+
+/// Whether submitted lists are not run on the host GPU (`VICTORY_NO_GPU_WORK`,
+/// diagnostics builds).
+#[cfg(feature = "diagnostics")]
+fn no_work() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NO_GPU_WORK").is_some())
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -466,6 +523,13 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Waits for memory values, with how many `writes` precede them.
+    waits: Vec<(usize, crate::memwait::Wait)>,
+    /// The work before each of `writes`.
+    marks: Vec<usize>,
+    /// How many of `writes` this submission has done already.
+    early: usize,
+    wait_marks: Vec<usize>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
@@ -536,6 +600,8 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
+                kept: Mutex::default(),
+                work: Mutex::default(),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
@@ -582,6 +648,12 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         for (i, group) in groups.iter().enumerate() {
+            // Diagnostics: everything but the GPU's work, to look at the
+            // order of the title's submissions.
+            #[cfg(feature = "diagnostics")]
+            if no_work() {
+                continue;
+            }
             *submitted += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
@@ -656,9 +728,11 @@ impl Host {
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
-            for &(at, what, bytes) in &list.deferred().writes {
+            let mut deferred = list.deferred();
+            for &(at, what, bytes) in &deferred.writes[deferred.early..] {
                 what.write(at as *mut u8, bytes);
             }
+            deferred.early = 0;
         }
         self.log_messages();
     }
@@ -934,10 +1008,20 @@ impl HostList {
         }
     }
 
+    pub(crate) fn keep_until_run(&self, what: Box<dyn std::any::Any + Send>) {
+        self.kept.lock().unwrap_or_else(|e| e.into_inner()).push(what);
+    }
+
+    pub(crate) fn release_kept(&self) {
+        let kept = std::mem::take(&mut *self.kept.lock().unwrap_or_else(|e| e.into_inner()));
+        drop(kept);
+    }
+
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
+        *self.work.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -1117,9 +1201,88 @@ impl HostList {
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
 
+    /// A wait for a memory value.
+    pub(crate) fn note_wait(&self, wait: crate::memwait::Wait) {
+        let mut deferred = self.deferred();
+        let before = deferred.writes.len();
+        deferred.waits.push((before, wait));
+        let work = *self.work.lock().unwrap_or_else(|e| e.into_inner());
+        deferred.wait_marks.push(work);
+    }
+
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
+    ///
+    /// Work is draws, dispatches, clears and copies: what has to run first.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
-        self.deferred().writes.push((dst as usize, what, bytes));
+        let work = *self.work.lock().unwrap_or_else(|e| e.into_inner());
+        let mut deferred = self.deferred();
+        deferred.writes.push((dst as usize, what, bytes));
+        deferred.marks.push(work);
+    }
+
+    /// The list's memory waits and writes in order, with how many draws and
+    /// dispatches precede each (for the log).
+    pub(crate) fn script(&self) -> String {
+        let deferred = self.deferred();
+        let mut events: Vec<(usize, u8, String)> = Vec::new();
+        for (i, (at, what, _)) in deferred.writes.iter().enumerate() {
+            events.push((i, 1, format!("W[{at:x}]={what:x?}@{}", deferred.marks.get(i).copied().unwrap_or(0))));
+        }
+        for (before, w) in &deferred.waits {
+            let mark = deferred.wait_marks.get(events.len().saturating_sub(deferred.writes.len())).copied().unwrap_or(0);
+            events.push((*before, 0, format!("R[{:x}]>={:x}@{mark}", w.address, w.reference)));
+        }
+        events.sort_by_key(|e| (e.0, e.1));
+        let work = *self.work.lock().unwrap_or_else(|e| e.into_inner());
+        let texts: Vec<_> = events.into_iter().map(|e| e.2).collect();
+        format!("{} ({work} in all)", texts.join(" "))
+    }
+
+    /// Counts a draw or dispatch (for the log).
+    pub(crate) fn count_work(&self) {
+        *self.work.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+    }
+
+    /// Does the list's writes that come before its first wait not met, if no
+    /// work of the list precedes them; whether there were any.
+    pub(crate) fn write_early(&self) -> bool {
+        let mut deferred = self.deferred();
+        let first = deferred.waits.iter().find(|(_, wait)| !wait.met(wait.value()));
+        let Some(&(before, _)) = first else {
+            return false;
+        };
+        let done = deferred.early;
+        // Those before any work (marks only grow).
+        let before = before.min(deferred.marks.iter().take_while(|&&m| m == 0).count());
+        if before <= done {
+            return false;
+        }
+        for &(at, what, bytes) in &deferred.writes[done..before] {
+            what.write(at as *mut u8, bytes);
+        }
+        deferred.early = before;
+        true
+    }
+
+    /// The waits of the list that are not met yet, apart from those its own
+    /// earlier writes meet.
+    pub(crate) fn unmet(&self) -> Vec<crate::memwait::Wait> {
+        let deferred = self.deferred();
+        deferred
+            .waits
+            .iter()
+            .filter(|(before, wait)| {
+                let own = deferred.writes[..*before]
+                    .iter()
+                    .rev()
+                    .find(|w| w.0 == wait.address);
+                match own {
+                    Some((_, crate::queue::Written::Value(v), _)) => !wait.met(*v),
+                    _ => !wait.met(wait.value()),
+                }
+            })
+            .map(|w| w.1)
+            .collect()
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
