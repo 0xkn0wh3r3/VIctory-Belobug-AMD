@@ -207,6 +207,7 @@ enum Term {
 
 /// A 32-bit sum: optional root parameter (as its first dword), constant,
 /// optional computed term.
+#[derive(Clone, Copy)]
 struct Sum {
     base: Option<Value>,
     offset: u32,
@@ -224,6 +225,10 @@ struct Tracer<'a> {
     /// Register per input value.
     inputs: Vec<Option<Reg>>,
     origin: Vec<Term>,
+    /// Address sums already traced, indexed by SSA value (the operands'
+    /// origins are settled before tracing starts, so every use of a value
+    /// can reuse its sum, an opaque one included).
+    sums: std::cell::RefCell<Vec<Option<Sum>>>,
 }
 
 const MAX_ROUNDS: usize = 64;
@@ -269,6 +274,7 @@ impl<'a> Tracer<'a> {
             phis,
             inputs,
             origin: Vec::new(),
+            sums: std::cell::RefCell::new(Vec::new()),
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -381,6 +387,23 @@ impl<'a> Tracer<'a> {
     }
 
     fn sum(&self, t: Term) -> Sum {
+        let Term::Value(v) = t else {
+            return self.sum_uncached(t);
+        };
+        let index = v.0 as usize;
+        if let Some(&Some(sum)) = self.sums.borrow().get(index) {
+            return sum;
+        }
+        let sum = self.sum_uncached(t);
+        let mut sums = self.sums.borrow_mut();
+        if index >= sums.len() {
+            sums.resize(index + 1, None);
+        }
+        sums[index] = Some(sum);
+        sum
+    }
+
+    fn sum_uncached(&self, t: Term) -> Sum {
         let v = match t {
             Term::Const(c) => {
                 return Sum {
