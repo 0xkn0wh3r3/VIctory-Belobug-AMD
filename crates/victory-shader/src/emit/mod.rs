@@ -631,6 +631,14 @@ mod tests {
             0x7E0C_0307, // v_mov_b32 v6, v7
             0xE078_1000,
             0x8002_0414, // buffer_store_dwordx4 v[4:7], v20, s[8:11], 0 offen
+            0x7E26_0280, // v_mov_b32 v19, 0
+            0xD577_1008,
+            0x044A_1F0E, // v_mad_i64_i32 v[8:9], s16, v14, v15, v[18:19]
+            0xD501_000A,
+            0x0041_0280, // v_cndmask_b32_e64 v10, 0, 1, s16
+            0x7E28_02A0, // v_mov_b32 v20, 32
+            0xE078_1000,
+            0x8002_0814, // buffer_store_dwordx4 v[8:11], v20, s[8:11], 0 offen
             0xBF81_0000, // s_endpgm
         ];
         let native = super::NativeProgram {
@@ -728,6 +736,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(&out[0][..7], &[0x8000_0002, 0, 1, 0, 10, 0, 1]);
+            assert_eq!(&out[0][8..11], &[(-15i32) as u32, u32::MAX, 1]);
         }
     }
 }

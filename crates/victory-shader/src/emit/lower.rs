@@ -3528,6 +3528,9 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_mad_u64_u32" | "v_mad_i64_i32" => {
+                if v.clamp {
+                    return Err("a clamped integer operation");
+                }
                 let signed = name == "v_mad_i64_i32";
                 let (a, bb, acc) = (s(self, 0)?, s(self, 1)?, self.src64(inst, 2)?);
                 let i64t = self.s.m.int(64);
@@ -3536,14 +3539,15 @@ impl<'a> Lower<'a> {
                 let bb = self.s.m.cast(c, ext, bb, i64t);
                 let prod = self.s.m.bin(c, Bin::Mul, a, bb);
                 let sum = self.s.m.bin(c, Bin::Add, prod, acc);
+                let ucarry = self.s.m.cmp(c, pred::IULT, sum, prod);
                 let carry = if signed {
-                    let ps = self.s.m.bin(c, Bin::Xor, prod, sum);
-                    let acs = self.s.m.bin(c, Bin::Xor, acc, sum);
-                    let ov = self.s.m.bin(c, Bin::And, ps, acs);
                     let z64 = self.s.m.int_const(i64t, 0);
-                    self.s.m.cmp(c, pred::SLT, ov, z64)
+                    let sp = self.s.m.cmp(c, pred::SLT, prod, z64);
+                    let sa = self.s.m.cmp(c, pred::SLT, acc, z64);
+                    let signs = self.s.m.bin(c, Bin::Xor, sp, sa);
+                    self.s.m.bin(c, Bin::Xor, ucarry, signs)
                 } else {
-                    self.s.m.cmp(c, pred::IULT, sum, prod)
+                    ucarry
                 };
                 self.s.flags |= flags::INT64;
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
