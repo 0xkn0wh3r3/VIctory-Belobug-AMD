@@ -264,6 +264,19 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     })
 }
 
+/// Dwords a scalar load reads, by the suffix of its name after
+/// `s_load_dword` or `s_buffer_load_dword`.
+fn smem_dwords(suffix: &str) -> Option<u32> {
+    match suffix {
+        "" => Some(1),
+        "x2" => Some(2),
+        "x4" => Some(4),
+        "x8" => Some(8),
+        "x16" => Some(16),
+        _ => None,
+    }
+}
+
 /// Where half `h` (dword h / 2, the high half when odd) of a parameter
 /// packing 16-bit rows `a` and `b` two per dword comes from: a row and
 /// channel of `elements`, none for padding. Channel c of `a` is half c;
@@ -2723,16 +2736,19 @@ impl<'a> Lower<'a> {
             return self.code_smem(inst, a);
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
+            if let Some(a) = self.scalar.get(&site).copied()
+                && self
+                    .x
+                    .native
+                    .layout
+                    .get(a.param)
+                    .is_some_and(|p| p.root == RootType::Descriptor)
+            {
+                return self.root_smem(inst, site, a);
+            }
             return self.descriptor_data(inst, site);
         };
-        let count = match rest {
-            "" => 1,
-            "x2" => 2,
-            "x4" => 4,
-            "x8" => 8,
-            "x16" => 16,
-            _ => return Err("a scalar buffer load"),
-        };
+        let count = smem_dwords(rest).ok_or("a scalar buffer load")?;
         let Some(Operand::Scalar { code, .. }) = *data else {
             return Err("a scalar buffer load");
         };
@@ -2763,8 +2779,40 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        let srv = matches!(kind, Some(u) if u.kind == ResourceType::Srv);
+        let props = if srv { (11, 0) } else { (13, 0x1_0000) };
+        let h = self.handle(site, src, false, props)?;
+        let constant = match addr {
+            V::Const(_)
+                if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
+            {
+                Some(*offset as u32)
+            }
+            _ => None,
+        };
+        let words = self.view_dwords(h, srv, addr, constant, count);
+        for (k, x) in words.into_iter().enumerate() {
+            self.write(inst, Reg::S(code + k as u8), x, None);
+        }
+        Ok(())
+    }
+
+    /// `count` dwords from byte `addr` (`constant` when known) of a raw
+    /// buffer (`srv`) or constant buffer view `h`. The address's two low
+    /// bits are ignored, as scalar memory does.
+    fn view_dwords(
+        &mut self,
+        h: V,
+        srv: bool,
+        addr: V,
+        constant: Option<u32>,
+        count: u32,
+    ) -> Vec<V> {
+        let c = self.cur;
+        let mut out = Vec::new();
+        if srv {
+            let not3 = self.s.m.i32(!3);
+            let addr = self.s.m.bin(c, Bin::And, addr, not3);
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -2779,25 +2827,15 @@ impl<'a> Lower<'a> {
                     &[h, a, u, mask, al],
                 );
                 let x = self.s.m.extract(c, r, 0);
-                let x = self.as_int(x);
-                self.write(inst, Reg::S(code + k as u8), x, None);
+                out.push(self.as_int(x));
             }
-            return Ok(());
+            return out;
         }
-        let h = self.handle(site, src, false, (13, 0x1_0000))?;
-        let constant = match addr {
-            V::Const(_)
-                if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
-            {
-                Some(*offset as u32)
-            }
-            _ => None,
-        };
         let mut rows: HashMap<u32, V> = HashMap::new();
         for k in 0..count {
             let x = match constant {
                 Some(base) => {
-                    let byte = base + 4 * k;
+                    let byte = base.wrapping_add(4 * k);
                     let row = match rows.get(&(byte >> 4)) {
                         Some(&r) => r,
                         None => {
@@ -2822,6 +2860,50 @@ impl<'a> Lower<'a> {
                     self.cbuffer_dword(h, a)
                 }
             };
+            out.push(x);
+        }
+        out
+    }
+
+    /// `s_load_dword*` from the memory of a root CBV or SRV: constants the
+    /// code reads through scalar memory at an address it computes from the
+    /// root descriptor's, read through the root view (a raw buffer for an
+    /// SRV, a constant buffer otherwise).
+    // shortcut: like the console's scalar loads, the host's root views are
+    // not bounds-checked, so a read past the view's data is undefined on
+    // both.
+    fn root_smem(&mut self, inst: &Inst, site: Site, a: Address) -> Result<(), Why> {
+        let Fields::Smem {
+            data: Some(Operand::Scalar { code, .. }),
+            ..
+        } = inst.fields
+        else {
+            return Err("a scalar memory read as data");
+        };
+        let count = inst
+            .name()
+            .strip_prefix("s_load_dword")
+            .and_then(smem_dwords)
+            .ok_or("a scalar memory read as data")?;
+        let src = Source::Built {
+            address: a,
+            bits: 0,
+            words: [0, 0],
+        };
+        let srv = self
+            .used_kind(&src)
+            .is_some_and(|u| u.kind == ResourceType::Srv);
+        let props = if srv { (11, 0) } else { (13, 0x1_0000) };
+        let h = self.handle(site, &src, false, props)?;
+        let c = self.cur;
+        let mut addr = self.s.m.i32(a.offset);
+        if let Some(d) = a.dynamic {
+            let d = self.i32_of(d)?;
+            addr = self.s.m.bin(c, Bin::Add, addr, d);
+        }
+        let constant = a.dynamic.is_none().then_some(a.offset);
+        let words = self.view_dwords(h, srv, addr, constant, count);
+        for (k, x) in words.into_iter().enumerate() {
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
@@ -2848,31 +2930,38 @@ impl<'a> Lower<'a> {
         else {
             return Err("a scalar memory read as data");
         };
-        let count = match inst.name().strip_prefix("s_load_dword") {
-            Some("") => 1u32,
-            Some("x2") => 2,
-            Some("x4") => 4,
-            Some("x8") => 8,
-            Some("x16") => 16,
-            _ => return Err("a scalar memory read as data"),
-        };
-        // How the program uses the descriptor tells the view's kind.
-        let use_at = self
-            .x
-            .res
-            .descriptors
-            .iter()
-            .filter(|d| d.role == Role::Resource)
-            .find_map(|d| {
-                d.source.leaves().into_iter().find_map(|l| match *l {
-                    Source::Loaded { load, first } if load == site => Some((d.site, first)),
-                    _ => None,
+        let count = inst
+            .name()
+            .strip_prefix("s_load_dword")
+            .and_then(smem_dwords)
+            .ok_or("a scalar memory read as data")?;
+        // How the program uses the descriptor tells the view's kind: this
+        // load's dwords, or those of another load of the same descriptor
+        // (the code often loads the whole descriptor for the resource and a
+        // dword or two of it again for its size). `skew` is the dword of
+        // the descriptor this load's first dword is; another load's
+        // descriptor counts only if this load starts inside it.
+        let find = |own: bool| {
+            self.x
+                .res
+                .descriptors
+                .iter()
+                .filter(|d| d.role == Role::Resource)
+                .find_map(|d| {
+                    d.source.leaves().into_iter().find_map(|l| match *l {
+                        Source::Loaded { load, first } if (load == site) == own => {
+                            let skew = self.load_skew(inst, site, load)? - i32::from(first);
+                            (own || (0..8).contains(&skew)).then_some((d.site, load, first, skew))
+                        }
+                        _ => None,
+                    })
                 })
-            });
-        let Some((at, first)) = use_at else {
+        };
+        let use_at = find(true).or_else(|| find(false));
+        let Some((at, load, first, skew)) = use_at else {
             return Err("a descriptor read only as data");
         };
-        let src = Source::Loaded { load: site, first };
+        let src = Source::Loaded { load, first };
         let used = self.used_kind(&src);
         let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
         let un = ui.name();
@@ -2963,8 +3052,8 @@ impl<'a> Lower<'a> {
             None => vec![(2, field(self, 0))],
         };
         for k in 0..count {
-            let rel = k.wrapping_sub(u32::from(first));
-            match words.iter().find(|w| w.0 == rel) {
+            let rel = (k as i32).wrapping_add(skew);
+            match words.iter().find(|w| w.0 as i32 == rel) {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
@@ -2976,6 +3065,49 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// The dword of what the scalar load at `other` reads that `inst` (at
+    /// `site`) reads first: the same base and offset registers, immediates
+    /// a whole number of dwords apart (none for loads that differ
+    /// otherwise). The handle of the other load's descriptor is then built
+    /// from values `inst` reads too.
+    fn load_skew(&self, inst: &Inst, site: Site, other: Site) -> Option<i32> {
+        if other == site {
+            return Some(0);
+        }
+        let o: &Inst = &self.x.p.blocks[other.0].insts[other.1];
+        let (
+            Fields::Smem {
+                base: Operand::Scalar { code: b0, .. },
+                offset: f0,
+                soffset: s0,
+                ..
+            },
+            Fields::Smem {
+                base: Operand::Scalar { code: b1, .. },
+                offset: f1,
+                soffset: s1,
+                ..
+            },
+        ) = (&inst.fields, &o.fields)
+        else {
+            return None;
+        };
+        let reads = |i: &Inst, code: u8| (i.read(Reg::S(code)), i.read(Reg::S(code + 1)));
+        let same_soffset = match (s0, s1) {
+            (Operand::Scalar { code: NULL, .. }, Operand::Scalar { code: NULL, .. }) => true,
+            (Operand::Scalar { code: c0, .. }, Operand::Scalar { code: c1, .. }) => {
+                inst.read(Reg::S(*c0)).is_some() && inst.read(Reg::S(*c0)) == o.read(Reg::S(*c1))
+            }
+            _ => false,
+        };
+        let delta = f0.wrapping_sub(*f1);
+        (reads(inst, *b0).0.is_some()
+            && reads(inst, *b0) == reads(o, *b1)
+            && same_soffset
+            && delta % 4 == 0)
+            .then_some(delta / 4)
+    }
+
     /// `s_load_dword*` from the program's constant table.
     fn code_smem(&mut self, inst: &Inst, a: Address) -> Result<(), Why> {
         let Fields::Smem {
@@ -2985,14 +3117,11 @@ impl<'a> Lower<'a> {
         else {
             return Err("a scalar load");
         };
-        let count = match inst.name().strip_prefix("s_load_dword") {
-            Some("") => 1u32,
-            Some("x2") => 2,
-            Some("x4") => 4,
-            Some("x8") => 8,
-            Some("x16") => 16,
-            _ => return Err("a scalar load from the code"),
-        };
+        let count = inst
+            .name()
+            .strip_prefix("s_load_dword")
+            .and_then(smem_dwords)
+            .ok_or("a scalar load from the code")?;
         let c = self.cur;
         let mut addr = self.s.m.i32(a.offset);
         if let Some(d) = a.dynamic {
@@ -6558,23 +6687,36 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Numeric, Parts, buffer_format, lower};
-    use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+    use super::{Lowered, Numeric, Parts, buffer_format, lower};
+    use crate::native::{
+        ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+    };
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
     /// Lowers a compute program of constants: whether it translates.
     fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
+        lower_with(words, vec![], vec![]).map(|_| ())
+    }
+
+    /// Lowers a compute program with root parameters in user SGPRs from s0
+    /// on.
+    fn lower_with(
+        words: &[u32],
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+    ) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64: false,
             vgprs: 256,
-            layout: vec![],
-            used: vec![],
+            layout,
+            used,
             io: StageIo::Cs(ComputeIo {
-                rsrc2: 0,
+                rsrc2: sgprs << 1,
                 threads: [1, 1, 1],
             }),
             code,
@@ -6594,7 +6736,88 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
+    }
+
+    /// Root parameter `slot` in user SGPRs from `user_data` on.
+    fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
+        RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs: if root == RootType::Descriptor { 2 } else { 1 },
+            base_register: 0,
+            user_data,
+            slot,
+        }
+    }
+
+    /// The view a root descriptor at `user_data` is.
+    fn root_view(kind: ResourceType, user_data: u8, slot: u8) -> UsedResource {
+        UsedResource {
+            kind,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data,
+            slot,
+        }
+    }
+
+    #[test]
+    fn constants_loaded_from_a_root_view() {
+        // Two dwords at byte 0x10 of the memory of a root descriptor (in
+        // s[0:1]) read with s_load and branched on: read through the root
+        // CBV, or the root SRV when the root signature says it is one.
+        let words = [
+            0xF404_0080,
+            0xFA00_0010, // s_load_dwordx2 s[2:3], s[0:1], 0x10
+            0x8002_0302, // s_add_u32 s2, s2, s3
+            0xBF06_8502, // s_cmp_eq_u32 s2, 5
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        let layout = || vec![root(RootType::Descriptor, 0, 3)];
+        let cbv = lower_with(&words, layout(), vec![]).unwrap();
+        assert_eq!((cbv.root_cbvs, cbv.root_srvs), (vec![3], vec![]));
+        let used = vec![root_view(ResourceType::Srv, 0, 3)];
+        let srv = lower_with(&words, layout(), used).unwrap();
+        assert_eq!((srv.root_cbvs, srv.root_srvs), (vec![], vec![3]));
+        // A root UAV's memory has no read-only host view.
+        let used = vec![root_view(ResourceType::Uav, 0, 3)];
+        assert!(lower_with(&words, layout(), used).is_err());
+    }
+
+    #[test]
+    fn a_dword_of_a_descriptor_another_load_reads_whole() {
+        // A 2D image's descriptor (a table range at s0) loaded whole for
+        // image_get_resinfo, and its dword 2 (width and height) loaded
+        // again alone and branched on.
+        let words = [
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF40C_0100,
+            0xFA00_0000, // s_load_dwordx8 s[4:11], s[0:1], null
+            0x7E04_0480, // v_mov_b32 v2, 0
+            0xF038_0308,
+            0x0001_0402, // image_get_resinfo v[4:5], v2, s[4:11] dim:SQ_RSRC_IMG_2D
+            0xF400_0300,
+            0xFA00_0008, // s_load_dword s12, s[0:1], 0x8
+            0xBF06_850C, // s_cmp_eq_u32 s12, 5
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        let layout = || vec![root(RootType::Table, 0, 0)];
+        lower_with(&words, layout(), vec![]).unwrap();
+        // Dword 2 of the next descriptor: no load of it is used.
+        let mut next = words;
+        next[7] = 0xFA00_0028;
+        let e = lower_with(&next, layout(), vec![]).err().unwrap();
+        assert!(
+            e.to_string().contains("a descriptor read only as data"),
+            "{e}"
+        );
     }
 
     #[test]
