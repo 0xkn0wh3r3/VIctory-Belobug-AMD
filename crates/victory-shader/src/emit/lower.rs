@@ -2135,6 +2135,13 @@ impl<'a> Lower<'a> {
             Some(&Val::I32(_)) if is_mask && !self.mask_ok && !self.phi_at.contains_key(&v) => {
                 return Err(LANE_MASK);
             }
+            // shortcut: descriptors a program that traces rays reads as data
+            // (a hit's material, say): no ray hits anything.
+            Some(&Val::Missing(
+                "a descriptor's address or format read as data" | "a descriptor read only as data",
+            )) if crate::resource::traces_rays(self.x.p) => {
+                return Ok(Val::I32(self.s.m.i32(0)));
+            }
             Some(&Val::Missing(w)) => return Err(w),
             Some(&val) => return Ok(val),
             None => {}
@@ -11477,6 +11484,17 @@ impl<'a> Lower<'a> {
                         } else {
                             self.s.m.undef(self.s.t.i32)
                         }
+                    }
+                    // SCC of a mask operation joined with a comparison's: the
+                    // edge past a section no lane is in, where it is clear.
+                    (Some(Val::Missing(why)), true)
+                        if why == LANE_MASK
+                            && phi
+                                .args
+                                .iter()
+                                .any(|a| matches!(self.vals.get(a), Some(Val::Bit(_)))) =>
+                    {
+                        self.s.m.bool(false)
                     }
                     // As above, of a lane mask: the registers held one before.
                     // shortcut: as above, zero there.
