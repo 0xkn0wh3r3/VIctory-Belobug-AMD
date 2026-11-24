@@ -318,6 +318,27 @@ pub fn run(
     Ok(())
 }
 
+/// The instructions around `offset` (`VICTORY_AROUND=<count>`, before and
+/// half as many after), with the block each starts in.
+fn disassemble(p: &ir::Program, offset: usize) {
+    let Some(around) = std::env::var("VICTORY_AROUND").ok().and_then(|v| v.parse::<usize>().ok()) else {
+        return;
+    };
+    let all: Vec<(usize, &ir::Inst)> = p
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(b, block)| block.insts.iter().map(move |i| (b, i)))
+        .collect();
+    let at = all
+        .iter()
+        .position(|(_, i)| i.machine.offset == offset)
+        .unwrap_or(0);
+    for (b, i) in &all[at.saturating_sub(around)..(at + around / 2).min(all.len())] {
+        println!("  {:#x} b{b} {} {:?}", i.machine.offset, i.name(), i.fields);
+    }
+}
+
 fn translate(
     source: &Source,
     path: &Path,
@@ -364,6 +385,7 @@ fn translate(
                         Some(r)
                     }
                     Err(ShaderError::Unsupported { offset, what }) => {
+                        disassemble(&program, offset);
                         t.fail(format!("resources: {what}"), || {
                             format!("{} {:?} at {offset:#x}", example(), p.stage)
                         });
@@ -416,10 +438,12 @@ fn translate(
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
                         }
-                        Err(ShaderError::Unsupported { offset, what }) => t
-                            .fail(format!("emit: {what}"), || {
+                        Err(ShaderError::Unsupported { offset, what }) => {
+                            disassemble(&program, offset);
+                            t.fail(format!("emit: {what}"), || {
                                 format!("{} at {offset:#x}", label())
-                            }),
+                            })
+                        }
                         Err(e) => t.fail(format!("emit: {e}"), label),
                     }
                 }

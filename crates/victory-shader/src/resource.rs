@@ -1857,6 +1857,18 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         // that has no inline form; fold more if descriptors need it.
         ("s_brev_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(x.reverse_bits())),
         ("s_not_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(!x)),
+        // Bits `src0` of them from bit `src1`.
+        ("s_bfm_b32", Operand::Const(a)) => {
+            let Some(&Operand::Const(b)) = (match &inst.fields {
+                Fields::Sop { src, .. } => src.get(1),
+                _ => None,
+            }) else {
+                return None;
+            };
+            let (n, at) = (inline(a)? & 31, inline(b)? & 31);
+            Some(Moved::Const(((1u32 << n) - 1) << at))
+        }
+        ("s_mov_b64", Operand::Literal(x)) => Some(Moved::Const(if k == 0 { x } else { 0 })),
         // 64-bit inline integers are sign-extended.
         ("s_mov_b64", Operand::Const(c @ 128..=208)) => {
             let low = inline(c)?;
