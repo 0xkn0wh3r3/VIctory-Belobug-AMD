@@ -36,6 +36,8 @@ macro_rules! once {
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
+    /// Its part of the buffer, if that is shared.
+    _slot: Option<crate::texpool::Slot>,
     /// Its bytes.
     size: u64,
     /// The [`USES`] count at its last use: the least recently used go
@@ -104,6 +106,8 @@ fn evict(map: &mut HashMap<usize, Arc<Staging>>, more: u64) {
     if STAGED.load(Ordering::Relaxed) + more <= budget {
         return;
     }
+    // Some more than needed: looking at all of them takes a while.
+    let budget = budget / 4 * 3;
     // Held only by the map: no list will copy from it, and no submission
     // still running reads it (lists hold theirs until reset).
     let mut idle: Vec<(u64, usize, u64)> = map
@@ -459,7 +463,18 @@ fn create_staging(
     if let Some(map) = map {
         evict(map, total);
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    let (buffer, data, slot) = match crate::texpool::staging(host, total) {
+        Some((buffer, data, offset, slot)) => {
+            for f in &mut footprints {
+                f.Offset += offset;
+            }
+            (buffer, data, Some(slot))
+        }
+        None => {
+            let (buffer, data) = host.upload_buffer(total)?;
+            (buffer, data, None)
+        }
+    };
     STAGED.fetch_add(total, Ordering::Relaxed);
     crate::host::name(&buffer, || {
         format!(
@@ -469,6 +484,7 @@ fn create_staging(
     });
     Some(Arc::new(Staging {
         buffer,
+        _slot: slot,
         size: total,
         used: AtomicU64::new(now),
         data,
@@ -540,6 +556,7 @@ mod tests {
                 .expect("create host texture");
         }
         let copy = Arc::new(HostTexture {
+            slot: None,
             texture: resource.unwrap(),
             state: AtomicU32::new(D3D12_RESOURCE_STATE_COMMON.0 as u32),
             bytes: 0,

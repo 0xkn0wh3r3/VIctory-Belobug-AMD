@@ -176,6 +176,11 @@ struct Bindless {
     /// looked for in: at submission, at recording. Once per frame: the title
     /// releases and evicts all the time, and each look is over all slots.
     looked: [u64; 2],
+    /// The ranges of [`MAPPED`] seen.
+    mapped_seen: u64,
+    /// The frame (plus one) the plan's lists of everything were last made in,
+    /// and whether slots changed since.
+    full: (u64, bool),
 }
 
 /// Time for making changed slots, at submission and at recording: an eighth
@@ -197,7 +202,7 @@ impl Bindless {
         let (at, left) = self
             .budget
             .get_or_insert((now, [SLOT_BUDGET_US; 2]));
-        let add = now.duration_since(*at).as_micros() as u64 / 4;
+        let add = now.duration_since(*at).as_micros() as u64 / 8;
         if add > 0 {
             *at = now;
             for l in left.iter_mut() {
@@ -227,8 +232,10 @@ struct SlotUse {
     /// It views a placed texture: the texture's object (0 for none), made
     /// again when the texture is evicted.
     placed: Option<usize>,
-    /// It views unmapped memory (looked at again when memory is remapped).
+    /// It views unmapped memory (looked at again when memory is remapped),
+    /// this of it.
     unmapped: bool,
+    at: (u64, u64),
 }
 
 /// Placed textures reached only through bindless slots are uploaded when a
@@ -247,6 +254,52 @@ const RECHECKS: u32 = 8;
 /// bindless slots view may have changed though no slot was written (their
 /// views' generations are checked, all at once, at the next submission).
 static VIEWED: AtomicU64 = AtomicU64::new(0);
+
+/// Title memory mapped or unmapped lately (start, end), and how many were.
+static MAPPED: Mutex<(VecDeque<(u64, u64)>, u64)> = Mutex::new((VecDeque::new(), 0));
+/// Of them, those kept; a heap that missed some looks at all its slots.
+const MAPPED_KEPT: usize = 1 << 16;
+
+/// Title memory `[start, end)` was mapped or unmapped.
+pub(crate) fn bindless_memory_changed(start: u64, end: u64) {
+    {
+        let mut m = MAPPED.lock().unwrap_or_else(|e| e.into_inner());
+        if m.0.len() == MAPPED_KEPT {
+            m.0.pop_front();
+        }
+        m.0.push_back((start, end));
+        m.1 += 1;
+    }
+    bindless_viewed_changed();
+}
+
+/// The ranges mapped or unmapped since the first `seen`, sorted and merged
+/// (`None` if they are not all known), and how many there were.
+fn mapped_since(seen: u64) -> (Option<Vec<(u64, u64)>>, u64) {
+    let m = MAPPED.lock().unwrap_or_else(|e| e.into_inner());
+    let n = (m.1 - seen) as usize;
+    if n > m.0.len() {
+        return (None, m.1);
+    }
+    let mut ranges: Vec<(u64, u64)> = m.0.iter().skip(m.0.len() - n).copied().collect();
+    let count = m.1;
+    drop(m);
+    ranges.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (a, b) in ranges {
+        match out.last_mut() {
+            Some(l) if a <= l.1 => l.1 = l.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    (Some(out), count)
+}
+
+/// Whether `[start, end)` meets one of `ranges` (sorted, merged).
+fn meets(ranges: &[(u64, u64)], (start, end): (u64, u64)) -> bool {
+    let i = ranges.partition_point(|r| r.1 <= start);
+    ranges.get(i).is_some_and(|r| r.0 < end)
+}
 
 /// Bindless slots must be checked again: a resource their views name was
 /// released, or title memory was mapped or unmapped.
@@ -271,19 +324,19 @@ const READ_GAP: usize = 64 << 10;
 pub(crate) struct BindlessPlan {
     /// Title memory the slots read, merged per host copy (address, bytes):
     /// refreshed at each submission using the heap.
-    pub(crate) reads: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
+    pub(crate) reads: Arc<Vec<(Arc<crate::shadow::Shadow>, usize, usize)>>,
     /// The unordered access slots' ranges (up to [`WRITE_CAP`] each), merged:
     /// copied back after a submission whose shaders may write memory.
-    pub(crate) writes: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
+    pub(crate) writes: Arc<Vec<(Arc<crate::shadow::Shadow>, usize, usize)>>,
     /// Misaligned constant buffers: bounce slice, title address, bytes.
-    bounces: Vec<(usize, u64, u32)>,
+    bounces: Arc<Vec<(usize, u64, u32)>>,
     /// Of them, those new in this plan.
     fresh: Vec<(usize, u64, u32)>,
     fresh_reads: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
     /// The frame (plus one) the bounces were last copied in.
     copied_in: AtomicU64,
     /// The host resources the slots view, held while a submission runs.
-    _retained: Vec<ID3D12Resource>,
+    _retained: Arc<Vec<ID3D12Resource>>,
 }
 
 // SAFETY: D3D12 resources are free-threaded; the rest is plain data.
@@ -304,24 +357,63 @@ impl BindlessPlan {
         let all = FRAME.swap(frame, Ordering::AcqRel) != frame;
         let fresh = self.copied_in.swap(frame, Ordering::AcqRel) == 0;
         let (bounces, reads) = match (all || cfg!(test), fresh) {
-            (true, _) => (&self.bounces, &self.reads),
+            (true, _) => (&*self.bounces, &*self.reads),
             (_, true) => (&self.fresh, &self.fresh_reads),
             _ => return &[],
         };
-        for &(cpu, address, len) in bounces {
+        if !bounces.is_empty() {
             let started = std::time::Instant::now();
+            let bytes: u64 = bounces.iter().map(|b| u64::from(b.2)).sum();
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
-                add(C::Copies, 1);
-                add(C::CopyBytes, u64::from(len));
+                add(C::Copies, bounces.len() as u64);
+                add(C::CopyBytes, bytes);
             }
-            crate::host::copy_mapped(cpu as *mut u8, address as *const u8, len as usize, false);
+            crate::host::in_parallel(bounces, 1024, copy_bounces);
             let us = started.elapsed().as_micros() as u64;
             crate::host::PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            crate::host::PREPARING[1].fetch_add(u64::from(len), Ordering::Relaxed);
+            crate::host::PREPARING[1].fetch_add(bytes, Ordering::Relaxed);
         }
         reads
+    }
+}
+
+/// Copies constant buffers (destination, title address, bytes), those near
+/// each other in title memory (as sorted lists have them) read at once.
+fn copy_bounces(list: &[(usize, u64, u32)]) {
+    const GAP: u64 = 4 << 10;
+    const RUN: u64 = 128 << 10;
+    let mut scratch = vec![0u8; RUN as usize];
+    let mut rest = list;
+    while let Some(&(_, first, len)) = rest.first() {
+        let mut end = first + u64::from(len);
+        let mut n = 1;
+        for &(_, a, l) in &rest[1..] {
+            let to = end.max(a + u64::from(l));
+            if a < first || a > end + GAP || to - first > RUN {
+                break;
+            }
+            end = to;
+            n += 1;
+        }
+        let (run, after) = rest.split_at(n);
+        rest = after;
+        let whole = (end - first) as usize;
+        let read = n > 1
+            && whole <= scratch.len()
+            && crate::host::read_into(first as *const u8, &mut scratch[..whole]);
+        for &(cpu, a, l) in run {
+            if read {
+                let from = &scratch[(a - first) as usize..][..l as usize];
+                // SAFETY: a bounce slice of at least `l` bytes, ours.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(from.as_ptr(), cpu as *mut u8, l as usize);
+                }
+            } else {
+                crate::host::copy_mapped(cpu as *mut u8, a as *const u8, l as usize, false);
+            }
+        }
     }
 }
 
@@ -1350,13 +1442,16 @@ impl HostHeap {
             let b = &mut *b;
             // Released views and evicted textures are looked for once a frame.
             let look = b.looked[0] != frame && b.checked != epochs;
+            let remake = b.full.1 && b.full.0 != frame;
             if b.dirty.is_empty()
                 && !look
+                && !remake
                 && let Some(plan) = &b.plan
             {
                 return Some(plan.clone());
             }
             if !look
+                && !remake
                 && b.budget()[0] == 0
                 && let Some(plan) = &b.plan
             {
@@ -1368,6 +1463,13 @@ impl HostHeap {
                 b.checked = epochs;
                 b.looked[0] = frame;
             }
+            let mapped = if viewed {
+                let (ranges, seen) = mapped_since(b.mapped_seen);
+                b.mapped_seen = seen;
+                ranges
+            } else {
+                Some(Vec::new())
+            };
             let mut remade: Vec<u32> = Vec::new();
             let mut dirty = BTreeSet::new();
             while dirty.len() < 4 * SLOT_CHUNK
@@ -1386,7 +1488,11 @@ impl HostHeap {
                 }
                 if evicted
                     || gone
-                    || viewed && u.unmapped && (u.placed.is_none() || (i + frame as u32) % 16 == 0)
+                    || viewed
+                        && u.unmapped
+                        && (cfg!(test)
+                            || (i + frame as u32).is_multiple_of(64)
+                            || mapped.as_ref().is_none_or(|m| meets(m, u.at)))
                 {
                     dirty.insert(i);
                 }
@@ -1459,9 +1565,27 @@ impl HostHeap {
         b.dirty.extend(todo.map(|(i, _)| i));
         BACKLOG[0].store(b.dirty.len() as u64, Ordering::Relaxed);
         BACKLOG[1].store(b.record_pending.len() as u64, Ordering::Relaxed);
-        if !made_any && let Some(plan) = &b.plan {
+        b.full.1 |= made_any;
+        let remake = b.full.1 && b.full.0 != frame || cfg!(test);
+        if !made_any && (!b.full.1 || !remake) && let Some(plan) = &b.plan {
             return Some(plan.clone());
         }
+        // All of it is copied by the first submission of a frame only: the
+        // later ones take what is new.
+        if !remake && let Some(plan) = &b.plan {
+            let plan = Arc::new(BindlessPlan {
+                reads: plan.reads.clone(),
+                writes: plan.writes.clone(),
+                bounces: plan.bounces.clone(),
+                fresh,
+                fresh_reads,
+                copied_in: AtomicU64::new(0),
+                _retained: plan._retained.clone(),
+            });
+            b.plan = Some(plan.clone());
+            return Some(plan);
+        }
+        b.full = (frame, false);
         let (mut reads, mut writes, mut bounces, mut retained) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         // What slots view is held by the slots, and for some frames after
@@ -1472,14 +1596,15 @@ impl HostHeap {
             bounces.extend(u.bounce);
             retained.extend(u.read.is_some().then(|| u.retained.clone()).flatten());
         }
+        bounces.sort_unstable_by_key(|b| b.1);
         let plan = Arc::new(BindlessPlan {
-            reads: merged(reads, READ_GAP),
-            writes: merged(writes, 0),
-            bounces,
+            reads: Arc::new(merged(reads, READ_GAP)),
+            writes: Arc::new(merged(writes, 0)),
+            bounces: Arc::new(bounces),
             fresh,
             fresh_reads,
             copied_in: AtomicU64::new(0),
-            _retained: retained,
+            _retained: Arc::new(retained),
         });
         b.plan = Some(plan.clone());
         Some(plan)
@@ -1497,10 +1622,11 @@ impl HostHeap {
         if !view.is_buffer() {
             return None;
         }
-        let unmapped = |view: &View| {
+        let unmapped = |view: &View, address: u64, len: u64| {
             self.set_unmapped_null(index, view);
             Some(SlotUse {
                 unmapped: true,
+                at: (address, address.saturating_add(len.max(1))),
                 ..SlotUse::default()
             })
         };
@@ -1510,7 +1636,7 @@ impl HostHeap {
             &View::Constant(address, size) => {
                 let capped = size.min(65_536);
                 if !valid_title_address(address, u64::from(capped)) {
-                    return unmapped(&view);
+                    return unmapped(&view, address, u64::from(capped));
                 }
                 let (mut reads, mut bounces) = (Vec::new(), Vec::new());
                 match self.materialize_bindless_cbv(
@@ -1522,7 +1648,7 @@ impl HostHeap {
                     &mut bounces,
                 ) {
                     Some(res) => slot.retained = Some(res),
-                    None => return unmapped(&view),
+                    None => return unmapped(&view, address, u64::from(capped)),
                 }
                 match reads.pop() {
                     Some((s, _, _)) if s.is_direct() => slot.direct = Some(s),
@@ -1548,6 +1674,7 @@ impl HostHeap {
                     self.set_unmapped_null(index, &view);
                     // Its pages may come later.
                     slot.unmapped = true;
+                    slot.at = (address, address + (4 << 20));
                 }
             }
             _ => {
@@ -1556,7 +1683,7 @@ impl HostHeap {
                     return Some(slot);
                 };
                 if !valid_title_address(address, len) {
-                    return unmapped(&view);
+                    return unmapped(&view, address, len);
                 }
                 slot.retained = self.ensure_buffer_slot(index, key, &view);
                 if let Some(shadow) = crate::shadow::find(address, len) {

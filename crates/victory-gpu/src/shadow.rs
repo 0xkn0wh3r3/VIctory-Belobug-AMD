@@ -866,11 +866,34 @@ pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<Arc<Shado
 /// tiles that were brought up to date. Reads of the others give zeros, where
 /// a copy ending too soon was a GPU page fault; and memory many buffers of
 /// the title overlap in is copied once.
+/// A quick hash for tile numbers.
+#[derive(Clone, Copy, Default)]
+struct Mix(u64);
+impl std::hash::BuildHasher for Mix {
+    type Hasher = Mix;
+    fn build_hasher(&self) -> Mix {
+        Mix(0)
+    }
+}
+impl std::hash::Hasher for Mix {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u32(u32::from(b));
+        }
+    }
+    fn write_u32(&mut self, x: u32) {
+        self.0 = (self.0.rotate_left(5) ^ u64::from(x)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
 struct Sparse {
     /// By tile: where the CPU writes it, and where it is in which heap.
-    tiles: Mutex<std::collections::HashMap<u32, Tile>>,
+    tiles: Mutex<std::collections::HashMap<u32, Tile, Mix>>,
     /// What tiles shaders write held before the submission.
-    before: Mutex<std::collections::HashMap<u32, Vec<u8>>>,
+    before: Mutex<std::collections::HashMap<u32, Vec<u8>, Mix>>,
     /// The same from other 64 KiB starts ([`Direct::aliases`]).
     aliases: Mutex<Vec<Arc<Shadow>>>,
     /// This is an alias of that one.

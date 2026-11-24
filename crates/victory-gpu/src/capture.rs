@@ -42,6 +42,7 @@ pub(crate) fn wanted(n: u64) -> bool {
         // `wantall` in the folder: the targets of a frame soon, once;
         // `want`: the next frame.
         if std::fs::remove_file(f.join("wantall")).is_ok() {
+            crate::resource::census_log();
             ASKED.store(n + 2, std::sync::atomic::Ordering::Relaxed);
         }
         n.is_power_of_two() || listed(n) || std::fs::remove_file(f.join("want")).is_ok()

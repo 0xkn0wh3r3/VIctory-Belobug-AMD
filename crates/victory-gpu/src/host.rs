@@ -2087,20 +2087,29 @@ impl Batch {
                 continue;
             };
             let reads = plan.copy_constants();
-            for (shadow, address, len) in reads {
-                #[cfg(feature = "diagnostics")]
-                {
-                    use crate::copystat::{C, add};
-                    add(C::Refreshes, 1);
-                    add(C::RefreshBytes, *len as u64);
-                }
-                update(shadow, *address, *len);
+            if !reads.is_empty() {
+                let started = std::time::Instant::now();
+                let copied = std::sync::atomic::AtomicU64::new(0);
+                in_parallel(reads, 8, |reads| {
+                    for (shadow, address, len) in reads {
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            use crate::copystat::{C, add};
+                            add(C::Refreshes, 1);
+                            add(C::RefreshBytes, *len as u64);
+                        }
+                        let n = shadow.update(*address, *len);
+                        copied.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                });
+                PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied.into_inner(), Ordering::Relaxed);
             }
             // shortcut: what shaders write through directly indexed slots into
             // copied memory stays in the copy (title memory used in place
             // needs no copy back); copying all of it back cost ~0.3 s a frame.
             if writes && cfg!(test) {
-                for (shadow, address, len) in &plan.writes {
+                for (shadow, address, len) in plan.writes.iter() {
                     if !self.bindless_writes.iter().any(|(s, a, l)| {
                         std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len)
                     }) {
@@ -2112,6 +2121,33 @@ impl Batch {
             self.plans.push(plan);
         }
     }
+}
+
+/// Runs `f` on pieces of `list`, of `least` items or more, on some threads.
+pub(crate) fn in_parallel<T: Sync>(list: &[T], least: usize, f: impl Fn(&[T]) + Sync) {
+    const THREADS: usize = 6;
+    if list.len() <= least {
+        return f(list);
+    }
+    // Small pieces, taken in turn: they are not equally long to do.
+    let piece = (list.len() / (THREADS * 8)).max(least);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let work = || {
+        loop {
+            let from = next.fetch_add(piece, Ordering::Relaxed);
+            if from >= list.len() {
+                break;
+            }
+            f(&list[from..(from + piece).min(list.len())]);
+        }
+    };
+    let threads = THREADS.min(list.len().div_ceil(piece));
+    std::thread::scope(|s| {
+        for _ in 1..threads {
+            s.spawn(work);
+        }
+        work();
+    });
 }
 
 /// Brings `[from, from + len)` of a host copy up to date now.

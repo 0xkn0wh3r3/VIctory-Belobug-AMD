@@ -843,6 +843,8 @@ pub(crate) struct HostTexture {
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// What the driver allocates for it (counted in [`crate::memstat`]).
     pub(crate) bytes: u64,
+    /// Its memory, if in a shared heap.
+    pub(crate) slot: Option<crate::texpool::Slot>,
 }
 
 #[cfg(windows)]
@@ -850,9 +852,43 @@ impl Drop for HostTexture {
     fn drop(&mut self) {
         crate::memstat::sub(&crate::memstat::HOST_TEXTURES, self.bytes);
         crate::memstat::sub(&crate::memstat::HOST_TEXTURE_COUNT, 1);
+        #[cfg(feature = "diagnostics")]
+        census(&self.texture, -(self.bytes as i64));
         // A submission recorded but not yet run may still name it.
-        crate::host::retire(self.texture.clone());
+        crate::host::retire((self.texture.clone(), self.slot.take()));
     }
+}
+
+/// Host textures by what they are: size, format, flags; count and bytes.
+#[cfg(all(windows, feature = "diagnostics"))]
+type Census = std::collections::HashMap<(u64, u32, u16, u16, i32, u32), (i64, i64)>;
+#[cfg(all(windows, feature = "diagnostics"))]
+static CENSUS: std::sync::LazyLock<std::sync::Mutex<Census>> =
+    std::sync::LazyLock::new(Default::default);
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn census(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, bytes: i64) {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let key = (d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.Format.0, d.Flags.0 as u32);
+    let mut all = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+    let e = all.entry(key).or_default();
+    e.0 += bytes.signum();
+    e.1 += bytes;
+}
+
+/// The kinds of host textures that take most (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn census_log() {
+    let all = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut v: Vec<_> = all.iter().collect();
+    v.sort_by_key(|(_, e)| -e.1);
+    for (k, e) in v.iter().take(40) {
+        tracing::info!("textures {k:?}: {} of {} MiB", e.0, e.1 >> 20);
+    }
+    let targets: i64 = v.iter().filter(|(k, _)| k.5 & 7 != 0).map(|(_, e)| e.1).sum();
+    let small: i64 = v.iter().filter(|(_, e)| e.1 / e.0.max(1) <= 65536).map(|(_, e)| e.1).sum();
+    tracing::info!("textures with target or write flags {} MiB, of 64 KiB each {} MiB", targets >> 20, small >> 20);
 }
 
 /// The driver's allocation size for `texture`.
@@ -909,7 +945,10 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Option<(
+    windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    Option<crate::texpool::Slot>,
+)> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -986,6 +1025,15 @@ fn host_texture(
             )
         }
     };
+    // SAFETY: the same fields (checked size).
+    let desc = unsafe { std::ptr::from_ref(&d).cast::<D3D12_RESOURCE_DESC>().read() };
+    let first = D3D12_RESOURCE_STATES(crate::host::legal_for(
+        d.flags,
+        crate::host::texture_state(state),
+    ) as i32);
+    if let Some((texture, slot)) = crate::texpool::place(&host.device, &desc, first) {
+        return Some((texture, Some(slot)));
+    }
     let mut made = create(&d, &mut texture);
     // Not every host GPU offers every use of every format (NVIDIA: no
     // unordered access to BGRA8, no B4G4R4A4 render targets, where the
@@ -1018,7 +1066,7 @@ fn host_texture(
             )
         });
     }
-    texture
+    texture.map(|t| (t, None))
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -1084,14 +1132,17 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: host.map(|texture| {
+        host: host.map(|(texture, slot)| {
             let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
             let bytes = allocation_bytes(&texture);
             crate::memstat::add(&crate::memstat::HOST_TEXTURES, bytes);
             crate::memstat::add(&crate::memstat::HOST_TEXTURE_COUNT, 1);
+            #[cfg(feature = "diagnostics")]
+            census(&texture, bytes as i64);
             std::sync::Arc::new(HostTexture {
                 texture,
                 bytes,
+                slot,
                 state: state.into(),
             })
         }),
