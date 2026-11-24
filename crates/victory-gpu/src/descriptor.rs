@@ -415,6 +415,23 @@ pub(crate) fn forget(resource: usize) {
     }
 }
 
+/// Of `entries` (slot, (view entry, generation)), those whose view went
+/// stale: one look at the views for all.
+#[cfg(windows)]
+fn stale_views(entries: &[(u32, (u32, u32))]) -> Vec<(u32, (u32, u32))> {
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    entries
+        .iter()
+        .filter(|(_, (i, generation))| {
+            views
+                .list
+                .get(*i as usize)
+                .is_none_or(|(_, current)| current != generation)
+        })
+        .copied()
+        .collect()
+}
+
 /// The view of entry `i` if `generation` is still its own.
 #[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {

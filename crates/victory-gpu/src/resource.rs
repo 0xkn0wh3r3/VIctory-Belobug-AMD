@@ -1158,6 +1158,17 @@ pub(crate) fn placed_epoch() -> u64 {
     PLACED_EPOCH.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// The placed textures alive now (resource objects).
+#[cfg(windows)]
+pub(crate) fn placed_live() -> std::collections::HashSet<usize> {
+    PLACED_TEXTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .map(|&(r, _)| r)
+        .collect()
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]

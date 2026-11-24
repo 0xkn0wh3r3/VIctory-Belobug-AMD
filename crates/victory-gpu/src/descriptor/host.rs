@@ -7,14 +7,14 @@
 //! `ResourceDescriptorHeap[]` draw or dispatch materializes and refreshes
 //! deferred buffer, constant-buffer, and placed-texture slots.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use super::{VIEW_TAG, View, view_at};
+use super::{VIEW_TAG, View, stale_views, view_at};
 use crate::host::host;
 
 pub(crate) struct HostHeap {
@@ -66,17 +66,64 @@ struct Bindless {
     cbv_bounce: HashMap<u32, BounceSlot>,
     /// Backing 256 KiB shared buffers `(resource, cpu_ptr, gpu_va, used_bytes)`.
     bounce_chunks: Vec<(ID3D12Resource, usize, u64, u64)>,
+    /// Slots written since the plan was made: only they are made again.
+    dirty: BTreeSet<u32>,
+    /// What each slot made for bindless access needs at submission.
+    uses: BTreeMap<u32, SlotUse>,
+    /// The released-view and placed-texture epochs `uses` was checked at.
+    checked: (u64, u64),
     /// What submissions do for the slots, until they or what they view change.
     plan: Option<Arc<BindlessPlan>>,
-    /// The placed-texture slots draws prepare at recording, likewise.
-    placed: Option<((u64, u64, u64), PlacedSlots)>,
+    /// The placed-texture slots draws prepare at recording, by revision.
+    placed: Option<(u64, PlacedSlots)>,
+    /// Placed-texture slots as last prepared at recording: view key,
+    /// placed-texture epoch, texture.
+    recorded: HashMap<u32, (u64, u64, usize)>,
+    /// Placed textures reached through slots, by resource object: the host
+    /// texture (held, so its address names it alone) and the frame last
+    /// uploaded.
+    uploaded: HashMap<usize, (ID3D12Resource, u64)>,
+    /// The placed-texture epoch `uploaded` was pruned at.
+    uploaded_epoch: u64,
+    /// A frame and the uploads of known textures done in it.
+    rechecks: (u64, u32),
+}
+
+/// What one bindless slot needs at submission.
+#[derive(Default)]
+struct SlotUse {
+    /// Title memory it reads (host copy, address, bytes).
+    read: Option<(Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// What shaders may write through it.
+    write: Option<(Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// A misaligned constant buffer: bounce slice, title address, bytes.
+    bounce: Option<(usize, u64, u32)>,
+    /// The host resource it views.
+    retained: Option<ID3D12Resource>,
+    /// It views a placed texture (made again when placed textures are evicted).
+    placed: bool,
+    /// It views unmapped memory (looked at again when memory is remapped).
+    unmapped: bool,
 }
 
 /// Bindless slots viewing placed textures: slot, view index and generation.
 type PlacedSlots = Arc<Vec<(u32, (u32, u32))>>;
 
+/// Placed textures reached only through bindless slots are uploaded when a
+/// slot first reaches them, and then looked at again (their memory hashed)
+/// at most this often, in frames, ...
+///
+/// shortcut: a texture the title rewrites in place without writing a slot
+/// shows its new contents up to this many frames late through bindless
+/// access (tables still upload what their draws read). Hashing all of them
+/// at each submission cost seconds per frame while the world streams in.
+const RECHECK_FRAMES: u64 = 60;
+/// ... and at most this many of them per frame.
+const RECHECKS: u32 = 8;
+
 /// Bumped when views go stale or title memory is mapped or unmapped: what
-/// bindless slots view may have changed though no slot was written.
+/// bindless slots view may have changed though no slot was written (their
+/// views' generations are checked, all at once, at the next submission).
 static VIEWED: AtomicU64 = AtomicU64::new(0);
 
 /// Bindless slots must be checked again: a resource their views name was
@@ -100,7 +147,6 @@ const READ_GAP: usize = 1 << 20;
 /// What a submission does for a heap's bindless slots, made again only when
 /// the slots or what they view change ([`HostHeap::bindless_plan`]).
 pub(crate) struct BindlessPlan {
-    key: (u64, u64, u64),
     /// Title memory the slots read, merged per host copy (address, bytes):
     /// refreshed at each submission using the heap.
     pub(crate) reads: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
@@ -380,13 +426,12 @@ impl HostHeap {
         self.count
     }
 
-    /// Current bindless slot, placed-texture, and viewed-memory epochs, for
-    /// caching what the slots need.
-    pub(crate) fn revision(&self) -> (u64, u64, u64) {
+    /// Current bindless slot and placed-texture epochs, for caching what
+    /// draws prepare at recording.
+    pub(crate) fn revision(&self) -> (u64, u64) {
         (
             self.revision.load(Ordering::Acquire),
             crate::resource::placed_epoch(),
-            VIEWED.load(Ordering::Acquire),
         )
     }
 
@@ -524,6 +569,7 @@ impl HostHeap {
     fn track_bindless(&self, index: u32, entry: (u32, u32)) {
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
         if b.slots.insert(index, entry) != Some(entry) {
+            b.dirty.insert(index);
             if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
                 bounce.active = false;
             }
@@ -534,6 +580,7 @@ impl HostHeap {
     fn untrack_bindless(&self, index: u32) {
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
         if b.slots.remove(&index).is_some() {
+            b.dirty.insert(index);
             if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
                 bounce.active = false;
             }
@@ -726,46 +773,53 @@ impl HostHeap {
     }
 
     /// At draw/dispatch recording time: materializes any placed streamed
-    /// textures in the heap and records their upload and state transition on
-    /// `list`. Buffer and constant-buffer views are materialized and refreshed
-    /// at submission from [`HostHeap::bindless_plan`].
+    /// textures in the heap and records their upload (when due, see
+    /// [`RECHECK_FRAMES`]) and state transition on `list`. Buffer and
+    /// constant-buffer views are materialized and refreshed at submission
+    /// from [`HostHeap::bindless_plan`].
     pub(crate) fn prepare_bindless_record(&self, list: &crate::host::HostList) {
-        use windows::core::Interface;
         if self.sampler {
             return;
         }
+        let started = std::time::Instant::now();
         let entries = self.placed_slots();
+        let epoch = crate::resource::placed_epoch();
+        let frame = crate::queue::presented();
+        self.prune_uploaded(epoch);
         let mut stale = Vec::new();
         for &(index, (vi, generation)) in entries.iter() {
-            let Some(view) = view_at(vi, generation) else {
-                self.clear_stale_slot(index);
-                stale.push(index);
-                continue;
-            };
-            let View::Placed(false, resource, desc) = &view else {
-                continue;
-            };
-            const BUFFER: u32 = 1;
-            if resource[0] == BUFFER {
-                continue;
-            }
-            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-            if !valid_title_address(address, 1) {
-                self.set_unmapped_null(index, &view);
-                continue;
-            }
-            let Some(shader_view @ View::Shader(tex_res, _)) = placed_texture(&view) else {
-                self.set_unmapped_null(index, &view);
-                continue;
-            };
-            let tex_this = tex_res as crate::object::This;
-            let Some(host_tex) = crate::resource::host_resource(tex_this) else {
-                self.set_unmapped_null(index, &view);
-                continue;
-            };
             let key = u64::from(generation) << 32 | u64::from(vi);
-            self.ensure_placed_slot(index, key, &shader_view, host_tex.as_raw());
-            if crate::texture::title_written(host_tex) {
+            let known = self
+                .bindless
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .recorded
+                .get(&index)
+                .filter(|&&(k, e, _)| (k, e) == (key, epoch))
+                .map(|&(_, _, t)| t);
+            let tex_this = match known {
+                Some(t) => t as crate::object::This,
+                None => match self.resolve_placed(index, vi, generation) {
+                    Ok(Some(t)) => {
+                        self.bindless
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .recorded
+                            .insert(index, (key, epoch, t as usize));
+                        t
+                    }
+                    Ok(None) => continue,
+                    Err(()) => {
+                        stale.push(index);
+                        continue;
+                    }
+                },
+            };
+            let Some(host_tex) = crate::resource::host_resource(tex_this) else {
+                continue;
+            };
+            if crate::texture::title_written(host_tex) && self.upload_due(tex_this, host_tex, frame)
+            {
                 crate::texture::upload(list, tex_this, host_tex);
             }
             const SHADER_RESOURCE: u32 = 0x40 | 0x80;
@@ -774,6 +828,7 @@ impl HostHeap {
         if !stale.is_empty() {
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
             for idx in stale {
+                b.recorded.remove(&idx);
                 if b.slots.remove(&idx).is_some()
                     && let Some(bounce) = b.cbv_bounce.get_mut(&idx)
                 {
@@ -781,12 +836,99 @@ impl HostHeap {
                 }
             }
         }
+        crate::host::BINDLESS_US[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// The placed texture slot `index` views, made in the slot: `Err` if the
+    /// view went stale, `None` if it is not a placed texture or cannot be made
+    /// (the slot is then null).
+    fn resolve_placed(
+        &self,
+        index: u32,
+        vi: u32,
+        generation: u32,
+    ) -> Result<Option<crate::object::This>, ()> {
+        use windows::core::Interface;
+        let Some(view) = view_at(vi, generation) else {
+            self.clear_stale_slot(index);
+            return Err(());
+        };
+        let View::Placed(false, resource, desc) = &view else {
+            return Ok(None);
+        };
+        const BUFFER: u32 = 1;
+        if resource[0] == BUFFER {
+            return Ok(None);
+        }
+        let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+        if !valid_title_address(address, 1) {
+            self.set_unmapped_null(index, &view);
+            return Ok(None);
+        }
+        let Some(shader_view @ View::Shader(tex_res, _)) = placed_texture(&view) else {
+            self.set_unmapped_null(index, &view);
+            return Ok(None);
+        };
+        let tex_this = tex_res as crate::object::This;
+        let Some(host_tex) = crate::resource::host_resource(tex_this) else {
+            self.set_unmapped_null(index, &view);
+            return Ok(None);
+        };
+        let key = u64::from(generation) << 32 | u64::from(vi);
+        self.ensure_placed_slot(index, key, &shader_view, host_tex.as_raw());
+        Ok(Some(tex_this))
+    }
+
+    /// Whether to upload placed texture `texture` (reached through a slot)
+    /// in a list recorded in `frame`: the first time, then as
+    /// [`RECHECK_FRAMES`] allows.
+    fn upload_due(&self, texture: crate::object::This, host: &ID3D12Resource, frame: u64) -> bool {
+        use windows::core::Interface;
+        let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+        let b = &mut *b;
+        let due = match b.uploaded.get(&(texture as usize)) {
+            None => true,
+            // Another texture at the object's address.
+            Some((h, _)) if h.as_raw() != host.as_raw() => true,
+            Some((_, last)) if frame >= last + RECHECK_FRAMES => {
+                if b.rechecks.0 != frame {
+                    b.rechecks = (frame, 0);
+                }
+                b.rechecks.1 += 1;
+                b.rechecks.1 <= RECHECKS
+            }
+            Some(_) => false,
+        };
+        if due {
+            b.uploaded
+                .insert(texture as usize, (host.clone(), frame));
+        }
+        due
+    }
+
+    /// After placed textures were evicted: forgets uploads of textures
+    /// that are gone (their objects' addresses may name new ones).
+    fn prune_uploaded(&self, epoch: u64) {
+        {
+            let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+            if b.uploaded_epoch == epoch {
+                return;
+            }
+            if b.uploaded.is_empty() {
+                b.uploaded_epoch = epoch;
+                return;
+            }
+        }
+        let live = crate::resource::placed_live();
+        let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+        b.uploaded.retain(|t, _| live.contains(t));
+        b.uploaded_epoch = epoch;
     }
 
     /// The slots viewing placed textures (not buffers), which draws prepare
     /// as they are recorded; found again only when the slots change.
     fn placed_slots(&self) -> PlacedSlots {
-        let key = self.revision();
+        let key = self.revision.load(Ordering::Acquire);
         let entries: Vec<(u32, (u32, u32))> = {
             let b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((k, placed)) = &b.placed
@@ -813,137 +955,185 @@ impl HostHeap {
         placed
     }
 
-    /// At submission: what the heap's bindless slots need. Made again (slots
-    /// materialized, stale ones pruned, ranges found and merged) only when a
-    /// slot was written or what slots view changed; otherwise the last plan,
-    /// whose reads the caller refreshes, which costs little when the title
-    /// changed nothing.
+    /// At submission: what the heap's bindless slots need. Only slots
+    /// written since the last plan are made again; released views are found
+    /// by one look at all slots' generations, and slots of evicted placed
+    /// textures (or unmapped memory, once remapped) are made again. With
+    /// nothing changed it is the last plan, whose reads the caller
+    /// refreshes, which costs little when the title changed nothing.
     pub(crate) fn bindless_plan(&self) -> Option<Arc<BindlessPlan>> {
         if self.sampler {
             return None;
         }
-        let key = self.revision();
-        let entries: Vec<(u32, (u32, u32))> = {
-            let b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(plan) = &b.plan
-                && plan.key == key
+        let epochs = (
+            VIEWED.load(Ordering::Acquire),
+            crate::resource::placed_epoch(),
+        );
+        let (mut todo, check) = {
+            let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+            let b = &mut *b;
+            if b.dirty.is_empty()
+                && b.checked == epochs
+                && let Some(plan) = &b.plan
             {
                 return Some(plan.clone());
             }
-            if b.slots.is_empty() {
-                return None;
+            let (viewed, placed) = (b.checked.0 != epochs.0, b.checked.1 != epochs.1);
+            b.checked = epochs;
+            let mut dirty = std::mem::take(&mut b.dirty);
+            for (&i, u) in &b.uses {
+                if placed && u.placed || viewed && u.unmapped {
+                    dirty.insert(i);
+                }
             }
-            b.slots.iter().map(|(&idx, &v)| (idx, v)).collect()
+            let check: Vec<(u32, (u32, u32))> = if viewed {
+                b.slots
+                    .iter()
+                    .filter(|(i, _)| !dirty.contains(i))
+                    .map(|(&i, &v)| (i, v))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let todo: Vec<(u32, Option<(u32, u32)>)> = dirty
+                .into_iter()
+                .map(|i| (i, b.slots.get(&i).copied()))
+                .collect();
+            (todo, check)
         };
-        let plan = Arc::new(self.make_plan(key, entries));
-        self.bindless.lock().unwrap_or_else(|e| e.into_inner()).plan = Some(plan.clone());
+        todo.extend(stale_views(&check).into_iter().map(|(i, v)| (i, Some(v))));
+        for (index, entry) in todo {
+            let made = entry.map(|e| (e, self.use_slot(index, e)));
+            let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+            match made {
+                None => {
+                    b.uses.remove(&index);
+                }
+                Some((_, Some(u))) => {
+                    b.uses.insert(index, u);
+                }
+                Some((e, None)) => {
+                    b.uses.remove(&index);
+                    b.recorded.remove(&index);
+                    if b.slots.get(&index) == Some(&e) {
+                        b.slots.remove(&index);
+                        if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
+                            bounce.active = false;
+                        }
+                    }
+                }
+            }
+        }
+        let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut reads, mut writes, mut bounces, mut retained) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for u in b.uses.values() {
+            reads.extend(u.read.clone());
+            writes.extend(u.write.clone());
+            bounces.extend(u.bounce);
+            retained.extend(u.retained.clone());
+        }
+        let plan = Arc::new(BindlessPlan {
+            reads: merged(reads, READ_GAP),
+            writes: merged(writes, 0),
+            bounces,
+            _retained: retained,
+        });
+        b.plan = Some(plan.clone());
         Some(plan)
     }
 
-    /// Materializes the bindless slots `entries` and finds what they read
-    /// and write.
-    fn make_plan(&self, key: (u64, u64, u64), entries: Vec<(u32, (u32, u32))>) -> BindlessPlan {
+    /// Materializes bindless slot `index` from its view `(vi, generation)`
+    /// and finds what it reads and writes; `None` if the slot is no longer
+    /// one for bindless access (its view went stale, or is not of a buffer).
+    fn use_slot(&self, index: u32, (vi, generation): (u32, u32)) -> Option<SlotUse> {
         use windows::core::Interface;
-        let (mut reads, mut writes, mut bounces) = (Vec::new(), Vec::new(), Vec::new());
-        let mut retained = Vec::new();
-        let mut stale = Vec::new();
-        for (index, (vi, generation)) in entries {
-            let Some(view) = view_at(vi, generation) else {
-                self.clear_stale_slot(index);
-                stale.push(index);
-                continue;
-            };
-            if !view.is_buffer() {
-                stale.push(index);
-                continue;
+        let Some(view) = view_at(vi, generation) else {
+            self.clear_stale_slot(index);
+            return None;
+        };
+        if !view.is_buffer() {
+            return None;
+        }
+        let unmapped = |view: &View| {
+            self.set_unmapped_null(index, view);
+            Some(SlotUse {
+                unmapped: true,
+                ..SlotUse::default()
+            })
+        };
+        let key = u64::from(generation) << 32 | u64::from(vi);
+        let mut slot = SlotUse::default();
+        match &view {
+            &View::Constant(address, size) => {
+                let capped = size.min(65_536);
+                if !valid_title_address(address, u64::from(capped)) {
+                    return unmapped(&view);
+                }
+                let (mut reads, mut bounces) = (Vec::new(), Vec::new());
+                match self.materialize_bindless_cbv(
+                    index,
+                    key,
+                    address,
+                    capped,
+                    &mut reads,
+                    &mut bounces,
+                ) {
+                    Some(res) => slot.retained = Some(res),
+                    None => return unmapped(&view),
+                }
+                slot.read = reads.pop();
+                slot.bounce = bounces.pop();
             }
-            let key = u64::from(generation) << 32 | u64::from(vi);
-            match &view {
-                &View::Constant(address, size) => {
-                    let capped = size.min(65_536);
-                    if !valid_title_address(address, u64::from(capped)) {
-                        self.set_unmapped_null(index, &view);
-                        continue;
-                    }
-                    match self.materialize_bindless_cbv(
-                        index,
-                        key,
-                        address,
-                        capped,
-                        &mut reads,
-                        &mut bounces,
-                    ) {
-                        Some(res) => retained.push(res),
-                        None => self.set_unmapped_null(index, &view),
-                    }
+            View::Placed(false, resource, desc) if resource[0] != 1 => {
+                slot.placed = true;
+                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                if !valid_title_address(address, 1) {
+                    self.set_unmapped_null(index, &view);
+                    slot.unmapped = true;
+                    return Some(slot);
                 }
-                View::Placed(false, resource, desc) if resource[0] != 1 => {
-                    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                    if !valid_title_address(address, 1) {
-                        self.set_unmapped_null(index, &view);
-                        continue;
-                    }
-                    if let Some(shader_view @ View::Shader(tex_res, _)) = placed_texture(&view)
-                        && let Some(host_tex) =
-                            crate::resource::host_resource(tex_res as crate::object::This)
-                    {
-                        self.ensure_placed_slot(index, key, &shader_view, host_tex.as_raw());
-                        retained.push(host_tex.clone());
-                    } else {
-                        self.set_unmapped_null(index, &view);
-                    }
+                if let Some(shader_view @ View::Shader(tex_res, _)) = placed_texture(&view)
+                    && let Some(host_tex) =
+                        crate::resource::host_resource(tex_res as crate::object::This)
+                {
+                    self.ensure_placed_slot(index, key, &shader_view, host_tex.as_raw());
+                    slot.retained = Some(host_tex.clone());
+                } else {
+                    self.set_unmapped_null(index, &view);
                 }
-                _ => {
-                    let Some((address, len)) = buffer_range(&view) else {
-                        self.set_unmapped_null(index, &view);
-                        continue;
-                    };
-                    if !valid_title_address(address, len) {
-                        self.set_unmapped_null(index, &view);
-                        continue;
-                    }
-                    if let Some(r) = self.ensure_buffer_slot(index, key, &view) {
-                        retained.push(r);
-                    }
-                    if let Some(shadow) = crate::shadow::find(address, len) {
-                        let clamped = len.min(shadow.left(address)) as usize;
-                        if clamped > 0 {
-                            reads.push((shadow.clone(), address as usize, clamped));
-                            if matches!(view, View::Unordered(..) | View::Placed(true, ..)) {
-                                if clamped <= WRITE_CAP {
-                                    writes.push((shadow, address as usize, clamped));
-                                } else {
-                                    static ONCE: std::sync::Once = std::sync::Once::new();
-                                    ONCE.call_once(|| {
-                                        tracing::warn!(
-                                            bytes = clamped,
-                                            "a bindless unordered access view too big to copy back"
-                                        );
-                                    });
-                                }
+            }
+            _ => {
+                let Some((address, len)) = buffer_range(&view) else {
+                    self.set_unmapped_null(index, &view);
+                    return Some(slot);
+                };
+                if !valid_title_address(address, len) {
+                    return unmapped(&view);
+                }
+                slot.retained = self.ensure_buffer_slot(index, key, &view);
+                if let Some(shadow) = crate::shadow::find(address, len) {
+                    let clamped = len.min(shadow.left(address)) as usize;
+                    if clamped > 0 {
+                        slot.read = Some((shadow.clone(), address as usize, clamped));
+                        if matches!(view, View::Unordered(..) | View::Placed(true, ..)) {
+                            if clamped <= WRITE_CAP {
+                                slot.write = Some((shadow, address as usize, clamped));
+                            } else {
+                                static ONCE: std::sync::Once = std::sync::Once::new();
+                                ONCE.call_once(|| {
+                                    tracing::warn!(
+                                        bytes = clamped,
+                                        "a bindless unordered access view too big to copy back"
+                                    );
+                                });
                             }
                         }
                     }
                 }
             }
         }
-        if !stale.is_empty() {
-            let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-            for idx in stale {
-                if b.slots.remove(&idx).is_some()
-                    && let Some(bounce) = b.cbv_bounce.get_mut(&idx)
-                {
-                    bounce.active = false;
-                }
-            }
-        }
-        BindlessPlan {
-            key,
-            reads: merged(reads, READ_GAP),
-            writes: merged(writes, 0),
-            bounces,
-            _retained: retained,
-        }
+        Some(slot)
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -1915,6 +2105,8 @@ void main() {
         });
         assert!(reused, "unchanged slots reuse the plan");
 
+        // Slot 0 marked unmade: were it made again, it would be made anew.
+        host_heap.made.lock().unwrap()[0] = 0;
         cbv(mem.address() + 0x1000, 1);
         let second = host_heap.bindless_plan().unwrap();
         assert!(
@@ -1924,9 +2116,47 @@ void main() {
         assert_eq!(second.reads.len(), 1, "nearby reads merge");
         assert_eq!(second.reads[0].1, mem.address() as usize);
         assert_eq!(second.reads[0].2, 0x1100);
+        assert_eq!(
+            host_heap.made.lock().unwrap()[0],
+            0,
+            "only the written slot is made again"
+        );
+        assert_ne!(host_heap.made.lock().unwrap()[1], 0);
 
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(title_heap), 0);
+    }
+
+    /// Placed textures reached through slots upload the first time, then
+    /// only after [`RECHECK_FRAMES`] (a few per frame), or when another
+    /// texture takes the object's address.
+    #[test]
+    fn bindless_texture_uploads_are_throttled() {
+        let Some(host) = host() else {
+            return;
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let (a, _) = host.shared_buffer(1 << 16).unwrap();
+        let (b, _) = host.shared_buffer(1 << 16).unwrap();
+        let tex = 0x1000 as crate::object::This;
+        assert!(heap.upload_due(tex, &a, 10), "first reach uploads");
+        assert!(!heap.upload_due(tex, &a, 10));
+        assert!(!heap.upload_due(tex, &a, 10 + RECHECK_FRAMES - 1));
+        assert!(heap.upload_due(tex, &b, 11), "a new texture at the address");
+        assert!(heap.upload_due(tex, &b, 11 + RECHECK_FRAMES), "looked at again");
+        // At most `RECHECKS` known textures per frame.
+        let frame = 1000;
+        let many: Vec<_> = (0..2 * RECHECKS as usize)
+            .map(|i| {
+                let t = (0x2000 + i) as crate::object::This;
+                assert!(heap.upload_due(t, &a, 0));
+                t
+            })
+            .collect();
+        let again = many.iter().filter(|&&t| heap.upload_due(t, &a, frame)).count();
+        assert_eq!(again, RECHECKS as usize);
     }
 
     /// A list queues each heap once, keeping whether any draw may write.

@@ -73,6 +73,12 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
 static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// Bindless heaps' slots made ready (microseconds), since the last
+/// frame-rate line: plans at submission (part of the preparing), and
+/// placed textures as draws are recorded.
+pub(crate) static BINDLESS_US: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
 /// refreshes (microseconds, bytes hashed), since the last frame-rate line.
 pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
@@ -1354,7 +1360,10 @@ impl Batch {
     fn prepare_bindless(&mut self) {
         self.flush();
         for (heap, writes) in std::mem::take(&mut self.bindless) {
-            let Some(plan) = heap.bindless_plan() else {
+            let started = std::time::Instant::now();
+            let plan = heap.bindless_plan();
+            BINDLESS_US[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let Some(plan) = plan else {
                 continue;
             };
             plan.copy_constants();
@@ -1622,6 +1631,8 @@ impl Meter {
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
+        let [plans_ms, records_ms] =
+            [0, 1].map(|i| BINDLESS_US[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         // Over the same frames as the counts above.
@@ -1631,8 +1642,9 @@ impl Meter {
             self.logged = std::time::Instant::now();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
-                 {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
-                 GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
+                 {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB, bindless plans \
+                 {plans_ms:.1} ms; {gpu:.1} on the GPU; {back_ms:.1} copying back {back_mb:.1} MB; \
+                 bindless records {records_ms:.1} ms), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect",
                 making = crate::pipeline::making()
