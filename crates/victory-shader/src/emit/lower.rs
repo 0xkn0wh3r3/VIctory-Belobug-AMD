@@ -349,6 +349,11 @@ const LANE_MASK: Why = "a lane mask read as data";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
+/// Samples whose level comes from derivatives across each quad of lanes.
+fn implicit_derivatives(name: &str) -> bool {
+    sample_form(name).is_some_and(|f| !f.gather && !f.c && !f.d && !f.l && !f.lz)
+}
+
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let ops: Vec<&Operand> = match &i.fields {
@@ -698,6 +703,7 @@ impl<'a> Lower<'a> {
                     || n.contains("permute")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                    || implicit_derivatives(n)
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
                     || numeric_selects && numeric_select(x.st, i)
@@ -2800,6 +2806,41 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Coarse derivatives of `coords` across this lane's quad, as DXIL
+    /// gradients (x for up to three coordinates, then y), each times
+    /// `scale` if given.
+    fn quad_gradients(&mut self, coords: &[V], scale: Option<V>) -> Vec<V> {
+        let c = self.cur;
+        let lane = self.lane_index();
+        let top = self.s.m.i32(!3);
+        let base = self.s.m.bin(c, Bin::And, lane, top);
+        let lanes: Vec<V> = (1..3u32)
+            .map(|k| {
+                let k = self.s.m.i32(k);
+                self.s.m.bin(c, Bin::Or, base, k)
+            })
+            .collect();
+        let fu = self.s.m.undef(self.s.t.f32);
+        let mut g = vec![fu; 6];
+        for (k, &x) in coords.iter().enumerate().take(3) {
+            let xi = self.as_int(x);
+            let at = |l: &mut Self, lane: V| {
+                let r = l.read_lane(xi, lane);
+                l.as_float(r)
+            };
+            let origin = at(self, base);
+            for (d, &lane) in lanes.iter().enumerate() {
+                let there = at(self, lane);
+                let mut diff = self.s.m.bin(c, Bin::Sub, there, origin);
+                if let Some(s) = scale {
+                    diff = self.s.m.bin(c, Bin::Mul, diff, s);
+                }
+                g[3 * d + k] = diff;
+            }
+        }
+        g
+    }
+
     /// The float value of a register value.
     fn float_of(&mut self, v: Value) -> Result<V, Why> {
         if let Some(&f) = self.floats.get(&v) {
@@ -4142,6 +4183,72 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Two scalar loads of the same dwords: same opcode and immediate
+    /// offset, base read from the same values, and the same or an
+    /// equivalent register offset.
+    fn twin_loads(&self, a: Site, b: Site) -> bool {
+        let (ia, ib): (&Inst, &Inst) = (
+            &self.x.p.blocks[a.0].insts[a.1],
+            &self.x.p.blocks[b.0].insts[b.1],
+        );
+        let (
+            Fields::Smem {
+                base: Operand::Scalar { code: ba, .. },
+                offset: oa,
+                soffset: sa,
+                ..
+            },
+            Fields::Smem {
+                base: Operand::Scalar { code: bb, .. },
+                offset: ob,
+                soffset: sb,
+                ..
+            },
+        ) = (&ia.fields, &ib.fields)
+        else {
+            return false;
+        };
+        let same_base = (0..2).all(|k| {
+            let va = ia.read(Reg::S(ba + k));
+            va.is_some() && va == ib.read(Reg::S(bb + k))
+        });
+        let same_soffset = match (sa, sb) {
+            (Operand::Scalar { code: NULL, .. }, Operand::Scalar { code: NULL, .. }) => true,
+            (Operand::Scalar { code: ca, .. }, Operand::Scalar { code: cb, .. }) => {
+                match (ia.read(Reg::S(*ca)), ib.read(Reg::S(*cb))) {
+                    (Some(x), Some(y)) => self.same_scalar(x, y),
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        ia.name() == ib.name() && oa == ob && same_base && same_soffset
+    }
+
+    /// The same value, or two `v_readfirstlane_b32` of the same VGPR value
+    /// (each waterfall loop reads the index anew).
+    fn same_scalar(&self, x: Value, y: Value) -> bool {
+        if x == y {
+            return true;
+        }
+        let first_lane_of = |v: Value| {
+            self.x
+                .p
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .find(|i| i.writes.iter().any(|w| w.1 == v))
+                .filter(|i| i.name() == "v_readfirstlane_b32")
+                .and_then(|i| {
+                    i.reads
+                        .iter()
+                        .find(|r| matches!(r.0, Reg::V(_)))
+                        .map(|r| r.1)
+                })
+        };
+        matches!((first_lane_of(x), first_lane_of(y)), (Some(a), Some(b)) if a == b)
+    }
+
     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
     /// the code also reads as numbers: the console compiler computes sizes
     /// from descriptor bits (an image's width, height, depth, levels; a
@@ -4192,8 +4299,12 @@ impl<'a> Lower<'a> {
                     if (load == site) != own {
                         continue;
                     }
+                    // A twin load of the same dwords (a non-uniform index
+                    // reloads the descriptor in each waterfall loop, one for
+                    // the size bits, another for the access) is at skew 0.
                     let Some(skew) = self
                         .load_skew(inst, site, load)
+                        .or_else(|| (!own && self.twin_loads(site, load)).then_some(0))
                         .map(|s| s - i32::from(first))
                     else {
                         continue;
@@ -4212,59 +4323,77 @@ impl<'a> Lower<'a> {
             best
         };
         let use_at = find(true).or_else(|| find(false));
-        let Some((at, load, first, skew)) = use_at else {
-            return Err("a descriptor read only as data");
-        };
-        let src = Source::Loaded { load, first };
-        let used = self.used_kind(&src);
-        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
-        let un = ui.name();
-        let uav = un.contains("store")
-            || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
-            Fields::Image { dim, .. } => {
-                let kind = match dim {
-                    0 => 1,
-                    1 => 2,
-                    2 => 4,
-                    3 => 5,
-                    4 => 6,
-                    5 => 7,
-                    _ => return Err("an image dimension (MSAA)"),
-                };
-                ((kind | u, 0x409), Some(kind))
-            }
-            Fields::Buffer { idxen, format, .. } => {
-                let stride = used.map_or(0, |u| u.stride);
-                let props = if un.starts_with("buffer_load_format")
-                    || un.starts_with("buffer_store_format")
-                {
-                    (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
-                } else {
-                    (11 | u, 0)
-                };
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    return Err("a constant buffer's descriptor read as data");
+        let (load, skew, src, props, image, uav) = if let Some((at, load, first, skew)) = use_at {
+            let src = Source::Loaded { load, first };
+            let used = self.used_kind(&src);
+            let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
+            let un = ui.name();
+            let uav = un.contains("store")
+                || un.contains("atomic")
+                || used.is_some_and(|u| u.kind == ResourceType::Uav);
+            let u = if uav { 0x1000 } else { 0 };
+            let (props, image) = match &ui.fields {
+                Fields::Image { dim, .. } => {
+                    let kind = match dim {
+                        0 => 1,
+                        1 => 2,
+                        2 => 4,
+                        3 => 5,
+                        4 => 6,
+                        5 => 7,
+                        _ => return Err("an image dimension (MSAA)"),
+                    };
+                    ((kind | u, 0x409), Some(kind))
                 }
-                (props, None)
-            }
-            Fields::Smem { .. } if un.starts_with("s_buffer_") => {
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    return Err("a constant buffer's descriptor read as data");
+                Fields::Buffer { idxen, format, .. } => {
+                    let stride = used.map_or(0, |u| u.stride);
+                    let props = if un.starts_with("buffer_load_format")
+                        || un.starts_with("buffer_store_format")
+                    {
+                        (10 | u, 0x409)
+                    } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4)
+                    {
+                        (12 | u, stride)
+                    } else {
+                        (11 | u, 0)
+                    };
+                    if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                        return Err("a constant buffer's descriptor read as data");
+                    }
+                    (props, None)
                 }
-                let stride = used.map_or(0, |u| u.stride);
-                let props = if stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
-                } else {
-                    (11 | u, 0)
-                };
-                (props, None)
+                Fields::Smem { .. } if un.starts_with("s_buffer_") => {
+                    if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                        return Err("a constant buffer's descriptor read as data");
+                    }
+                    let stride = used.map_or(0, |u| u.stride);
+                    let props = if stride >= 4 && stride.is_multiple_of(4) {
+                        (12 | u, stride)
+                    } else {
+                        (11 | u, 0)
+                    };
+                    (props, None)
+                }
+                _ => return Err("a scalar memory read as data"),
+            };
+            (load, skew, src, props, image, uav)
+        } else {
+            // An image the program only measures (it reads the size bits and
+            // samples the image in other programs): eight dwords are an image
+            // descriptor, taken here as a 2D texture.
+            // shortcut: a 3D or array image would report depth or layers 1.
+            let src = Source::Loaded {
+                load: site,
+                first: 0,
+            };
+            if count != 8
+                || self
+                    .used_kind(&src)
+                    .is_some_and(|u| u.kind != ResourceType::Srv)
+            {
+                return Err("a descriptor read only as data");
             }
-            _ => return Err("a scalar memory read as data"),
+            (site, 0, src, (2, 0x409), Some(2), false)
         };
         // The handle is built from this load's own address (the other
         // load's registers need not hold it here): the descriptor starts
@@ -8002,6 +8131,33 @@ impl<'a> Lower<'a> {
             let mut args = vec![h, sh];
             args.extend(&cs);
             match op {
+                60 | 61 if !self.s.pixel => {
+                    // Outside pixel shaders the console still takes the level
+                    // from each quad of lanes (lane 1 minus lane 0 across,
+                    // lane 2 minus lane 0 down); DXIL before validator 1.8
+                    // has no implicit derivatives there, so the quad's
+                    // differences become explicit gradients. A bias scales
+                    // them by 2^bias, the same level for isotropic filtering.
+                    self.cross_lane(true)?;
+                    let scale = if op == 61 {
+                        let bias = float(self, bias_at)?;
+                        Some(self.unary(21, bias))
+                    } else {
+                        None
+                    };
+                    let g = self.quad_gradients(&cs[..spatial], scale);
+                    args.extend(&os);
+                    args.extend(g);
+                    args.push(clamp);
+                    self.s.op(
+                        c,
+                        "sampleGrad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        63,
+                        &args,
+                    )
+                }
                 60 => {
                     args.extend(&os);
                     args.push(clamp);
@@ -9176,6 +9332,29 @@ impl<'a> Lower<'a> {
         e
     }
 
+    /// A dword a scalar load writes, where the load is a descriptor the
+    /// program uses as a resource or sampler.
+    fn descriptor_dword(&self, v: Value) -> bool {
+        let Some(load) = self.x.p.blocks.iter().enumerate().find_map(|(b, block)| {
+            block
+                .insts
+                .iter()
+                .position(|i| i.writes.iter().any(|w| w.1 == v))
+                .map(|i| (b, i))
+        }) else {
+            return false;
+        };
+        self.x.p.blocks[load.0].insts[load.1]
+            .name()
+            .starts_with("s_load_dword")
+            && self.x.res.descriptors.iter().any(|d| {
+                d.source
+                    .leaves()
+                    .iter()
+                    .any(|l| matches!(l, Source::Loaded { load: at, .. } if *at == load))
+            })
+    }
+
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
@@ -9215,6 +9394,17 @@ impl<'a> Lower<'a> {
                     }
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
+                    }
+                    // A descriptor's dwords reaching a join that also takes
+                    // data (the registers are reused after the last access).
+                    // shortcut: undefined on that edge, assuming the program
+                    // reads the joined value only after the data edge.
+                    (Some(Val::Missing(_)), _) if self.descriptor_dword(arg) => {
+                        if bit {
+                            self.s.m.undef(self.s.t.i1)
+                        } else {
+                            self.s.m.undef(self.s.t.i32)
+                        }
                     }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, why));
