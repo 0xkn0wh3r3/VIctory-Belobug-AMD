@@ -37,6 +37,9 @@ impl Op {
     fn of(name: &str) -> Option<Op> {
         Some(match name {
             "v_add_nc_u32" => Op::AddU,
+            // shortcut: 64-bit sums as two dwords: the low ones are taken not
+            // to pass 32 bits (they are counts).
+            "v_add_co_u32" | "v_add_co_ci_u32" => Op::AddU,
             "v_add_f32" => Op::AddF,
             "v_min_u32" => Op::MinU,
             "v_max_u32" => Op::MaxU,
