@@ -1343,6 +1343,7 @@ impl HostHeap {
             };
             if crate::texture::title_written(host_tex) && self.upload_due(texture, host_tex, frame)
             {
+                crate::texture::upload_first(texture, host_tex);
                 crate::texture::upload(list, texture, host_tex);
             }
             const SHADER_RESOURCE: u32 = 0x40 | 0x80;
@@ -1690,6 +1691,9 @@ impl HostHeap {
                     && let Some(host_tex) =
                         crate::resource::host_resource(tex_res as crate::object::This)
                 {
+                    if crate::texture::title_written(host_tex) {
+                        crate::texture::upload_first(tex_res as crate::object::This, host_tex);
+                    }
                     self.ensure_placed_slot(index, key, &shader_view, host_tex.as_raw());
                     slot.placed = Some(tex_res);
                     slot.retained = Some(host_tex.clone());

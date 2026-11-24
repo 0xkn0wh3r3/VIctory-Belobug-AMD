@@ -200,6 +200,33 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
     unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
 }
 
+/// Textures a bindless slot began to view, to upload before anything of the
+/// next submission runs: every list reads the slot, not only the one whose
+/// recording made it.
+static FIRST: Mutex<Vec<(Arc<Staging>, Arc<crate::resource::HostTexture>)>> = Mutex::new(Vec::new());
+
+/// A bindless slot views `resource` from now on.
+pub(crate) fn upload_first(resource: This, texture: &ID3D12Resource) {
+    let host_written = HOST_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&(resource as usize)));
+    if host_written {
+        return;
+    }
+    if let Some(copy) = crate::resource::host_copy(resource)
+        && let Some(staging) = staging(resource, texture)
+    {
+        FIRST.lock().unwrap_or_else(|e| e.into_inner()).push((staging, copy));
+    }
+}
+
+/// The textures of [`upload_first`] since the last call.
+pub(crate) fn take_first() -> Vec<(Arc<Staging>, Arc<crate::resource::HostTexture>)> {
+    std::mem::take(&mut *FIRST.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 /// Registers a title-written texture with `list` (once per list) so that at
 /// submission time its staging buffer is checked for CPU modifications and,
 /// only when its contents changed (including first upload), copied into its

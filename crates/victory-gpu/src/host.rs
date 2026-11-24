@@ -888,6 +888,10 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        let mut early = Early::default();
+        if !runs.is_empty() {
+            early.take(&mut batch, runs, false);
+        }
         for list in runs {
             let uploads = list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -897,6 +901,11 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.prepare_bindless();
+        if !runs.is_empty() {
+            early.take(&mut batch, runs, true);
+        }
+        // The textures live (in `early`) until the submission is done.
+        let first = early.record(self);
         let prepared = std::time::Instant::now();
         // Each run (prelude and list) is a submission of its own: the host
         // resets the device when one submission runs for about 2 s, and
@@ -913,6 +922,10 @@ impl Host {
         let each = timing();
         #[cfg(not(feature = "diagnostics"))]
         let each = false;
+        if let Some(first) = first {
+            // SAFETY: a closed list.
+            unsafe { self.queue.ExecuteCommandLists(&[Some(first)]) };
+        }
         for (i, group) in groups.iter().enumerate() {
             // Diagnostics: everything but the GPU's work, to look at the
             // order of the title's submissions.
@@ -954,6 +967,7 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        drop(early);
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
         let gpu = prepared.elapsed();
@@ -2158,6 +2172,100 @@ impl Batch {
                 }
             }
             self.plans.push(plan);
+        }
+    }
+}
+
+/// Uploads before a submission's lists ([`crate::texture::upload_first`]).
+#[derive(Default)]
+struct Early {
+    copies: Vec<(
+        std::sync::Arc<crate::texture::Staging>,
+        std::sync::Arc<crate::resource::HostTexture>,
+    )>,
+    before: Vec<D3D12_RESOURCE_BARRIER>,
+    after: Vec<D3D12_RESOURCE_BARRIER>,
+}
+
+impl Early {
+    /// Takes the textures waiting; `late`: after the lists' preludes took
+    /// the textures' states, so not those the lists use (they upload them).
+    fn take(&mut self, batch: &mut Batch, runs: &[&HostList], late: bool) {
+        let first = crate::texture::take_first();
+        if first.is_empty() {
+            return;
+        }
+        let mut used = std::collections::HashSet::new();
+        if late {
+            for list in runs {
+                let states = list.states.lock().unwrap_or_else(|e| e.into_inner());
+                used.extend(states.values().map(|s| std::sync::Arc::as_ptr(&s.2) as usize));
+            }
+        }
+        const COPY_DEST: i32 = D3D12_RESOURCE_STATE_COPY_DEST.0;
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        for (staging, copy) in first {
+            if used.contains(&(std::sync::Arc::as_ptr(&copy) as usize))
+                || !batch.texture_due(&staging)
+                || !staging.refresh()
+            {
+                continue;
+            }
+            let real = copy.state.swap(SHADER_RESOURCE, Ordering::Relaxed) as i32;
+            let (to, from) = (D3D12_RESOURCE_STATES(COPY_DEST), D3D12_RESOURCE_STATES(real));
+            if real != COPY_DEST {
+                self.before.push(transition(&copy.texture, from, to));
+            }
+            self.after
+                .push(transition(&copy.texture, to, D3D12_RESOURCE_STATES(SHADER_RESOURCE as i32)));
+            self.copies.push((staging, copy));
+        }
+    }
+
+    /// The list with the uploads, if there are any. One submission runs at a
+    /// time and is waited for, so there is one list.
+    fn record(&self, host: &Host) -> Option<ID3D12CommandList> {
+        if self.copies.is_empty() {
+            return None;
+        }
+        struct List(ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+        // SAFETY: free-threaded objects, used under the submission's lock.
+        unsafe impl Send for List {}
+        // SAFETY: as above.
+        unsafe impl Sync for List {}
+        static LIST: OnceLock<Option<List>> = OnceLock::new();
+        // SAFETY: the list is not executing (every submission is waited
+        // for); the textures and staging buffers are live.
+        unsafe {
+            let List(allocator, list) = LIST
+                .get_or_init(|| {
+                    let allocator: ID3D12CommandAllocator = host
+                        .device
+                        .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                        .ok()?;
+                    let list: ID3D12GraphicsCommandList = host
+                        .device
+                        .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                        .ok()?;
+                    list.Close().ok()?;
+                    Some(List(allocator, list))
+                })
+                .as_ref()?;
+            let recorded = allocator.Reset().and_then(|()| {
+                list.Reset(allocator, None)?;
+                if !self.before.is_empty() {
+                    list.ResourceBarrier(&self.before);
+                }
+                for (staging, copy) in &self.copies {
+                    staging.record_copies(list, &copy.texture);
+                }
+                list.ResourceBarrier(&self.after);
+                list.Close()
+            });
+            if let Err(e) = recorded {
+                fail(format_args!("texture uploads did not record ({e})"));
+            }
+            list.cast().ok()
         }
     }
 }
