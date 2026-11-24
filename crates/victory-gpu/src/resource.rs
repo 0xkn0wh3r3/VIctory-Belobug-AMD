@@ -850,6 +850,8 @@ impl Drop for HostTexture {
     fn drop(&mut self) {
         crate::memstat::sub(&crate::memstat::HOST_TEXTURES, self.bytes);
         crate::memstat::sub(&crate::memstat::HOST_TEXTURE_COUNT, 1);
+        // A submission recorded but not yet run may still name it.
+        crate::host::retire(self.texture.clone());
     }
 }
 

@@ -35,6 +35,16 @@ pub(crate) struct HostHeap {
     next: Mutex<(u32, Vec<bool>)>,
 }
 
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        if let Ok(mut kept) = self.kept.lock() {
+            for res in kept.drain(..).flatten() {
+                crate::host::retire(res);
+            }
+        }
+    }
+}
+
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
@@ -65,7 +75,10 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
-const DYNAMIC: u32 = 1 << 16;
+const DYNAMIC: u32 = 1 << 19;
+/// Smaller dynamic reserve when the host caps the whole view heap at
+/// [`PORTABLE_VIEWS`].
+const DYNAMIC_CAPPED: u32 = 1 << 16;
 
 /// The host's limit for shader-visible sampler heaps, on every binding
 /// tier.
@@ -116,19 +129,23 @@ impl HostHeap {
         }
         let extra = if sampler { 0 } else { DYNAMIC };
         let wanted = count;
-        let (heap, count) = match make(count + extra) {
-            Ok(heap) => (heap, count),
+        let (heap, count, extra) = match make(count + extra) {
+            Ok(heap) => (heap, count, extra),
             Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
                 // shortcut: descriptors past the host's limit are left out;
                 // draw::tables now remaps the root tables that reach them.
                 tracing::warn!(
                     error = %e,
                     wanted,
-                    made = PORTABLE_VIEWS - extra,
-                    lost = wanted + extra - PORTABLE_VIEWS,
+                    made = PORTABLE_VIEWS - DYNAMIC_CAPPED,
+                    lost = wanted + DYNAMIC_CAPPED - PORTABLE_VIEWS,
                     "host view heap capped at {PORTABLE_VIEWS}"
                 );
-                (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - extra)
+                (
+                    make(PORTABLE_VIEWS).ok()?,
+                    PORTABLE_VIEWS - DYNAMIC_CAPPED,
+                    DYNAMIC_CAPPED,
+                )
             }
             Err(e) => {
                 tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -155,7 +172,7 @@ impl HostHeap {
                 host.device.GetDescriptorHandleIncrementSize(kind),
             )
         };
-        tracing::debug!(count, sampler, "host descriptor heap");
+        tracing::debug!(count, extra, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
@@ -290,7 +307,7 @@ impl HostHeap {
         }
         let Some(first) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            ONCE.call_once(|| tracing::warn!(n, spare, "no free dynamic descriptor slots: a table is not made"));
             return None;
         };
         taken[first..first + n].fill(true);
@@ -343,15 +360,64 @@ impl HostHeap {
         self.keep(index, None);
     }
 
-    /// Slot `index` now views `resource` (or nothing of the host's).
-    fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
-        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = kept.get_mut(index as usize) {
-            // A running submission may still read the old resource through
-            // this slot.
-            if let Some(old) = std::mem::replace(slot, resource) {
-                crate::host::retire(old);
+    /// Makes slot `index` a null view matching the resource kind a shader
+    /// expects there (CBV, buffer SRV/UAV, or 2D texture).
+    pub(crate) fn make_null_kind(&self, index: u32, kind: victory_shader::ResourceType, dwords: u8) {
+        if self.sampler {
+            self.null_sampler(index);
+            self.keep(index, None);
+            return;
+        }
+        let at = self.cpu(index);
+        match kind {
+            victory_shader::ResourceType::Cbv => {
+                if let Some(host) = host() {
+                    let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+                    // SAFETY: a slot of our heap; zero location makes a null CBV.
+                    unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+                }
             }
+            victory_shader::ResourceType::Srv if dwords == 4 => null_buffer_view(at),
+            victory_shader::ResourceType::Uav => {
+                if let Some(host) = host() {
+                    let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                        Format: DXGI_FORMAT_R32_UINT,
+                        ViewDimension: if dwords == 4 {
+                            D3D12_UAV_DIMENSION_BUFFER
+                        } else {
+                            D3D12_UAV_DIMENSION_TEXTURE2D
+                        },
+                        ..Default::default()
+                    };
+                    // SAFETY: a slot of our heap; null resource makes a null UAV.
+                    unsafe {
+                        host.device.CreateUnorderedAccessView(
+                            None::<&ID3D12Resource>,
+                            None::<&ID3D12Resource>,
+                            Some(&desc),
+                            at,
+                        )
+                    };
+                }
+            }
+            _ => null_view(at),
+        }
+        self.keep(index, None);
+    }
+
+    /// Slot `index` now views `resource` (or nothing of the host's). A
+    /// previously viewed resource is retired rather than dropped inline so an
+    /// in-flight GPU submission reading that slot cannot fault on freed memory.
+    fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        // A running submission may still read the old resource through
+        // this slot; it is retired outside the lock.
+        let old = {
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            kept.get_mut(index as usize)
+                .and_then(|slot| std::mem::replace(slot, resource))
+        };
+        if let Some(old) = old {
+            crate::host::retire(old);
         }
     }
 

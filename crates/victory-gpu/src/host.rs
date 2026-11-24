@@ -67,9 +67,6 @@ unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
 
-/// Time spent in submissions since the last frame-rate line, in
-/// microseconds: preparing them on the CPU (title memory copies, texture
-/// detiling), then waiting for the GPU.
 /// Host objects the title let go of while a submission may still use them
 /// (a texture its descriptors name, a descriptor slot's old resource), by
 /// the submission count they wait for. The title's descriptor writes and
@@ -77,45 +74,65 @@ unsafe impl Sync for Host {}
 /// runs a submission for most of a second in the world: freeing there was
 /// a GPU page fault on the freed texture (DXGI_ERROR_DEVICE_HUNG,
 /// 2026-11-24, RX 7600).
-static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
+static RETIRED: Mutex<Vec<Retired>> = Mutex::new(Vec::new());
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Presented host frames a retired object is also kept for. Worker threads
+/// record lists ahead of submission and a title frame spans many
+/// submissions, so finishing the submissions running when it was retired
+/// is not enough on its own. Ages are in frames presented to the host, not
+/// the title's 60 Hz clock (which ticks many times per host frame while
+/// the host runs at 1-2 fps).
+const KEEP_FRAMES: u64 = 4;
+
 /// A retired object, dropped on whatever thread finishes the submission.
-struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
+struct Retired {
+    /// The submission count it waits for.
+    submission: u64,
+    /// The presented frame it was retired in.
+    frame: u64,
+    #[allow(dead_code)]
+    object: Box<dyn std::any::Any>,
+}
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
 // reference-counted wrappers holding them, dropped once.
 unsafe impl Send for Retired {}
 
-/// Drops `object` once every submission running now has finished: at once
-/// if none is.
+/// Drops `object` once every submission running now has finished and
+/// [`KEEP_FRAMES`] more frames were presented.
 pub(crate) fn retire<T: 'static>(object: T) {
-    let started = STARTED.load(Ordering::Acquire);
-    if started <= FINISHED.load(Ordering::Acquire) {
-        drop(object);
-        return;
-    }
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((started, Retired(Box::new(object))));
+    let submission = STARTED.load(Ordering::Acquire);
+    let frame = crate::queue::presented();
+    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(Retired {
+        submission,
+        frame,
+        object: Box::new(object),
+    });
 }
 
-/// Drops what waited for submissions up to `finished`.
+/// Drops what waited for submissions up to `finished` and is old enough
+/// in presented frames.
 fn bury(finished: u64) {
-    let done: Vec<(u64, Retired)> = {
+    let now = crate::queue::presented();
+    let done: Vec<Retired> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         if retired.is_empty() {
             return;
         }
-        let (done, keep) = std::mem::take(&mut *retired).into_iter().partition(|(at, _)| *at <= finished);
+        let (done, keep) = std::mem::take(&mut *retired).into_iter().partition(|r| {
+            r.submission <= finished && now.saturating_sub(r.frame) >= KEEP_FRAMES
+        });
         *retired = keep;
         done
     };
     drop(done);
 }
 
+/// Time spent in submissions since the last frame-rate line, in
+/// microseconds: preparing them on the CPU (title memory copies, texture
+/// detiling), then waiting for the GPU.
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
