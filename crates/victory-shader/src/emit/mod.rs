@@ -289,7 +289,13 @@ pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, Sha
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
     let mut p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
-    crate::unspill::unspill(&mut p, &native.layout, native.stage);
+    // Spilled user-data tables belong to the ray-tracing BVH builder
+    // (`XboxBvhBuilder.dll`). Running only a subset of its stages while
+    // `VICTORY_RAYS` is off lets later stages (e.g. `c42a31951201f9a0`) read
+    // uninitialized data from dropped stages and page-fault the GPU.
+    if rays() {
+        crate::unspill::unspill(&mut p, &native.layout, native.stage);
+    }
     crate::sgpr_spill::forward(&mut p);
     let traces = resource::traces_rays(&p);
     let io = io::raise(&p, &native)?;

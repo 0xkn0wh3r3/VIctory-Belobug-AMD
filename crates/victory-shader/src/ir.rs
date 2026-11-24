@@ -412,7 +412,16 @@ fn unspill(blocks: &mut [Block]) {
     for inst in blocks.iter().flat_map(|b| &b.insts) {
         // Of a lane access, the spilled register itself is no other use.
         let own = spill(inst).map(|s| Reg::V(s.0));
-        for &(reg, _) in inst.reads.iter().chain(&inst.writes) {
+        // An M0-relative read (`v_movrels_b32`) names every VGPR from its base
+        // up; the compiler indexes a small array with it, never the lanes it
+        // parks scalars in, so it does not make those VGPRs ordinary ones.
+        // (Relative writes still do.)
+        let relative_read = inst.name() == "v_movrels_b32";
+        let n_reads = inst.reads.len();
+        for (k, &(reg, _)) in inst.reads.iter().chain(&inst.writes).enumerate() {
+            if relative_read && k < n_reads && matches!(reg, Reg::V(_)) {
+                continue;
+            }
             if let Reg::V(v) = reg
                 && Some(reg) != own
             {
