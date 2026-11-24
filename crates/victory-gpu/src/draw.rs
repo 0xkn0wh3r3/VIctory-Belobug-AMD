@@ -992,6 +992,61 @@ impl State {
 }
 
 impl State {
+    /// For an indirect draw of rectangles: every per-vertex buffer the
+    /// pipeline reads expanded into triangles, and the records rewritten
+    /// for them, both on the GPU ([`crate::rects`]). Records before the
+    /// pipeline is bound (it replaces it). `None` if this draw cannot be
+    /// expanded (indexed, unaligned, too many elements, no pipeline).
+    #[allow(clippy::type_complexity)]
+    fn indirect_rectangles(
+        &self,
+        list: &HostList,
+        kind: u32,
+        args: &crate::shadow::Shadow,
+        arguments: u64,
+        stride: u32,
+        max: u32,
+    ) -> Option<(ID3D12Resource, Vec<(u32, D3D12_VERTEX_BUFFER_VIEW)>)> {
+        if kind != 0 {
+            return None;
+        }
+        let host = crate::host::host()?;
+        let p = crate::pipeline::host_pipeline(self.pipeline as This)?;
+        if p.compute || p.mesh {
+            return None;
+        }
+        let mut views = Vec::new();
+        for slot in 0..32u32 {
+            let elements: Vec<(u32, u32)> = p
+                .inputs
+                .iter()
+                .filter(|e| e.slot == slot && !e.per_instance)
+                .map(|e| (e.offset, e.format))
+                .collect();
+            if elements.is_empty() {
+                continue;
+            }
+            let v = self.vertex[slot as usize];
+            if v.address == 0 || v.size == 0 || v.stride == 0 {
+                return None;
+            }
+            let shadow = crate::shadow::find(v.address, u64::from(v.size))?;
+            shadow.refresh(list, v.address, u64::from(v.size));
+            let (_, gpu, size) =
+                crate::rects::vertices(list, host, shadow.gpu(v.address), u64::from(v.size), v.stride, &elements)?;
+            views.push((
+                slot,
+                D3D12_VERTEX_BUFFER_VIEW {
+                    BufferLocation: gpu,
+                    SizeInBytes: size,
+                    StrideInBytes: v.stride,
+                },
+            ));
+        }
+        let records = crate::rects::records(list, host, &args.buffer, args.gpu(arguments), stride, max)?;
+        Some((records, views))
+    }
+
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
     /// records `stride` bytes apart at title address `arguments`, and the
@@ -1050,14 +1105,36 @@ impl State {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
+        // Rectangle lists: their vertices expanded and the records rewritten
+        // on the GPU, before the draw's own pipeline is bound.
+        let mut rect_args: Option<ID3D12Resource> = None;
+        let mut rect_vertices: Vec<(u32, D3D12_VERTEX_BUFFER_VIEW)> = Vec::new();
         if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES {
-            crate::indirect::done(list, &args.buffer);
-            why("a rectangle list (rectangles are expanded for direct draws only)");
-            return false;
+            match self.indirect_rectangles(list, kind, &args, arguments, stride, max) {
+                Some((a, views)) => {
+                    rect_args = Some(a);
+                    rect_vertices = views;
+                }
+                None => {
+                    crate::indirect::done(list, &args.buffer);
+                    why("a rectangle list (not expanded: indexed, unaligned or unknown inputs)");
+                    return false;
+                }
+            }
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
+            DRAW if rect_args.is_some() => {
+                let ok = self.prepare(list, false);
+                if ok {
+                    for (slot, view) in &rect_vertices {
+                        // SAFETY: an open list; the view names a buffer the list keeps.
+                        unsafe { list.list.IASetVertexBuffers(*slot, Some(&[*view])) };
+                    }
+                }
+                ok
+            }
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
@@ -1088,12 +1165,16 @@ impl State {
         });
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
+        let (arg_buffer, arg_offset) = match &rect_args {
+            Some(a) => (a, 0),
+            None => (&args.buffer, args.offset(arguments)),
+        };
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
                 max,
-                &args.buffer,
-                args.offset(arguments),
+                arg_buffer,
+                arg_offset,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
