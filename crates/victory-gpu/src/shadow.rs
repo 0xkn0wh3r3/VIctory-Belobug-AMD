@@ -517,8 +517,9 @@ impl Shadow {
         to - from
     }
 
-    /// Copies title memory `[from, to)` into the tiles of a sparse copy;
-    /// `lazy`: not those whose turn it is not.
+    /// Copies title memory `[from, to)` into the tiles of a sparse copy where
+    /// the title changed it since the last time: what shaders wrote into the
+    /// copy only is left as it is. `lazy`: not the tiles whose turn it is not.
     ///
     /// shortcut: a tile that did not change when looked at twice is next
     /// looked at after 2, 4 and at most 16 frames, unless something new reads
@@ -529,48 +530,53 @@ impl Shadow {
         }
         let mut bytes = 0;
         self.each_tile(s, from, to, |at, data, n| {
-            if n < PAGE {
-                crate::host::copy_mapped(data, at as *const u8, n, false);
-                bytes += n;
-                return;
-            }
             let tile = ((at - self.start as usize) / PAGE) as u32;
-            let seen = {
-                let looks = s.looks.lock().unwrap_or_else(|e| e.into_inner());
-                looks.get(&tile).copied()
+            let look = {
+                let mut looks = s.looks.lock().unwrap_or_else(|e| e.into_inner());
+                looks.entry(tile).or_default().clone()
             };
-            if lazy && seen.is_some_and(|(next, _)| frame < next) {
+            let mut look = look.lock().unwrap_or_else(|e| e.into_inner());
+            if lazy && n == PAGE && frame < look.next {
                 return;
             }
             bytes += n;
-            // Only written where it changed: the copy is in memory the CPU
-            // reads quickly.
-            let same = READ.with_borrow_mut(|read| {
+            let mut same = true;
+            READ.with_borrow_mut(|read| {
                 if !crate::host::read_into(at as *const u8, &mut read[..n]) {
-                    crate::host::copy_mapped(data, at as *const u8, n, false);
-                    return false;
+                    crate::host::copy_mapped(read.as_mut_ptr(), at as *const u8, n, false);
                 }
-                // SAFETY: the tile's mapping; only submissions write it.
-                let host = unsafe { std::slice::from_raw_parts_mut(data, n) };
-                let same = *host == read[..n];
-                if !same {
-                    host.copy_from_slice(&read[..n]);
+                let first = at % PAGE;
+                let mut done = 0;
+                while done < n {
+                    let block = (first + done) / BLOCK;
+                    let len = (BLOCK - (first + done) % BLOCK).min(n - done);
+                    let part = &read[done..done + len];
+                    let known = &mut look.blocks[block];
+                    let changed = if len == BLOCK {
+                        let now = mixed(part);
+                        std::mem::replace(known, now) != now
+                    } else {
+                        // Part of a block: not known any more.
+                        *known = 0;
+                        true
+                    };
+                    if changed {
+                        same = false;
+                        // SAFETY: the tile's mapping; only submissions write it.
+                        unsafe { std::ptr::copy_nonoverlapping(part.as_ptr(), data.add(done), len) };
+                    }
+                    done += len;
                 }
-                same
             });
-            let still = match seen {
-                Some((_, still)) if same => (still + 1).min(5),
-                _ => 0,
-            };
-            // Not all in the same frame.
-            let wait = match still {
-                0 | 1 => 1,
-                k => (1 << (k - 1)) - u64::from(tile) % 2,
-            };
-            s.looks
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(tile, (frame + wait, still));
+            if n == PAGE {
+                look.still = if same { (look.still + 1).min(5) } else { 0 };
+                // Not all in the same frame.
+                let wait = match look.still {
+                    0 | 1 => 1,
+                    k => (1 << (k - 1)) - u64::from(tile) % 2,
+                };
+                look.next = frame + wait;
+            }
         });
         bytes
     }
@@ -933,6 +939,42 @@ pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<Arc<Shado
 /// tiles that were brought up to date. Reads of the others give zeros, where
 /// a copy ending too soon was a GPU page fault; and memory many buffers of
 /// the title overlap in is copied once.
+/// What was seen of a tile's title memory.
+struct Look {
+    /// The frame to look at it next in, and how often in a row it had not
+    /// changed.
+    next: u64,
+    still: u32,
+    /// A hash of each [`BLOCK`] as last copied (0: not known).
+    blocks: [u64; PAGE / BLOCK],
+}
+
+impl Default for Look {
+    fn default() -> Self {
+        Look {
+            next: 0,
+            still: 0,
+            blocks: [0; PAGE / BLOCK],
+        }
+    }
+}
+
+/// Bytes of title memory copied as one.
+const BLOCK: usize = 1 << 10;
+
+/// A quick hash, never 0.
+fn mixed(bytes: &[u8]) -> u64 {
+    let mut h = [0x9e37_79b9_7f4a_7c15_u64, 0xc2b2_ae3d_27d4_eb4f, 0x1656_67b1_9e37_79f9, 0x27d4_eb2f_1656_67c5];
+    for c in bytes.chunks_exact(32) {
+        for (k, h) in h.iter_mut().enumerate() {
+            let x = u64::from_le_bytes(c[8 * k..8 * k + 8].try_into().unwrap_or_default());
+            *h = (*h ^ x).wrapping_mul(0x9fb2_1c65_1e98_df25).rotate_left(29);
+        }
+    }
+    let x = h[0] ^ h[1].rotate_left(17) ^ h[2].rotate_left(31) ^ h[3].rotate_left(47);
+    (x ^ x >> 32).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1
+}
+
 /// A quick hash for tile numbers.
 #[derive(Clone, Copy, Default)]
 struct Mix(u64);
@@ -963,7 +1005,7 @@ struct Sparse {
     before: Mutex<std::collections::HashMap<u32, Vec<u8>, Mix>>,
     /// By tile: the frame to look at it next in, and how often in a row it
     /// had not changed.
-    looks: Mutex<std::collections::HashMap<u32, (u64, u32), Mix>>,
+    looks: Mutex<std::collections::HashMap<u32, Arc<Mutex<Look>>, Mix>>,
     /// The same from other 64 KiB starts ([`Direct::aliases`]).
     aliases: Mutex<Vec<Arc<Shadow>>>,
     /// This is an alias of that one.
