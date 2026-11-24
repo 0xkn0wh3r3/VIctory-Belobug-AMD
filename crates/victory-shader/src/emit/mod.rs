@@ -673,7 +673,7 @@ mod tests {
             ],
             io: crate::native::StageIo::Cs(crate::native::ComputeIo {
                 rsrc2: 5 << 1,
-                threads: [6, 1, 1],
+                threads: [7, 1, 1],
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
@@ -713,7 +713,7 @@ mod tests {
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
-                7.0f32, 3.0, -1.0, 1e-40, 1.0, 1e35, 1e-35, 1e-36, 0.0, 0.0, -1.0, 0.0,
+                7.0f32, 3.0, -1.0, 1e-40, 1.0, 1e35, 1e-35, 1e-36, 0.0, 0.0, -1.0, 0.0, -1e35, 1e35,
             ]
             .into_iter()
             .map(f32::to_bits)
@@ -736,7 +736,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            let got: Vec<f32> = out[0][..6].iter().copied().map(f32::from_bits).collect();
+            let got: Vec<f32> = out[0][..7].iter().copied().map(f32::from_bits).collect();
             assert!((got[0] - (7.0f32 / 3.0)).abs() < 1e-6, "got {:?}", got);
             assert_eq!(out[0][1], (-1.0f32 / 1e-40).to_bits());
             assert!(
@@ -753,6 +753,12 @@ mod tests {
             );
             assert_eq!(out[0][4], 0xFFC0_0000);
             assert_eq!(out[0][5], (-1.0f32 / 0.0).to_bits());
+            assert!(
+                (got[6] - (-1.0)).abs() < 1e-6,
+                "lane 6 got {:?} ({:#x})",
+                got[6],
+                out[0][6]
+            );
         }
     }
 }

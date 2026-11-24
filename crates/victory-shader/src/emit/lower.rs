@@ -3720,6 +3720,7 @@ impl<'a> Lower<'a> {
                 let den_tiny = self.s.m.cmp(c, pred::IULE, e2, k23_exp);
                 let den_huge = self.s.m.cmp(c, pred::IUGE, e2, k232_exp);
                 let num_tiny_exp = self.s.m.cmp(c, pred::IULE, e1, k23_exp);
+                let num_huge = self.s.m.cmp(c, pred::IUGE, e1, k232_exp);
                 let num_gap = self.s.m.cmp(c, pred::SGE, diff, k96);
                 let not_den_huge = {
                     let t = self.s.m.bool(true);
@@ -3728,8 +3729,7 @@ impl<'a> Lower<'a> {
                 let num_gap = self.s.m.bin(c, Bin::And, num_gap, not_den_huge);
                 let num_tiny = self.s.m.bin(c, Bin::Or, num_tiny_exp, num_gap);
                 let up_raw = self.s.m.select(c, is_den, den_tiny, num_tiny);
-                let f_false = self.s.m.bool(false);
-                let dn_raw = self.s.m.select(c, is_den, den_huge, f_false);
+                let dn_raw = self.s.m.select(c, is_den, den_huge, num_huge);
                 let not_special = {
                     let t = self.s.m.bool(true);
                     self.s.m.bin(c, Bin::Xor, special, t)
@@ -3737,8 +3737,9 @@ impl<'a> Lower<'a> {
                 let up = self.s.m.bin(c, Bin::And, up_raw, not_special);
                 let dn = self.s.m.bin(c, Bin::And, dn_raw, not_special);
                 let uncancelled = {
-                    let x = self.s.m.bin(c, Bin::Xor, den_tiny, num_tiny);
-                    self.s.m.bin(c, Bin::Or, x, den_huge)
+                    let x_tiny = self.s.m.bin(c, Bin::Xor, den_tiny, num_tiny);
+                    let x_huge = self.s.m.bin(c, Bin::Xor, den_huge, num_huge);
+                    self.s.m.bin(c, Bin::Or, x_tiny, x_huge)
                 };
                 let flag_raw = self.s.m.select(c, is_den, uncancelled, up_raw);
                 let flag = self.s.m.bin(c, Bin::And, flag_raw, not_special);
