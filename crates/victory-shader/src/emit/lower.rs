@@ -288,17 +288,6 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     })
 }
 
-/// A select that needs the actual scalar mask words and console lane index.
-fn numeric_select(st: &Structured, inst: &Inst) -> bool {
-    inst.name() == "v_cndmask_b32"
-        && matches!(&inst.fields, Fields::Valu(v)
-            if matches!(v.src.get(2), Some(Operand::Scalar { code, .. }) if *code != NULL))
-        && inst
-            .writes
-            .first()
-            .is_some_and(|&(_, v)| !st.select_masks.contains_key(&v))
-}
-
 /// Dwords a scalar load reads, by the suffix of its name after
 /// `s_load_dword` or `s_buffer_load_dword`.
 fn smem_dwords(suffix: &str) -> Option<u32> {
@@ -310,6 +299,17 @@ fn smem_dwords(suffix: &str) -> Option<u32> {
         "x16" => Some(16),
         _ => None,
     }
+}
+
+/// A select that needs the actual scalar mask words and console lane index.
+fn numeric_select(st: &Structured, inst: &Inst) -> bool {
+    inst.name() == "v_cndmask_b32"
+        && matches!(&inst.fields, Fields::Valu(v)
+            if matches!(v.src.get(2), Some(Operand::Scalar { code, .. }) if *code != NULL))
+        && inst
+            .writes
+            .first()
+            .is_some_and(|&(_, v)| !st.select_masks.contains_key(&v))
 }
 
 /// Where half `h` (dword h / 2, the high half when odd) of a parameter
@@ -2996,6 +2996,44 @@ impl<'a> Lower<'a> {
                     (self.s.m.bin(c, Bin::And, old, nb), None)
                 }
             }
+            "s_absdiff_i32" => {
+                // |a - b| of the wrapped difference; SCC is set below as for
+                // the other results (nonzero).
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let z = self.s.m.i32(0);
+                let t = self.s.m.bin(c, Bin::Sub, a, b);
+                let neg = self.s.m.cmp(c, pred::SLT, t, z);
+                let n = self.s.m.bin(c, Bin::Sub, z, t);
+                (self.s.m.select(c, neg, n, t), None)
+            }
+            "s_sext_i32_i8" | "s_sext_i32_i16" => {
+                let a = src32(self, 0)?;
+                let k = self.s.m.i32(if name.ends_with("i8") { 24 } else { 16 });
+                let t = self.s.m.bin(c, Bin::Shl, a, k);
+                (self.s.m.bin(c, Bin::AShr, t, k), None)
+            }
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
+                // The low half of the result is half of src0 (low for ll and
+                // lh, high for hh), the high half the one of src1 (low for ll,
+                // high otherwise).
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let (k16, low, high) = (
+                    self.s.m.i32(16),
+                    self.s.m.i32(0xFFFF),
+                    self.s.m.i32(0xFFFF_0000),
+                );
+                let lo_half = if name == "s_pack_hh_b32_b16" {
+                    self.s.m.bin(c, Bin::LShr, a, k16)
+                } else {
+                    self.s.m.bin(c, Bin::And, a, low)
+                };
+                let hi_half = if name == "s_pack_ll_b32_b16" {
+                    self.s.m.bin(c, Bin::Shl, b, k16)
+                } else {
+                    self.s.m.bin(c, Bin::And, b, high)
+                };
+                (self.s.m.bin(c, Bin::Or, lo_half, hi_half), None)
+            }
             "s_bfm_b32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let k31 = self.s.m.i32(31);
@@ -3271,7 +3309,7 @@ impl<'a> Lower<'a> {
     // shortcut: the base level reads 0 (the host view starts at its own
     // level 0, so sizes the code shifts by it come out right) and the other
     // dwords (addresses, formats, tiling) have no host value: reading them
-    // stops the program.
+    // stops the program. A cube reads as its six faces (not a cube array).
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         const OTHER: Why = "a descriptor's address or format read as data";
         let Fields::Smem {
@@ -3326,9 +3364,10 @@ impl<'a> Lower<'a> {
                     0 => 1,
                     1 => 2,
                     2 => 4,
+                    3 => 5,
                     4 => 6,
                     5 => 7,
-                    _ => return Err("an image dimension (cube or MSAA)"),
+                    _ => return Err("an image dimension (MSAA)"),
                 };
                 ((kind | u, 0x409), Some(kind))
             }
@@ -3371,6 +3410,8 @@ impl<'a> Lower<'a> {
                     1 => (one, one),
                     2 => (field(self, 1), one),
                     6 => (one, field(self, 1)),
+                    // A cube is six faces (DXIL's dimensions have no depth).
+                    5 => (field(self, 1), self.s.m.i32(6)),
                     _ => (field(self, 1), field(self, 2)),
                 };
                 let levels = if uav { one } else { field(self, 3) };
@@ -3394,7 +3435,7 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.bin(c, Bin::And, hi, mask);
                 let ht = self.s.m.bin(c, Bin::Shl, height, k14);
                 let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
-                let ty = [0, 8, 9, 0, 10, 0, 12, 13][kind as usize];
+                let ty = [0, 8, 9, 0, 10, 11, 12, 13][kind as usize];
                 let base = k(self, 0xFAC | ty << 28);
                 let last = self.s.m.bin(c, Bin::Shl, levels, k16);
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
@@ -3670,7 +3711,7 @@ impl<'a> Lower<'a> {
 
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
-        if let Source::Phi { args, .. } = src {
+        if let Source::Phi { args, .. } | Source::Select { args, .. } = src {
             return self.used_kind(args.first()?);
         }
         if let Source::Built { address, .. } = src {
@@ -3788,6 +3829,24 @@ impl<'a> Lower<'a> {
                 let phi = self.s.m.phi(join, self.s.t.i32);
                 self.s.m.set_phi(phi, incoming);
                 Ok(self.s.heap_handle(self.cur, phi, sampler, props))
+            }
+            Source::Select { scc, args } => {
+                // The heap index of each choice, picked by SCC (uniform).
+                let [
+                    Source::Loaded { load: a, first: fa },
+                    Source::Loaded { load: b, first: fb },
+                ] = args[..]
+                else {
+                    return Err("a descriptor chosen by a condition");
+                };
+                let cond = match self.get(*scc)? {
+                    Val::Bit(x) => x,
+                    _ => return Err("SCC without a value"),
+                };
+                let set = self.heap_index(a, fa, sampler)?;
+                let clear = self.heap_index(b, fb, sampler)?;
+                let index = self.s.m.select(self.cur, cond, set, clear);
+                Ok(self.s.heap_handle(self.cur, index, sampler, props))
             }
         }
     }
@@ -7115,251 +7174,13 @@ impl<'a> Lower<'a> {
 #[cfg(test)]
 mod tests {
     use super::{Lowered, Numeric, Parts, SubDword, buffer_format, inline_f16, lower};
-    use crate::native::{ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource};
-    use crate::{Container, FourCC, ShaderError, io, ir, resource, structure};
-    use super::super::emit;
+    use crate::native::{
+        ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+    };
     use super::super::container::SigElement;
+    use crate::{ShaderError, io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
-
-    /// Lowers a compute program of constants: whether it translates.
-    fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
-        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let native = NativeProgram {
-            stage: HwStage::Cs,
-            wave64: false,
-            vgprs: 256,
-            layout: vec![],
-            used: vec![],
-            io: StageIo::Cs(ComputeIo {
-                rsrc2: 0,
-                threads: [1, 1, 1],
-            }),
-            code,
-        };
-        let p = ir::build(&native.code, false, 256).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = io::raise(&p, &native).unwrap();
-        let st = structure::structure(&p).unwrap();
-        lower(&Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: vec![],
-            outputs: vec![],
-            prims: vec![],
-            mesh_stride: 0,
-        })
-        .map(|_| ())
-    }
-
-    #[test]
-    fn a_scalar_carry_chain_reaches_the_select() {
-        // The high dword of a 64-bit add or subtract, then a select on the
-        // carry (borrow) the high half leaves in SCC, and a branch on it
-        // (only code with an effect needs its operands).
-        let add = [
-            0xBE80_03C1, // s_mov_b32 s0, -1
-            0xBE81_0380, // s_mov_b32 s1, 0
-            0x8000_8100, // s_add_u32 s0, s0, 1
-            0x8201_8001, // s_addc_u32 s1, s1, 0
-            0x8502_0001, // s_cselect_b32 s2, s1, s0
-            0xBF07_8002, // s_cmp_lg_u32 s2, 0
-            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
-            0xBE83_0380, // s_mov_b32 s3, 0
-            S_ENDPGM,
-        ];
-        let sub = [
-            0xBE80_0380, // s_mov_b32 s0, 0
-            0xBE81_0380, // s_mov_b32 s1, 0
-            0x8080_8100, // s_sub_u32 s0, s0, 1
-            0x8281_8001, // s_subb_u32 s1, s1, 0
-            0x8502_0001, // s_cselect_b32 s2, s1, s0
-            0xBF07_8002, // s_cmp_lg_u32 s2, 0
-            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
-            0xBE83_0380, // s_mov_b32 s3, 0
-            S_ENDPGM,
-        ];
-        for words in [add, sub] {
-            lowers(&words).unwrap();
-        }
-    }
-
-    #[test]
-    fn scalar_bit_tests_lower() {
-        // Each tests one bit of a constant into SCC and branches on it (only
-        // code with an effect needs its operands).
-        let tail = [
-            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
-            0xBE84_0380, // s_mov_b32 s4, 0
-            S_ENDPGM,
-        ];
-        let bit_tests: [&[u32]; 4] = [
-            &[0xBE81_0387, 0xBF0C_8301], // s_mov_b32 s1, 7; s_bitcmp0_b32 s1, 3
-            &[0xBE81_0387, 0xBF0D_8301], // s_mov_b32 s1, 7; s_bitcmp1_b32 s1, 3
-            &[
-                0xBE80_0387, // s_mov_b32 s0, 7
-                0xBE81_0380, // s_mov_b32 s1, 0
-                0xBF0E_8300, // s_bitcmp0_b64 s[0:1], 3
-            ],
-            &[
-                0xBE80_0387, // s_mov_b32 s0, 7
-                0xBE81_0380, // s_mov_b32 s1, 0
-                0xBF0F_8300, // s_bitcmp1_b64 s[0:1], 3
-            ],
-        ];
-        for head in bit_tests {
-            let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
-            lowers(&words).unwrap();
-        }
-    }
-
-    #[test]
-    fn scalar_conditional_moves_lower() {
-        // Each sets SCC, moves under it into a destination that already has a
-        // value, and branches on the result (only code with an effect needs
-        // its operands).
-        let tail = [
-            0xBF07_8002, // s_cmp_lg_u32 s2, 0
-            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
-            0xBE84_0380, // s_mov_b32 s4, 0
-            S_ENDPGM,
-        ];
-        let b32 = [
-            0xBE82_0387, // s_mov_b32 s2, 7
-            0xBE81_0381, // s_mov_b32 s1, 1
-            0xBF07_8001, // s_cmp_lg_u32 s1, 0
-            0xBE82_0501, // s_cmov_b32 s2, s1
-        ];
-        let k32 = [
-            0xBE82_0387, // s_mov_b32 s2, 7
-            0xBE81_0381, // s_mov_b32 s1, 1
-            0xBF07_8001, // s_cmp_lg_u32 s1, 0
-            0xB102_0005, // s_cmovk_i32 s2, 5
-        ];
-        let b64 = [
-            0xBE82_0387, // s_mov_b32 s2, 7
-            0xBE83_0387, // s_mov_b32 s3, 7
-            0xBE80_0381, // s_mov_b32 s0, 1
-            0xBE81_0381, // s_mov_b32 s1, 1
-            0xBF07_8000, // s_cmp_lg_u32 s0, 0
-            0xBE82_0600, // s_cmov_b64 s[2:3], s[0:1]
-        ];
-        for head in [&b32[..], &k32[..], &b64[..]] {
-            let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
-            lowers(&words).unwrap();
-        }
-    }
-
-    /// An f16 (sign, 5-bit exponent, 10-bit fraction) as an f32; normal numbers only.
-    fn f16_value(h: u32) -> f32 {
-        let sign = if h >> 15 != 0 { -1.0 } else { 1.0 };
-        let exponent = (h >> 10 & 0x1F) as i32 - 15;
-        sign * (1.0 + (h & 0x3FF) as f32 / 1024.0) * 2f32.powi(exponent)
-    }
-
-    #[test]
-    fn inline_float_constants_mean_the_same_in_f16() {
-        // v_fma_mix and v_pack_b32_f16 read these as f16: 1.0 must be 0x3C00,
-        // not the low half (0) of the f32 bits 0x3F800000.
-        assert_eq!(inline_f16(242), 0x3C00);
-        for code in 240..=248u8 {
-            let f32_value = f32::from_bits(crate::resource::inline(code).unwrap());
-            let f16_value = f16_value(inline_f16(code));
-            assert!(
-                (f32_value - f16_value).abs() <= f32_value.abs() * 1e-3,
-                "inline constant {code}: f32 {f32_value}, f16 {f16_value}"
-            );
-        }
-    }
-
-    #[test]
-    fn buffer_formats_by_number() {
-        // The numbers the disassembler names 8_8_8_8_UNORM, 16_16_SNORM,
-        // 2_10_10_10_UNORM, 16_FLOAT, 32_32_32_32_FLOAT.
-        assert_eq!(buffer_format(56), Some((&[8, 8, 8, 8][..], Numeric::Unorm)));
-        assert_eq!(buffer_format(24), Some((&[16, 16][..], Numeric::Snorm)));
-        assert_eq!(
-            buffer_format(50),
-            Some((&[10, 10, 10, 2][..], Numeric::Unorm))
-        );
-        assert_eq!(buffer_format(13), Some((&[16][..], Numeric::Float)));
-        assert_eq!(
-            buffer_format(77),
-            Some((&[32, 32, 32, 32][..], Numeric::Float))
-        );
-        // Invalid, a packed float, past the table.
-        assert_eq!(buffer_format(0), None);
-        assert_eq!(buffer_format(36), None);
-        assert_eq!(buffer_format(78), None);
-    }
-
-    #[test]
-    fn selects_from_independently_written_mask_words() {
-        let words = [
-            0xbe81_0380u32, // s1 = 0 (table address high)
-            0xf408_0200,
-            0xfa00_0000, // load UAV into s[8:11]
-            0xbe84_03ff,
-            0x8000_0000, // s4 = lane 31
-            0xbe85_0381, // s5 = lane 32 in wave64
-            0x7e02_028b,
-            0x7e04_029d, // v1 = 11, v2 = 29
-            0xd501_0003,
-            0x0012_0501, // v_cndmask_b32 v3, v1, v2, s[4:5]
-            0x3402_0082, // v1 = 4 * v0
-            0xe070_1000,
-            0x8002_0301, // store v3 to UAV at v1
-            0xbf81_0000,
-        ];
-        let container = crate::dxbc::build(&[]);
-        let c = Container::parse(&container).unwrap();
-        for (wave64, uses_select) in [(false, true), (true, true), (true, false)] {
-            let mut words = words;
-            if !uses_select {
-                words[12] = 0x8002_0101; // store v1 instead of the select result
-            }
-            let native = NativeProgram {
-                stage: HwStage::Cs,
-                wave64,
-                vgprs: 4,
-                layout: vec![RootParam {
-                    root: RootType::Table,
-                    table_offset_dwords: 0,
-                    sgprs: 1,
-                    base_register: 0,
-                    user_data: 0,
-                    slot: 0,
-                }],
-                used: vec![UsedResource {
-                    kind: ResourceType::Uav,
-                    root: RootType::Table,
-                    table_offset_dwords: 0,
-                    lower_bound: 0,
-                    stride: 0,
-                    dwords: 4,
-                    user_data: 0,
-                    slot: 0,
-                }],
-                io: crate::native::StageIo::Cs(ComputeIo {
-                    rsrc2: 2,
-                    threads: [if wave64 { 64 } else { 32 }, 1, 1],
-                }),
-                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-            };
-            let p = crate::ir::build(&native.code, wave64, native.vgprs).unwrap();
-            let st = crate::structure::structure(&p).unwrap();
-            let io = crate::io::raise(&p, &native).unwrap();
-            let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
-            let shader = emit(&c, &native, &p, &st, &io, &res).unwrap();
-            let emitted = Container::parse(&shader.dxil).unwrap();
-            let features = emitted.part(FourCC::SFI0).unwrap();
-            let wave_ops = u64::from_le_bytes(features.data.try_into().unwrap()) & 0x4000 != 0;
-            assert_eq!(wave_ops, uses_select);
-        }
-    }
 
     /// VOP3 `op dst, a, b` (GFX10 encoding); `flags` are the clamp, op_sel
     /// and abs bits of the first dword.
@@ -7425,79 +7246,9 @@ mod tests {
         lower(&parts).map(|l| l.dxil)
     }
 
-    #[test]
-    fn signed_names_of_wrapping_integer_operations_match_the_unsigned_ones() {
-        // The low 32 bits of a sum, difference or product do not depend on
-        // the sign, so the _i32 forms lower exactly as their _u32 twins.
-        for (signed, unsigned) in [
-            (0x37F, 0x125), // v_add_nc_i32, v_add_nc_u32
-            (0x376, 0x126), // v_sub_nc_i32, v_sub_nc_u32
-            (0x16B, 0x169), // v_mul_lo_i32, v_mul_lo_u32
-        ] {
-            let a = lower_ps(vop3(signed, 0, 2, 259, 129)).unwrap();
-            let b = lower_ps(vop3(unsigned, 0, 2, 259, 129)).unwrap();
-            assert_eq!(a, b, "opcode {signed:#x}");
-        }
-    }
-
-    #[test]
-    fn sixteen_bit_signed_add_and_sub_lower_with_half_selects() {
-        // v_add_nc_i16 and v_sub_nc_i16, also reading the high halves.
-        for op in [0x30D, 0x30E] {
-            for opsel in [0, 1 << 11, 1 << 12 | 1 << 14] {
-                lower_ps(vop3(op, opsel, 2, 259, 259)).unwrap();
-            }
-        }
-    }
-
-    #[test]
-    fn clamped_signed_operations_are_refused_not_miscompiled() {
-        // Clamping saturates; wrapping them would give other values.
-        let clamp = 1 << 15;
-        for op in [0x37F, 0x376, 0x16B, 0x30D, 0x30E] {
-            let err = lower_ps(vop3(op, clamp, 2, 259, 129)).unwrap_err();
-            assert!(
-                matches!(err, ShaderError::Unsupported { what, .. } if what.contains("modifier")),
-                "{op:#x}: {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn sub_dword_lds_names() {
-        let s = |write, bits, signed, d16| {
-            Some(SubDword {
-                write,
-                bits,
-                signed,
-                d16,
-            })
-        };
-        assert_eq!(SubDword::of("ds_read_i8"), s(false, 8, true, None));
-        assert_eq!(SubDword::of("ds_read_u16"), s(false, 16, false, None));
-        assert_eq!(
-            SubDword::of("ds_read_u8_d16"),
-            s(false, 8, false, Some(false))
-        );
-        assert_eq!(
-            SubDword::of("ds_read_i16_d16_hi"),
-            s(false, 16, true, Some(true))
-        );
-        assert_eq!(SubDword::of("ds_write_b8"), s(true, 8, false, None));
-        assert_eq!(
-            SubDword::of("ds_write_b16_d16_hi"),
-            s(true, 16, false, Some(true))
-        );
-        for name in [
-            "ds_read_b32",
-            "ds_read2_b32",
-            "ds_write_b64",
-            "ds_write_b8_d16",
-            "ds_read_u8_d32",
-            "ds_add_u32",
-        ] {
-            assert_eq!(SubDword::of(name), None, "{name}");
-        }
+    /// Lowers a compute program of constants: whether it translates.
+    fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
+        lower_with(words, vec![], vec![]).map(|_| ())
     }
 
     /// Lowers a compute program with the root parameters `layout` (in user
@@ -7621,6 +7372,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_scalar_carry_chain_reaches_the_select() {
+        // The high dword of a 64-bit add or subtract, then a select on the
+        // carry (borrow) the high half leaves in SCC, and a branch on it
+        // (only code with an effect needs its operands).
+        let add = [
+            0xBE80_03C1, // s_mov_b32 s0, -1
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0x8000_8100, // s_add_u32 s0, s0, 1
+            0x8201_8001, // s_addc_u32 s1, s1, 0
+            0x8502_0001, // s_cselect_b32 s2, s1, s0
+            0xBF07_8002, // s_cmp_lg_u32 s2, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ];
+        let sub = [
+            0xBE80_0380, // s_mov_b32 s0, 0
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0x8080_8100, // s_sub_u32 s0, s0, 1
+            0x8281_8001, // s_subb_u32 s1, s1, 0
+            0x8502_0001, // s_cselect_b32 s2, s1, s0
+            0xBF07_8002, // s_cmp_lg_u32 s2, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ];
+        for words in [add, sub] {
+            lowers(&words).unwrap();
+        }
+    }
+
     /// A dword load by index through a descriptor built around the root
     /// descriptor in s[0:1] with dword 1 bits `hi` and dword 3 `w3`, stored
     /// to LDS so the load is needed.
@@ -7684,5 +7467,352 @@ mod tests {
             why(indexed_root_load(0x0010_0000, 0x1181_4FAC)),
             "a buffer indexed by lane"
         );
+    }
+
+    #[test]
+    fn scalar_bit_tests_lower() {
+        // Each tests one bit of a constant into SCC and branches on it (only
+        // code with an effect needs its operands).
+        let tail = [
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        let bit_tests: [&[u32]; 4] = [
+            &[0xBE81_0387, 0xBF0C_8301], // s_mov_b32 s1, 7; s_bitcmp0_b32 s1, 3
+            &[0xBE81_0387, 0xBF0D_8301], // s_mov_b32 s1, 7; s_bitcmp1_b32 s1, 3
+            &[
+                0xBE80_0387, // s_mov_b32 s0, 7
+                0xBE81_0380, // s_mov_b32 s1, 0
+                0xBF0E_8300, // s_bitcmp0_b64 s[0:1], 3
+            ],
+            &[
+                0xBE80_0387, // s_mov_b32 s0, 7
+                0xBE81_0380, // s_mov_b32 s1, 0
+                0xBF0F_8300, // s_bitcmp1_b64 s[0:1], 3
+            ],
+        ];
+        for head in bit_tests {
+            let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
+            lowers(&words).unwrap();
+        }
+    }
+
+    /// An f16 (sign, 5-bit exponent, 10-bit fraction) as an f32; normal numbers only.
+    fn f16_value(h: u32) -> f32 {
+        let sign = if h >> 15 != 0 { -1.0 } else { 1.0 };
+        let exponent = (h >> 10 & 0x1F) as i32 - 15;
+        sign * (1.0 + (h & 0x3FF) as f32 / 1024.0) * 2f32.powi(exponent)
+    }
+
+    #[test]
+    fn inline_float_constants_mean_the_same_in_f16() {
+        // v_fma_mix and v_pack_b32_f16 read these as f16: 1.0 must be 0x3C00,
+        // not the low half (0) of the f32 bits 0x3F800000.
+        assert_eq!(inline_f16(242), 0x3C00);
+        for code in 240..=248u8 {
+            let f32_value = f32::from_bits(crate::resource::inline(code).unwrap());
+            let f16_value = f16_value(inline_f16(code));
+            assert!(
+                (f32_value - f16_value).abs() <= f32_value.abs() * 1e-3,
+                "inline constant {code}: f32 {f32_value}, f16 {f16_value}"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_conditional_moves_lower() {
+        // Each sets SCC, moves under it into a destination that already has a
+        // value, and branches on the result (only code with an effect needs
+        // its operands).
+        let tail = [
+            0xBF07_8002, // s_cmp_lg_u32 s2, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        let b32 = [
+            0xBE82_0387, // s_mov_b32 s2, 7
+            0xBE81_0381, // s_mov_b32 s1, 1
+            0xBF07_8001, // s_cmp_lg_u32 s1, 0
+            0xBE82_0501, // s_cmov_b32 s2, s1
+        ];
+        let k32 = [
+            0xBE82_0387, // s_mov_b32 s2, 7
+            0xBE81_0381, // s_mov_b32 s1, 1
+            0xBF07_8001, // s_cmp_lg_u32 s1, 0
+            0xB102_0005, // s_cmovk_i32 s2, 5
+        ];
+        let b64 = [
+            0xBE82_0387, // s_mov_b32 s2, 7
+            0xBE83_0387, // s_mov_b32 s3, 7
+            0xBE80_0381, // s_mov_b32 s0, 1
+            0xBE81_0381, // s_mov_b32 s1, 1
+            0xBF07_8000, // s_cmp_lg_u32 s0, 0
+            0xBE82_0600, // s_cmov_b64 s[2:3], s[0:1]
+        ];
+        for head in [&b32[..], &k32[..], &b64[..]] {
+            let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
+            lowers(&words).unwrap();
+        }
+    }
+
+    #[test]
+    fn signed_names_of_wrapping_integer_operations_match_the_unsigned_ones() {
+        // The low 32 bits of a sum, difference or product do not depend on
+        // the sign, so the _i32 forms lower exactly as their _u32 twins.
+        for (signed, unsigned) in [
+            (0x37F, 0x125), // v_add_nc_i32, v_add_nc_u32
+            (0x376, 0x126), // v_sub_nc_i32, v_sub_nc_u32
+            (0x16B, 0x169), // v_mul_lo_i32, v_mul_lo_u32
+        ] {
+            let a = lower_ps(vop3(signed, 0, 2, 259, 129)).unwrap();
+            let b = lower_ps(vop3(unsigned, 0, 2, 259, 129)).unwrap();
+            assert_eq!(a, b, "opcode {signed:#x}");
+        }
+    }
+
+    #[test]
+    fn sixteen_bit_signed_add_and_sub_lower_with_half_selects() {
+        // v_add_nc_i16 and v_sub_nc_i16, also reading the high halves.
+        for op in [0x30D, 0x30E] {
+            for opsel in [0, 1 << 11, 1 << 12 | 1 << 14] {
+                lower_ps(vop3(op, opsel, 2, 259, 259)).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn clamped_signed_operations_are_refused_not_miscompiled() {
+        // Clamping saturates; wrapping them would give other values.
+        let clamp = 1 << 15;
+        for op in [0x37F, 0x376, 0x16B, 0x30D, 0x30E] {
+            let err = lower_ps(vop3(op, clamp, 2, 259, 129)).unwrap_err();
+            assert!(
+                matches!(err, ShaderError::Unsupported { what, .. } if what.contains("modifier")),
+                "{op:#x}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sub_dword_lds_names() {
+        let s = |write, bits, signed, d16| {
+            Some(SubDword {
+                write,
+                bits,
+                signed,
+                d16,
+            })
+        };
+        assert_eq!(SubDword::of("ds_read_i8"), s(false, 8, true, None));
+        assert_eq!(SubDword::of("ds_read_u16"), s(false, 16, false, None));
+        assert_eq!(
+            SubDword::of("ds_read_u8_d16"),
+            s(false, 8, false, Some(false))
+        );
+        assert_eq!(
+            SubDword::of("ds_read_i16_d16_hi"),
+            s(false, 16, true, Some(true))
+        );
+        assert_eq!(SubDword::of("ds_write_b8"), s(true, 8, false, None));
+        assert_eq!(
+            SubDword::of("ds_write_b16_d16_hi"),
+            s(true, 16, false, Some(true))
+        );
+        for name in [
+            "ds_read_b32",
+            "ds_read2_b32",
+            "ds_write_b64",
+            "ds_write_b8_d16",
+            "ds_read_u8_d32",
+            "ds_add_u32",
+        ] {
+            assert_eq!(SubDword::of(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn scalar_pack_extend_and_absdiff_lower() {
+        // Each computes into s2 from two constants and branches on it (only
+        // code with an effect needs its operands).
+        let head = [
+            0xBE80_0387, // s_mov_b32 s0, 7
+            0xBE81_0383, // s_mov_b32 s1, 3
+        ];
+        let tail = [
+            0xBF07_8002, // s_cmp_lg_u32 s2, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        let ops = [
+            0x9602_0100, // s_absdiff_i32 s2, s0, s1
+            0xBE82_1901, // s_sext_i32_i8 s2, s1
+            0xBE82_1A01, // s_sext_i32_i16 s2, s1
+            0x9902_0100, // s_pack_ll_b32_b16 s2, s0, s1
+            0x9982_0100, // s_pack_lh_b32_b16 s2, s0, s1
+            0x9A02_0100, // s_pack_hh_b32_b16 s2, s0, s1
+        ];
+        for op in ops {
+            let words: Vec<u32> = head.iter().chain(&[op]).chain(&tail).copied().collect();
+            lowers(&words).unwrap();
+        }
+    }
+
+    #[test]
+    fn cube_descriptor_dwords_read_as_data() {
+        // A cube image's descriptor (a table range at s0) is loaded, sized
+        // with image_get_resinfo, and its depth dword (4: the six faces, so
+        // 5) is read as a number and branched on.
+        let table = || vec![root(RootType::Table, 0, 0)];
+        let words = [
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF40C_0100,
+            0xFA00_0000, // s_load_dwordx8 s[4:11], s[0:1], null
+            0x7E04_0480, // v_mov_b32 v2, 0
+            0xF038_0318,
+            0x0001_0402, // image_get_resinfo v[4:5], v2, s[4:11] dim:SQ_RSRC_IMG_CUBE
+            0xBF06_8508, // s_cmp_eq_u32 s8, 5
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        lower_with(&words, table(), vec![]).unwrap();
+        // The same with a 2D image (dim 1) also lowers.
+        let mut flat = words;
+        flat[4] = 0xF038_0308;
+        lower_with(&flat, table(), vec![]).unwrap();
+    }
+
+    #[test]
+    fn a_descriptor_selected_by_scc_picks_its_heap_index() {
+        // Two buffer descriptors loaded from the table at s0, one picked by
+        // a root constant (s1) with s_cselect_b64 per half, and loaded
+        // through by index and stored to LDS so the load is needed.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF408_0302,
+            0xFA00_0010, // s_load_dwordx4 s[12:15], s[4:5], 0x10
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0x8590_0C08, // s_cselect_b64 s[16:17], s[8:9], s[12:13]
+            0x8592_0E0A, // s_cselect_b64 s[18:19], s[10:11], s[14:15]
+            0xE030_2000,
+            0x8004_0100, // buffer_load_dword v1, v0, s[16:19], 0 idxen
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let layout = || vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        // Both are structured buffers of dwords in the table's range.
+        let used = || {
+            vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }]
+        };
+        lower_with(&words, layout(), used()).unwrap();
+    }
+
+    #[test]
+    fn buffer_formats_by_number() {
+        // The numbers the disassembler names 8_8_8_8_UNORM, 16_16_SNORM,
+        // 2_10_10_10_UNORM, 16_FLOAT, 32_32_32_32_FLOAT.
+        assert_eq!(buffer_format(56), Some((&[8, 8, 8, 8][..], Numeric::Unorm)));
+        assert_eq!(buffer_format(24), Some((&[16, 16][..], Numeric::Snorm)));
+        assert_eq!(
+            buffer_format(50),
+            Some((&[10, 10, 10, 2][..], Numeric::Unorm))
+        );
+        assert_eq!(buffer_format(13), Some((&[16][..], Numeric::Float)));
+        assert_eq!(
+            buffer_format(77),
+            Some((&[32, 32, 32, 32][..], Numeric::Float))
+        );
+        // Invalid, a packed float, past the table.
+        assert_eq!(buffer_format(0), None);
+        assert_eq!(buffer_format(36), None);
+        assert_eq!(buffer_format(78), None);
+    }
+}
+
+#[cfg(test)]
+mod select_tests {
+    use super::super::emit;
+    use crate::native::{ComputeIo, RootParam};
+    use crate::{Container, FourCC, HwStage, NativeProgram, ResourceType, RootType, UsedResource};
+
+    #[test]
+    fn selects_from_independently_written_mask_words() {
+        let words = [
+            0xbe81_0380u32, // s1 = 0 (table address high)
+            0xf408_0200,
+            0xfa00_0000, // load UAV into s[8:11]
+            0xbe84_03ff,
+            0x8000_0000, // s4 = lane 31
+            0xbe85_0381, // s5 = lane 32 in wave64
+            0x7e02_028b,
+            0x7e04_029d, // v1 = 11, v2 = 29
+            0xd501_0003,
+            0x0012_0501, // v_cndmask_b32 v3, v1, v2, s[4:5]
+            0x3402_0082, // v1 = 4 * v0
+            0xe070_1000,
+            0x8002_0301, // store v3 to UAV at v1
+            0xbf81_0000,
+        ];
+        let container = crate::dxbc::build(&[]);
+        let c = Container::parse(&container).unwrap();
+        for (wave64, uses_select) in [(false, true), (true, true), (true, false)] {
+            let mut words = words;
+            if !uses_select {
+                words[12] = 0x8002_0101; // store v1 instead of the select result
+            }
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64,
+                vgprs: 4,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                io: crate::native::StageIo::Cs(ComputeIo {
+                    rsrc2: 2,
+                    threads: [if wave64 { 64 } else { 32 }, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = crate::ir::build(&native.code, wave64, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+            let shader = emit(&c, &native, &p, &st, &io, &res).unwrap();
+            let emitted = Container::parse(&shader.dxil).unwrap();
+            let features = emitted.part(FourCC::SFI0).unwrap();
+            let wave_ops = u64::from_le_bytes(features.data.try_into().unwrap()) & 0x4000 != 0;
+            assert_eq!(wave_ops, uses_select);
+        }
     }
 }
