@@ -2096,6 +2096,17 @@ impl<'a> Lower<'a> {
     /// Values of the program's input registers.
     fn inputs(&mut self) -> Result<(), Stop> {
         let io_inputs: HashMap<Value, Input> = self.x.io.inputs.iter().copied().collect();
+        // RDNA2 POPS (ROV) pixel shaders read a hardware wave-ordering SGPR
+        // (bit 31 = overlap flag) and spin on `src_pops_exiting_wave_id` (239)
+        // when bit 31 is set. Zeroing that SGPR takes the non-overlapping fast
+        // path straight past the `s_sleep` spin loop into the critical section.
+        let uses_pops = self.s.pixel
+            && self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|inst| {
+                matches!(
+                    &inst.fields,
+                    Fields::Sop { src, .. } if src.contains(&Operand::Const(239))
+                )
+            });
         for &(reg, v) in &self.x.p.inputs {
             let val = match reg {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
@@ -2121,7 +2132,7 @@ impl<'a> Lower<'a> {
                     // within the first few after the 32 user SGPRs.
                     None if n <= 105
                         && (self.s.threads.is_some() && self.s.mesh.is_none()
-                            || self.s.pixel && n >= 40) =>
+                            || self.s.pixel && (n >= 40 || uses_pops)) =>
                     {
                         Val::I32(self.s.m.i32(0))
                     }
@@ -2340,7 +2351,9 @@ impl<'a> Lower<'a> {
             // shortcut: descriptors a program that traces rays reads as data
             // (a hit's material, say): no ray hits anything.
             Some(&Val::Missing(
-                "a descriptor's address or format read as data" | "a descriptor read only as data",
+                "a descriptor's address or format read as data"
+                | "a descriptor read only as data"
+                | "a constant buffer's descriptor read as data",
             )) if crate::resource::traces_rays(self.x.p) => {
                 return Ok(Val::I32(self.s.m.i32(0)));
             }
@@ -3199,6 +3212,9 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            // RDNA2 `src_pops_exiting_wave_id`: POPS spin-wait counter (bypassed
+            // on host by zeroing the POPS overlap SGPR at PS entry).
+            Operand::Const(239) => Ok(self.s.m.i32(0)),
             // SCC as a number.
             Operand::Const(253) => {
                 let bit = self.scc_in(inst)?;
