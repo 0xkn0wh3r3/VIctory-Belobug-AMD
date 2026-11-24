@@ -62,6 +62,10 @@ pub(crate) struct Staging {
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
+    /// How often in a row it had not changed, and the frame to look at it
+    /// next in.
+    still: u32,
+    next: u64,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -248,6 +252,12 @@ impl Staging {
             );
             return (0, false);
         }
+        // shortcut: contents that did not change the last times are looked at
+        // every 2, 4 and at most 8 frames.
+        let frame = crate::queue::presented() + 1;
+        if !cfg!(test) && last.hash.is_some() && frame < last.next {
+            return (0, false);
+        }
         // Read through the kernel, as above: the title may unmap the pages
         // (evicting a texture a big table lists) while we read them, and a
         // direct read would fault. The copy is reused, not kept per texture.
@@ -255,6 +265,12 @@ impl Staging {
             tiled.resize(size, 0);
             crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
             let read = self.changed(last, tiled);
+            last.still = if read.1 { 0 } else { (last.still + 1).min(5) };
+            // Not all in the same frame.
+            last.next = match last.still {
+                0 | 1 => 0,
+                k => frame + (1 << (k - 1).min(3)) - (self.memory as u64 >> 16) % 2,
+            };
             // As in `with_tiled_copy`: a one-off huge read is not kept.
             if tiled.capacity() > 64 << 20 {
                 *tiled = Vec::new();
