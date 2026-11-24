@@ -1238,6 +1238,11 @@ fn log_memory(peak: &mut usize) {
     *peak = (*peak).max(commit);
     // Committed bytes by kind, and private ones by allocation.
     let (mut private, mut mapped, mut image) = (0usize, 0usize, 0usize);
+    // Private memory below 2^40 is the title's (`XMemVirtualAlloc` keeps
+    // it there); above, the host heap's, the driver's and the title's own
+    // kernel32 allocations. Allocations by size: under 1, 16, 64 MiB, more.
+    let mut low = 0usize;
+    let mut sizes = [(0usize, 0usize); 4];
     let mut by_base: HashMap<usize, usize> = HashMap::new();
     let mut at = 0usize;
     loop {
@@ -1264,6 +1269,24 @@ fn log_memory(peak: &mut usize) {
         };
         at = next;
     }
+    for (&base, &n) in &by_base {
+        if base < 1 << 40 {
+            low += n;
+        }
+        let bucket = match n {
+            n if n < MIB => 0,
+            n if n < 16 * MIB => 1,
+            n if n < 64 * MIB => 2,
+            _ => 3,
+        };
+        sizes[bucket].0 += 1;
+        sizes[bucket].1 += n;
+    }
+    let sizes: Vec<String> = ["<1M", "<16M", "<64M", ">=64M"]
+        .iter()
+        .zip(sizes)
+        .map(|(name, (count, n))| format!("{name} {count}x {} MiB", n / MIB))
+        .collect();
     let mut largest: Vec<(usize, usize)> = by_base.into_iter().collect();
     largest.sort_unstable_by_key(|&(_, n)| std::cmp::Reverse(n));
     let largest: Vec<String> = largest
@@ -1274,11 +1297,14 @@ fn log_memory(peak: &mut usize) {
     let pages = physical().pages.len() * PAGE;
     tracing::info!(
         target: "victory::memory",
-        "commit {} MiB (peak {} MiB): private {} MiB, mapped {} MiB, image {} MiB; \
+        "commit {} MiB (peak {} MiB): private {} MiB (title range {} MiB; by allocation: {}), \
+         mapped {} MiB, image {} MiB; \
          physical pages {} MiB of sections {} MiB; {}; largest private: {}",
         commit / MIB,
         *peak / MIB,
         private / MIB,
+        low / MIB,
+        sizes.join(", "),
         mapped / MIB,
         image / MIB,
         pages / MIB,
