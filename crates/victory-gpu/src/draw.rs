@@ -1050,6 +1050,11 @@ impl State {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
+        if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES {
+            crate::indirect::done(list, &args.buffer);
+            why("a rectangle list (rectangles are expanded for direct draws only)");
+            return false;
+        }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
