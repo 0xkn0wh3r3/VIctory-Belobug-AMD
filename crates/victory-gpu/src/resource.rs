@@ -764,6 +764,31 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    /// What the driver allocates for it (counted in [`crate::memstat`]).
+    bytes: u64,
+}
+
+#[cfg(windows)]
+impl Drop for HostTexture {
+    fn drop(&mut self) {
+        crate::memstat::sub(&crate::memstat::HOST_TEXTURES, self.bytes);
+        crate::memstat::sub(&crate::memstat::HOST_TEXTURE_COUNT, 1);
+    }
+}
+
+/// The driver's allocation size for `texture`.
+#[cfg(windows)]
+fn allocation_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u64 {
+    let Some(host) = crate::host::host() else {
+        return 0;
+    };
+    // SAFETY: a live resource and its own description.
+    unsafe {
+        let desc = texture.GetDesc();
+        host.device
+            .GetResourceAllocationInfo(0, &[desc])
+            .SizeInBytes
+    }
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -944,8 +969,12 @@ fn hand_out_resource(
         #[cfg(windows)]
         host: host.map(|texture| {
             let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
+            let bytes = allocation_bytes(&texture);
+            crate::memstat::add(&crate::memstat::HOST_TEXTURES, bytes);
+            crate::memstat::add(&crate::memstat::HOST_TEXTURE_COUNT, 1);
             std::sync::Arc::new(HostTexture {
                 texture,
+                bytes,
                 state: state.into(),
             })
         }),
@@ -1180,6 +1209,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
+    crate::memstat::PLACED_COUNT.store(map.len() as u64, std::sync::atomic::Ordering::Relaxed);
     resource(out).host.is_some().then_some(out)
 }
 
