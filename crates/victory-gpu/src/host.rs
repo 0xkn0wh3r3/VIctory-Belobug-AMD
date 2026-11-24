@@ -95,7 +95,7 @@ static RETIRED: Mutex<std::collections::VecDeque<(u64, Box<dyn std::any::Any + S
     Mutex::new(std::collections::VecDeque::new());
 
 /// Frames a retired object is held for.
-const RETIRED_FRAMES: u64 = 4;
+const RETIRED_FRAMES: u64 = 120;
 
 /// Frees `object` some frames from now.
 pub(crate) fn retire(object: impl std::any::Any + Send) {
@@ -106,6 +106,11 @@ pub(crate) fn retire(object: impl std::any::Any + Send) {
 
 /// Frees what was retired [`RETIRED_FRAMES`] frames before `frame`.
 pub(crate) fn free_retired(frame: u64) {
+    // Diagnostics (`VICTORY_KEEP_RETIRED`): nothing is freed, to tell a use
+    // after free from a wild address.
+    if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_KEEP_RETIRED").is_some() {
+        return;
+    }
     let free: Vec<_> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         let n = retired.iter().take_while(|r| r.0 + RETIRED_FRAMES <= frame).count();
