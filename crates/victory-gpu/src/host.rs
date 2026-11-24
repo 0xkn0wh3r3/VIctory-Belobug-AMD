@@ -38,6 +38,8 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
+    /// Resizable BAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`) supported by device/OS.
+    pub(crate) gpu_upload: bool,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -322,6 +324,18 @@ impl Host {
                 )
                 .is_ok()
                 && options.DepthBoundsTestSupported.as_bool();
+            let mut options16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            let gpu_upload = !cfg!(test)
+                && std::env::var_os("VICTORY_NO_GPU_UPLOAD").is_none()
+                && device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS16,
+                        (&raw mut options16).cast(),
+                        size_of_val(&options16) as u32,
+                    )
+                    .is_ok()
+                && options16.GPUUploadHeapSupported.as_bool();
+            tracing::info!(gpu_upload, "D3D12 GPU upload heap (Resizable BAR)");
             let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                 Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
                 ..Default::default()
@@ -345,6 +359,7 @@ impl Host {
             Ok(Host {
                 device,
                 depth_bounds_supported,
+                gpu_upload,
                 queue,
                 fence,
                 submitted: Mutex::new(0),
@@ -1018,10 +1033,41 @@ impl Host {
                 back.push((shadow, address, len));
             }
         }
-        for (shadow, address, len) in &back {
-            let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len);
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        if back.len() <= 1 {
+            for (shadow, address, len) in &back {
+                let written = shadow.copy_back(*address, *len);
+                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            }
+        } else {
+            // Group by Shadow pointer so distinct shadows run in parallel
+            // across CPU cores without lock contention on `before`/`pending`.
+            let mut groups: Vec<Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>> =
+                Vec::new();
+            for item in back {
+                if let Some(g) = groups
+                    .iter_mut()
+                    .find(|g| std::sync::Arc::ptr_eq(&g[0].0, &item.0))
+                {
+                    g.push(item);
+                } else {
+                    groups.push(vec![item]);
+                }
+            }
+            if groups.len() <= 1 {
+                for (shadow, address, len) in &groups[0] {
+                    let written = shadow.copy_back(*address, *len);
+                    COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                }
+            } else {
+                in_parallel(&groups, 8, |chunk| {
+                    for g in chunk {
+                        for (shadow, address, len) in g {
+                            let written = shadow.copy_back(*address, *len);
+                            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
         }
         for list in runs {
             for rb in &list.deferred().readbacks {
@@ -2460,12 +2506,10 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 }
 
 impl Host {
-    /// A buffer in the upload heap, mapped for writing.
+    /// A buffer in GPU-upload (Resizable BAR VRAM, when supported and within
+    /// 85% of the live VRAM budget) or standard upload heap, mapped for CPU
+    /// writing.
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_UPLOAD,
-            ..Default::default()
-        };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: size.max(1),
@@ -2479,26 +2523,43 @@ impl Host {
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of an upload buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                    &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
+        let use_gpu_upload = self.gpu_upload
+            && video_memory().is_none_or(|[(used, budget), _]| {
+                budget == 0 || used.saturating_add(size) < budget * 85 / 100
+            });
+        let try_make = |heap_type: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES| {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: heap_type,
+                ..Default::default()
+            };
+            let mut buffer: Option<ID3D12Resource> = None;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: plain creation and mapping of an upload buffer.
+            let made = unsafe {
+                self.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        state,
+                        None,
+                        &mut buffer,
+                    )
+                    .and_then(|()| {
+                        let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                        b.Map(0, None, Some(&mut data))
+                    })
+            };
+            made.map(|()| (buffer, data))
+        };
+        let made = if use_gpu_upload {
+            try_make(D3D12_HEAP_TYPE_GPU_UPLOAD, D3D12_RESOURCE_STATE_COMMON)
+                .or_else(|_| try_make(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ))
+        } else {
+            try_make(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)
         };
         match made {
-            Ok(()) => {
+            Ok((buffer, data)) => {
                 let buffer = buffer?;
                 crate::memstat::track(&buffer, 0, size);
                 Some((buffer, data.cast()))

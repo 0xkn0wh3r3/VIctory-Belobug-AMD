@@ -20,6 +20,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Incremented whenever any guarded block is opened (VEH guard fault or
+/// `writing`) or remapped/rewritten (`title_memory_remapped` /
+/// `title_memory_written`). While this stays unchanged, any range already
+/// guarded and copied at this epoch cannot have been modified by the title.
+static GUARD_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn guard_epoch() -> u64 {
+    GUARD_EPOCH.load(Ordering::Acquire)
+}
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -89,6 +100,36 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let now = j.asked;
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
     for page in pages.collect::<Vec<_>>() {
+        j.written.insert(page, now);
+    }
+    Some((
+        now,
+        j.written
+            .range(first..last)
+            .map(|(&p, &w)| (p, w))
+            .collect(),
+    ))
+}
+
+/// Same as [`writes`] for memory already known to be guarded `MEM_MAPPED`
+/// view memory: skips the `GetWriteWatch` syscall (which always fails on
+/// mapped views).
+pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let guarded = guard(first * PAGE, last * PAGE)?;
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::Watches, 1);
+        add(C::WatchUs, started.elapsed().as_micros() as u64);
+    }
+    j.asked += 1;
+    let now = j.asked;
+    for page in guarded {
         j.written.insert(page, now);
     }
     Some((
@@ -287,6 +328,9 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
     }
+    if !blocks.is_empty() {
+        GUARD_EPOCH.fetch_add(1, Ordering::Release);
+    }
     !blocks.is_empty()
 }
 
@@ -318,12 +362,16 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             .range(at / BLOCK..end.div_ceil(BLOCK))
             .copied()
             .collect();
+        let changed = !holes.is_empty() || !blocks.is_empty();
         for block in holes {
             g.holes.remove(&block);
         }
         for block in blocks {
             g.protected.remove(&block);
             g.clean.remove(&block);
+        }
+        if changed {
+            GUARD_EPOCH.fetch_add(1, Ordering::Release);
         }
     }
     crate::shadow::remapped(at as u64, end as u64);
@@ -343,6 +391,7 @@ pub fn title_memory_committed(at: usize, len: usize) {
 /// next use, not when their turn to be looked at comes.
 pub fn title_memory_written(at: usize, len: usize) {
     if len != 0 {
+        GUARD_EPOCH.fetch_add(1, Ordering::Release);
         crate::resource::textures_rewritten(at as u64, (at + len) as u64);
     }
 }

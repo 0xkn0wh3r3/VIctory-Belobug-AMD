@@ -48,6 +48,9 @@ pub(crate) struct Shadow {
     direct: Option<Direct>,
     /// Ranges that cannot be watched, with the frame they were copied in.
     unwatched: Mutex<std::collections::HashMap<(usize, usize), u64>>,
+    /// Ranges already guarded and copied at `guard_epoch` (O(1) fast path when
+    /// zero guard faults/remaps occurred since).
+    clean_spans: Mutex<(u64, std::collections::HashSet<(usize, usize)>)>,
     /// The buffer has memory only where it was brought up to date.
     sparse: Option<Sparse>,
 }
@@ -150,6 +153,7 @@ fn give_back(v: Vec<u8>) {
 }
 
 const NOT_WATCHED: u8 = 2;
+const WATCHED_GUARDED: u8 = 3;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
@@ -221,6 +225,7 @@ impl Shadow {
             before: Mutex::default(),
             direct: None,
             unwatched: Mutex::default(),
+            clean_spans: Mutex::default(),
             sparse: None,
         }
     }
@@ -484,10 +489,69 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize, lazy: bool) -> usize {
-        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+        let mode = self.watched.load(Ordering::Relaxed);
+        if mode == WATCHED_GUARDED {
+            let ge = crate::watch::guard_epoch();
+            {
+                let spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
+                if spans.0 == ge && spans.1.contains(&(from, to)) {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        use crate::copystat::{C, add};
+                        add(C::Checked, (to - from) as u64);
+                        add(C::Unchanged, (to - from) as u64);
+                    }
+                    return 0;
+                }
+            }
+            if let Some((now, written)) = crate::watch::writes_guarded(from, to) {
+                let copied = self.copy_stale(from, to, now, &written);
+                if crate::watch::guard_epoch() == ge {
+                    let mut spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
+                    if spans.0 != ge {
+                        spans.0 = ge;
+                        spans.1.clear();
+                    }
+                    if spans.1.len() < 4096 {
+                        spans.1.insert((from, to));
+                    }
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::Checked, (to - from) as u64);
+                    add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+                }
+                return copied;
+            }
+        } else if mode != NOT_WATCHED {
+            // Probe write-watch first; if that fails and guard succeeds, mark
+            // this shadow as guarded so subsequent calls skip GetWriteWatch.
+            if let Some((now, written)) = crate::watch::writes(from, to, false) {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::Checked, (to - from) as u64);
+                    add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+                }
+                return copied;
+            }
+            let ge = crate::watch::guard_epoch();
+            if let Some((now, written)) = crate::watch::writes_guarded(from, to) {
+                self.watched.store(WATCHED_GUARDED, Ordering::Relaxed);
+                let copied = self.copy_stale(from, to, now, &written);
+                if crate::watch::guard_epoch() == ge {
+                    let mut spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
+                    if spans.0 != ge {
+                        spans.0 = ge;
+                        spans.1.clear();
+                    }
+                    if spans.1.len() < 4096 {
+                        spans.1.insert((from, to));
+                    }
+                }
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -750,6 +814,7 @@ fn placed(
             dead: std::sync::atomic::AtomicBool::new(false),
         }),
         unwatched: Mutex::default(),
+        clean_spans: Mutex::default(),
         sparse: None,
     })
 }
@@ -1395,6 +1460,7 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
         before: Mutex::default(),
         direct: None,
         unwatched: Mutex::default(),
+        clean_spans: Mutex::default(),
         sparse: Some(Sparse {
             tiles: Mutex::default(),
             before: Mutex::default(),
@@ -1574,8 +1640,10 @@ impl Shadow {
             let tile = ((at - start) / PAGE) as u32;
             before.entry(tile).or_insert_with(|| {
                 let whole = data as usize & !(PAGE - 1);
+                let mut buf = pooled(PAGE);
                 // SAFETY: the tile's mapping.
-                unsafe { std::slice::from_raw_parts(whole as *const u8, PAGE) }.to_vec()
+                buf.extend_from_slice(unsafe { std::slice::from_raw_parts(whole as *const u8, PAGE) });
+                buf
             });
         });
     }
@@ -1612,7 +1680,9 @@ impl Shadow {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
         if pending.is_empty() {
-            before.clear();
+            for (_, buf) in before.drain() {
+                give_back(buf);
+            }
         }
         written
     }
