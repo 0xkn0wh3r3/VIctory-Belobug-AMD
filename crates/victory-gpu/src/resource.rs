@@ -1328,12 +1328,21 @@ impl Drop for HeldTexture {
 /// A reference to `texture` if it is a placed texture alive now.
 #[cfg(windows)]
 pub(crate) fn hold_placed(texture: This) -> Option<HeldTexture> {
-    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    map.values().any(|&(r, _)| r == texture as usize).then(|| {
+    let _map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let live = PLACED_LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    live.contains(&(texture as usize)).then(|| {
         object::add_ref(texture);
         HeldTexture(texture)
     })
 }
+
+/// The placed textures alive now, and the longest there was. Locked after
+/// [`PLACED_TEXTURES`], changed with it.
+#[cfg(windows)]
+static PLACED_LIVE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<usize>>> =
+    std::sync::LazyLock::new(Default::default);
+#[cfg(windows)]
+static PLACED_LONGEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The placed textures alive now (resource objects).
 #[cfg(windows)]
@@ -1353,9 +1362,11 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if address == 0 {
         return None;
     }
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&(r, _)) = map.get(&(address, *desc)) {
-        return Some(r as This);
+    {
+        let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&(r, _)) = map.get(&(address, *desc)) {
+            return Some(r as This);
+        }
     }
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
@@ -1364,7 +1375,13 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     }
     let size = footprint(&d).map_or(1, |info| info.size.max(1));
     let end = address.saturating_add(size);
+    // The title's pages for it may not be there yet (streaming): nothing to
+    // show, and the console's whole address space would not fit in memory.
+    if !cfg!(test) && !crate::texture::committed(address as *const u8, size as usize) {
+        return None;
+    }
     let mut out = std::ptr::null();
+    // Outside the lock: making one takes a while.
     let made = create_at_address(
         std::ptr::null(),
         address,
@@ -1378,10 +1395,17 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     if resource(out).host.is_none() {
-        drop(map);
         resource_release(out);
         return None;
     }
+    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(r, _)) = map.get(&(address, *desc)) {
+        drop(map);
+        resource_release(out);
+        return Some(r as This);
+    }
+    PLACED_LIVE.lock().unwrap_or_else(|e| e.into_inner()).insert(out as usize);
+    PLACED_LONGEST.fetch_max(end - address, std::sync::atomic::Ordering::AcqRel);
     map.insert((address, *desc), (out as usize, end));
     crate::memstat::PLACED_COUNT.store(map.len() as u64, std::sync::atomic::Ordering::Relaxed);
     Some(out)
@@ -1396,13 +1420,20 @@ pub(crate) fn evict_placed_textures(start: u64, end: u64) {
     let mut evicted = Vec::new();
     {
         let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-        map.retain(|&(addr, _), &mut (res, tex_end)| {
-            let overlaps = addr < end && tex_end > start;
-            if overlaps {
+        let longest = PLACED_LONGEST.load(std::sync::atomic::Ordering::Acquire);
+        let from = (start.saturating_sub(longest), [0u32; 14]);
+        let over: Vec<_> = map
+            .range(from..(end, [0u32; 14]))
+            .filter(|(_, (_, tex_end))| *tex_end > start)
+            .map(|(k, _)| *k)
+            .collect();
+        let mut live = PLACED_LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        for key in over {
+            if let Some((res, _)) = map.remove(&key) {
+                live.remove(&res);
                 evicted.push(res);
             }
-            !overlaps
-        });
+        }
     }
     if !evicted.is_empty() {
         PLACED_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);

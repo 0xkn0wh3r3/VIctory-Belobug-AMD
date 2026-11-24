@@ -69,7 +69,8 @@ unsafe impl Sync for Host {}
 /// runs a submission for most of a second in the world: freeing there was
 /// a GPU page fault on the freed texture (DXGI_ERROR_DEVICE_HUNG,
 /// 2026-11-24, RX 7600).
-static RETIRED: Mutex<Vec<Retired>> = Mutex::new(Vec::new());
+static RETIRED: Mutex<std::collections::VecDeque<Retired>> =
+    Mutex::new(std::collections::VecDeque::new());
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -80,7 +81,7 @@ static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// is not enough on its own. Ages are in frames presented to the host, not
 /// the title's 60 Hz clock (which ticks many times per host frame while
 /// the host runs at 1-2 fps).
-const KEEP_FRAMES: u64 = 60;
+const KEEP_FRAMES: u64 = 8;
 
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired {
@@ -100,7 +101,7 @@ unsafe impl Send for Retired {}
 pub(crate) fn retire<T: 'static>(object: T) {
     let submission = STARTED.load(Ordering::Acquire);
     let frame = crate::queue::presented();
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(Retired {
+    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back(Retired {
         submission,
         frame,
         object: Box::new(object),
@@ -118,14 +119,14 @@ fn bury(finished: u64) {
     let now = crate::queue::presented();
     let done: Vec<Retired> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-        if retired.is_empty() {
-            return;
-        }
-        let (done, keep) = std::mem::take(&mut *retired).into_iter().partition(|r| {
-            r.submission <= finished && now.saturating_sub(r.frame) >= KEEP_FRAMES
-        });
-        *retired = keep;
-        done
+        // In the order they came: the old ones are at the front.
+        let n = retired
+            .iter()
+            .take_while(|r| {
+                r.submission <= finished && now.saturating_sub(r.frame) >= KEEP_FRAMES
+            })
+            .count();
+        retired.drain(..n).collect()
     };
     drop(done);
 }
@@ -2060,8 +2061,8 @@ impl Batch {
             let Some(plan) = plan else {
                 continue;
             };
-            plan.copy_constants();
-            for (shadow, address, len) in &plan.reads {
+            let reads = plan.copy_constants();
+            for (shadow, address, len) in reads {
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -2426,12 +2427,14 @@ impl Meter {
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
-                "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
+                "[{} {}] {fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB, bindless plans \
                  {plans_ms:.1} ms; {gpu:.1} on the GPU; {back_ms:.1} copying back {back_mb:.1} MB; \
                  bindless records {records_ms:.1} ms), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect",
+                crate::descriptor::host::BACKLOG[0].load(Ordering::Relaxed),
+                crate::descriptor::host::BACKLOG[1].load(Ordering::Relaxed),
                 making = crate::pipeline::making()
             );
             #[cfg(feature = "diagnostics")]

@@ -208,6 +208,9 @@ impl Bindless {
     }
 }
 
+/// Slots waiting to be made: at submission, at recording (for the log).
+pub(crate) static BACKLOG: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
 /// What one bindless slot needs at submission.
 #[derive(Default)]
 struct SlotUse {
@@ -261,7 +264,7 @@ const WRITE_CAP: usize = 8 << 20;
 
 /// Gap below which two ranges of one host copy are refreshed as one: the
 /// write-watch answers by 64 KiB page, and fewer, larger askings cost less.
-const READ_GAP: usize = 1 << 20;
+const READ_GAP: usize = 64 << 10;
 
 /// What a submission does for a heap's bindless slots, made again only when
 /// the slots or what they view change ([`HostHeap::bindless_plan`]).
@@ -274,6 +277,9 @@ pub(crate) struct BindlessPlan {
     pub(crate) writes: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Misaligned constant buffers: bounce slice, title address, bytes.
     bounces: Vec<(usize, u64, u32)>,
+    /// Of them, those new in this plan.
+    fresh: Vec<(usize, u64, u32)>,
+    fresh_reads: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
     /// The frame (plus one) the bounces were last copied in.
     copied_in: AtomicU64,
     /// The host resources the slots view, held while a submission runs.
@@ -290,12 +296,19 @@ impl BindlessPlan {
     ///
     /// shortcut: all of them once a frame, else only for a plan not copied
     /// yet: the title writes constants before it points a slot at them.
-    pub(crate) fn copy_constants(&self) {
+    /// Returns the title memory to bring up to date, by the same rule.
+    pub(crate) fn copy_constants(&self) -> &[(Arc<crate::shadow::Shadow>, usize, usize)] {
         let frame = crate::queue::presented() + 1;
-        if self.copied_in.swap(frame, Ordering::AcqRel) == frame {
-            return;
-        }
-        for &(cpu, address, len) in &self.bounces {
+        // Counted for all plans: each is the one before with a few changes.
+        static FRAME: AtomicU64 = AtomicU64::new(0);
+        let all = FRAME.swap(frame, Ordering::AcqRel) != frame;
+        let fresh = self.copied_in.swap(frame, Ordering::AcqRel) == 0;
+        let (bounces, reads) = match (all || cfg!(test), fresh) {
+            (true, _) => (&self.bounces, &self.reads),
+            (_, true) => (&self.fresh, &self.fresh_reads),
+            _ => return &[],
+        };
+        for &(cpu, address, len) in bounces {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             {
@@ -308,6 +321,7 @@ impl BindlessPlan {
             crate::host::PREPARING[0].fetch_add(us, Ordering::Relaxed);
             crate::host::PREPARING[1].fetch_add(u64::from(len), Ordering::Relaxed);
         }
+        reads
     }
 }
 
@@ -1370,7 +1384,10 @@ impl HostHeap {
                 if gone {
                     remade.push(i);
                 }
-                if evicted || gone || viewed && u.unmapped {
+                if evicted
+                    || gone
+                    || viewed && u.unmapped && (u.placed.is_none() || (i + frame as u32) % 16 == 0)
+                {
                     dirty.insert(i);
                 }
             }
@@ -1398,6 +1415,8 @@ impl HostHeap {
         todo.extend(stale_views(&check).into_iter().map(|(i, v)| (i, Some(v))));
         let (started, left) = (std::time::Instant::now(), self.budget_left(0));
         let mut made_any = false;
+        let mut fresh = Vec::new();
+        let mut fresh_reads = Vec::new();
         let mut todo = todo.into_iter();
         for (index, entry) in todo.by_ref() {
             if started.elapsed().as_micros() as u64 > left {
@@ -1418,6 +1437,13 @@ impl HostHeap {
                     b.busy.remove(&index);
                 }
                 Some((_, Some(u))) => {
+                    fresh.extend(u.bounce);
+                    fresh_reads.extend(u.read.clone());
+                    // Drawn textures are brought up to date at recording.
+                    if u.placed.is_some_and(|t| t != 0) && !b.recorded.contains_key(&index) {
+                        b.record_pending.insert(index);
+                        self.record_hint.store(true, Ordering::Release);
+                    }
                     if u.read.is_some() || u.write.is_some() || u.bounce.is_some() {
                         b.busy.insert(index);
                     } else {
@@ -1431,6 +1457,8 @@ impl HostHeap {
         self.budget_spend(0, started.elapsed().as_micros() as u64);
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
         b.dirty.extend(todo.map(|(i, _)| i));
+        BACKLOG[0].store(b.dirty.len() as u64, Ordering::Relaxed);
+        BACKLOG[1].store(b.record_pending.len() as u64, Ordering::Relaxed);
         if !made_any && let Some(plan) = &b.plan {
             return Some(plan.clone());
         }
@@ -1448,6 +1476,8 @@ impl HostHeap {
             reads: merged(reads, READ_GAP),
             writes: merged(writes, 0),
             bounces,
+            fresh,
+            fresh_reads,
             copied_in: AtomicU64::new(0),
             _retained: retained,
         });
@@ -1516,6 +1546,8 @@ impl HostHeap {
                     slot.retained = Some(host_tex.clone());
                 } else {
                     self.set_unmapped_null(index, &view);
+                    // Its pages may come later.
+                    slot.unmapped = true;
                 }
             }
             _ => {

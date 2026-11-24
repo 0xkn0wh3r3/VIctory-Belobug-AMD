@@ -364,6 +364,22 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     let mut p = at as usize;
     let end = p + len;
+    if crate::shadow::in_place(p as u64, end as u64) {
+        return true;
+    }
+    if !cfg!(test) {
+        // A byte of each 64 KiB read: querying a page of a big region costs
+        // as much as its pages are many.
+        let mut byte = [0u8; 1];
+        while p < end {
+            if !crate::host::read_into(p as *const u8, &mut byte) {
+                return false;
+            }
+            p = (p + 1).next_multiple_of(1 << 16);
+        }
+        return end <= at as usize
+            || crate::host::read_into((end - 1) as *const u8, &mut byte);
+    }
     while p < end {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };

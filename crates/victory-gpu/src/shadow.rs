@@ -46,6 +46,8 @@ pub(crate) struct Shadow {
     /// The buffer is the title's memory itself ([`direct`]): nothing is
     /// copied either way.
     direct: Option<Direct>,
+    /// Ranges that cannot be watched, with the frame they were copied in.
+    unwatched: Mutex<std::collections::HashMap<(usize, usize), u64>>,
 }
 
 struct Direct {
@@ -216,6 +218,7 @@ impl Shadow {
             pending: Mutex::default(),
             before: Mutex::default(),
             direct: None,
+            unwatched: Mutex::default(),
         }
     }
 
@@ -470,6 +473,15 @@ impl Shadow {
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
+        // shortcut: memory that cannot be watched (unmapped, mostly) is copied
+        // once a frame.
+        let frame = crate::queue::presented() + 1;
+        {
+            let mut seen = self.unwatched.lock().unwrap_or_else(|e| e.into_inner());
+            if !cfg!(test) && seen.insert((from, to), frame) == Some(frame) {
+                return 0;
+            }
+        }
         self.copy(from, to);
         to - from
     }
@@ -595,6 +607,7 @@ fn placed(
             aliases: Mutex::default(),
             dead: std::sync::atomic::AtomicBool::new(false),
         }),
+        unwatched: Mutex::default(),
     })
 }
 
@@ -646,6 +659,15 @@ fn run_of(from: u64, to: u64) -> Option<(u64, u64)> {
         return None;
     }
     (start <= from && end >= to).then_some((start, end))
+}
+
+/// Whether `[address, end)` lies in a window made already.
+pub(crate) fn in_place(address: u64, end: u64) -> bool {
+    windows_of_memory()
+        .range(..=address)
+        .rev()
+        .take(8)
+        .any(|(_, s)| s.start + s.len >= end)
 }
 
 /// The window of title memory holding `[address, end)`, made on first use.
