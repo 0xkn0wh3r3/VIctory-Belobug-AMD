@@ -945,6 +945,10 @@ pub(crate) fn filled(start: u64, end: u64) {
         let first = (start.max(root.start) - root.start) / page;
         let last = (end.min(root.start + root.len) - root.start).div_ceil(page);
         for tile in first..last {
+            s.kept
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(tile as u32));
             let look = s
                 .looks
                 .lock()
@@ -965,6 +969,7 @@ pub(crate) fn filled(start: u64, end: u64) {
 pub(crate) fn remapped(start: u64, end: u64) {
     use windows::core::Interface;
     filled(start, end);
+    crate::memory::remapped(start, end);
     let mut map = windows_of_memory();
     if map.is_empty() {
         return;
@@ -1127,6 +1132,8 @@ struct Sparse {
     /// By tile: the frame to look at it next in, and how often in a row it
     /// had not changed.
     looks: Mutex<std::collections::HashMap<u32, Arc<Mutex<Look>>, Mix>>,
+    /// Tiles shaders reach by address: kept whatever asks about them.
+    kept: Mutex<std::collections::HashSet<u32, Mix>>,
     /// The same from other 64 KiB starts ([`Direct::aliases`]).
     aliases: Mutex<Vec<Arc<Shadow>>>,
     /// This is an alias of that one.
@@ -1248,9 +1255,10 @@ pub(crate) fn sweep(frame: u64) {
         }
         let old: Vec<(u32, Tile)> = {
             let mut tiles = s.tiles.lock().unwrap_or_else(|e| e.into_inner());
+            let kept = s.kept.lock().unwrap_or_else(|e| e.into_inner());
             let old: Vec<(u32, Tile)> = tiles
                 .iter()
-                .filter(|(_, t)| t.used + KEEP < frame)
+                .filter(|(at, t)| t.used + KEEP < frame && !kept.contains(at))
                 .map(|(&at, &t)| (at, t))
                 .collect();
             for (at, _) in &old {
@@ -1388,6 +1396,7 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
             tiles: Mutex::default(),
             before: Mutex::default(),
             looks: Mutex::default(),
+            kept: Mutex::default(),
             aliases: Mutex::default(),
             of,
         }),
@@ -1405,6 +1414,36 @@ fn sparse(address: u64, end: u64) -> Option<Arc<Shadow>> {
         .entry(address / CHUNK)
         .or_insert_with(|| sparse_buffer(address / CHUNK * CHUNK, CHUNK, None).map(Arc::new))
         .clone()
+}
+
+/// The sparse copy of the 2 GiB `address` is in.
+pub(crate) fn chunk(address: u64) -> Option<Arc<Shadow>> {
+    sparse(address, address + 1)
+}
+
+/// Shaders run by `list` reach the memory at `address` (and `len` bytes
+/// after it, more or less) by its address.
+pub(crate) fn declare(list: &HostList, address: u64, len: u64) {
+    if address >> 40 != 0 || address < 1 << 20 {
+        return;
+    }
+    let Some(s) = find_reaching(address, 1) else { return };
+    if s.is_direct() {
+        crate::memory::reach(address, Some((&s.buffer, s.start, s.len)));
+        return;
+    }
+    crate::memory::reach(address, None);
+    let Some(root) = chunk(address) else { return };
+    let Some(sparse) = &root.sparse else { return };
+    let end = (address + len).min(root.start + root.len);
+    {
+        let page = PAGE as u64;
+        let mut kept = sparse.kept.lock().unwrap_or_else(|e| e.into_inner());
+        for tile in (address - root.start) / page..(end - root.start).div_ceil(page) {
+            kept.insert(tile as u32);
+        }
+    }
+    root.refresh(list, address, end - address);
 }
 
 /// Maps tiles of a sparse buffer (`first`, then each the next) to heaps.

@@ -2606,6 +2606,177 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// `image_bvh64_intersect_ray`: the ray `words` (node pointer, extent,
+    /// origin, direction, inverse direction) against a node of the
+    /// acceleration structure, as the console's ray accelerator answers.
+    ///
+    /// A node pointer is an address over 8 with the node's kind in its low
+    /// bits: 0 to 3 a triangle of a node of 5 vertices, 4 a box of 4
+    /// children with 16-bit floats, 5 with 32-bit ones (4 child pointers,
+    /// then each child's minimum and maximum); the rest is the title's own.
+    /// A box gives its children hit, nearest first, then -1; a triangle the
+    /// distance and barycentrics i and j, each over the second value
+    /// (negative from behind), as the title divides them.
+    // shortcut: no watertight edges, no box growing.
+    fn intersect(&mut self, words: &[V; 12], guard: Option<V>) -> [V; 4] {
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let kf = |l: &mut Self, x: f32| l.s.m.f32(x.to_bits());
+        let [lo, hi, rest @ ..] = *words;
+        let f: Vec<V> = rest.iter().map(|&x| self.as_float(x)).collect();
+        let extent = f[0];
+        let (o, d, inv) = ([f[1], f[2], f[3]], [f[4], f[5], f[6]], [f[7], f[8], f[9]]);
+        let c = self.cur;
+        let (k3, k7, k29, not7, ones) = (k(self, 3), k(self, 7), k(self, 29), k(self, !7), k(self, u32::MAX));
+        let kind = self.s.m.bin(c, Bin::And, lo, k7);
+        let base = self.s.m.bin(c, Bin::And, lo, not7);
+        let alo = self.s.m.bin(c, Bin::Shl, base, k3);
+        let ahi = self.s.m.bin(c, Bin::Shl, hi, k3);
+        let up = self.s.m.bin(c, Bin::LShr, lo, k29);
+        let ahi = self.s.m.bin(c, Bin::Or, ahi, up);
+        let (k4, k5, k6) = (k(self, 4), k(self, 5), k(self, 6));
+        let and = |l: &mut Self, a: V, b: V| {
+            let c = l.cur;
+            l.s.m.bin(c, Bin::And, a, b)
+        };
+        let boxes = self.s.m.bin(c, Bin::And, kind, k6);
+        let is_box = self.s.m.cmp(c, pred::EQ, boxes, k4);
+        let is_tri = self.s.m.cmp(c, pred::IULT, kind, k4);
+        let (is_box, is_tri) = match guard {
+            Some(g) => (and(self, is_box, g), and(self, is_tri, g)),
+            None => (is_box, is_tri),
+        };
+
+        // Boxes.
+        let place = self.begin_guarded(Some(is_box));
+        let node = self.memory_dwords((alo, ahi), 28, true);
+        let c = self.cur;
+        let wide = self.s.m.cmp(c, pred::EQ, kind, k5);
+        let (k16, kffff) = (k(self, 16), k(self, 0xFFFF));
+        let f32t = self.s.t.f32;
+        let mut bounds = Vec::new();
+        for n in 0..24usize {
+            let full = self.as_float(node[4 + n]);
+            let w = node[4 + n / 2];
+            let h = if n % 2 == 1 { self.s.m.bin(c, Bin::LShr, w, k16) } else { w };
+            let h = self.s.m.bin(c, Bin::And, h, kffff);
+            let half = self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+            bounds.push(self.s.m.select(c, wide, full, half));
+        }
+        let (zero, far) = (kf(self, 0.0), kf(self, f32::INFINITY));
+        let mut hits: Vec<(V, V)> = Vec::new();
+        for child in 0..4usize {
+            let (mut near_all, mut far_all) = (zero, extent);
+            for axis in 0..3usize {
+                let side = |l: &mut Self, which: usize| {
+                    let x = bounds[6 * child + 3 * which + axis];
+                    let x = l.s.m.bin(c, Bin::Sub, x, o[axis]);
+                    l.s.m.bin(c, Bin::Mul, x, inv[axis])
+                };
+                let (a, b) = (side(self, 0), side(self, 1));
+                let (n, x) = (self.binary(36, a, b), self.binary(35, a, b));
+                near_all = self.binary(35, near_all, n);
+                far_all = self.binary(36, far_all, x);
+            }
+            let pointer = node[child];
+            let there = self.s.m.cmp(c, pred::NE, pointer, ones);
+            let meets = self.s.m.cmp(c, pred::OLE, near_all, far_all);
+            let hit = self.s.m.bin(c, Bin::And, there, meets);
+            let p = self.s.m.select(c, hit, pointer, ones);
+            let t = self.s.m.select(c, hit, near_all, far);
+            hits.push((p, t));
+        }
+        for (a, b) in [(0, 1), (2, 3), (0, 2), (1, 3), (1, 2)] {
+            let ((pa, ta), (pb, tb)) = (hits[a], hits[b]);
+            // Misses last, also behind hits infinitely far.
+            let later = self.s.m.cmp(c, pred::OGT, ta, tb);
+            let (pn, pf) = (self.s.m.select(c, later, pb, pa), self.s.m.select(c, later, pa, pb));
+            let (tn, tf) = (self.s.m.select(c, later, tb, ta), self.s.m.select(c, later, ta, tb));
+            hits[a] = (pn, tn);
+            hits[b] = (pf, tf);
+        }
+        let found: Vec<(V, V)> = hits.iter().map(|h| (h.0, ones)).collect();
+        let r = self.end_guarded(place, &found);
+
+        // Triangles.
+        let place = self.begin_guarded(Some(is_tri));
+        let node = self.memory_dwords((alo, ahi), 16, true);
+        let c = self.cur;
+        let vertex = |l: &mut Self, v: usize, axis: usize| l.as_float(node[3 * v + axis]);
+        // The vertices of each of the node's triangles.
+        const VERTICES: [[usize; 3]; 4] = [[0, 1, 2], [1, 3, 2], [2, 3, 4], [2, 4, 0]];
+        let is: Vec<V> = (0..3u32)
+            .map(|n| {
+                let n = k(self, n);
+                self.s.m.cmp(c, pred::EQ, kind, n)
+            })
+            .collect();
+        let mut v = [[zero; 3]; 3];
+        for (corner, row) in v.iter_mut().enumerate() {
+            for (axis, x) in row.iter_mut().enumerate() {
+                let mut at = vertex(self, VERTICES[3][corner], axis);
+                for n in (0..3).rev() {
+                    let other = vertex(self, VERTICES[n][corner], axis);
+                    at = self.s.m.select(c, is[n], other, at);
+                }
+                *x = at;
+            }
+        }
+        let sub = |l: &mut Self, a: [V; 3], b: [V; 3]| [0, 1, 2].map(|i| l.s.m.bin(c, Bin::Sub, a[i], b[i]));
+        let cross = |l: &mut Self, a: [V; 3], b: [V; 3]| {
+            [(1, 2), (2, 0), (0, 1)].map(|(i, j)| {
+                let x = l.s.m.bin(c, Bin::Mul, a[i], b[j]);
+                let y = l.s.m.bin(c, Bin::Mul, a[j], b[i]);
+                l.s.m.bin(c, Bin::Sub, x, y)
+            })
+        };
+        let dot = |l: &mut Self, a: [V; 3], b: [V; 3]| {
+            let x = l.s.m.bin(c, Bin::Mul, a[0], b[0]);
+            let x = l.fmad(a[1], b[1], x);
+            l.fmad(a[2], b[2], x)
+        };
+        let (e1, e2) = (sub(self, v[1], v[0]), sub(self, v[2], v[0]));
+        let p = cross(self, d, e2);
+        let det = dot(self, e1, p);
+        let tv = sub(self, o, v[0]);
+        let b1 = dot(self, tv, p);
+        let q = cross(self, tv, e1);
+        let b2 = dot(self, d, q);
+        let t = dot(self, e2, q);
+        let rest = self.s.m.bin(c, Bin::Sub, det, b1);
+        let b0 = self.s.m.bin(c, Bin::Sub, rest, b2);
+        // All on the side of the determinant.
+        let back = self.s.m.cmp(c, pred::OLT, det, zero);
+        let mut inside = self.s.m.cmp(c, pred::ONE, det, zero);
+        for x in [b0, b1, b2, t] {
+            let neg = self.s.m.bin(c, Bin::Sub, zero, x);
+            let x = self.s.m.select(c, back, neg, x);
+            let ok = self.s.m.cmp(c, pred::OGE, x, zero);
+            inside = self.s.m.bin(c, Bin::And, inside, ok);
+        }
+        // Which barycentrics i and j are: 8 bits per triangle.
+        let shift = self.s.m.bin(c, Bin::Shl, kind, k3);
+        let id = self.s.m.bin(c, Bin::LShr, node[15], shift);
+        let (one, two) = (k(self, 1), k(self, 2));
+        let pick = |l: &mut Self, id: V| {
+            let n = l.s.m.bin(c, Bin::And, id, k3);
+            let first = l.s.m.cmp(c, pred::EQ, n, one);
+            let second = l.s.m.cmp(c, pred::EQ, n, two);
+            let x = l.s.m.select(c, second, b2, b0);
+            l.s.m.select(c, first, b1, x)
+        };
+        let i = pick(self, id);
+        let id = self.s.m.bin(c, Bin::LShr, id, two);
+        let j = pick(self, id);
+        let unit = kf(self, 1.0);
+        let out = [(t, far), (det, unit), (i, zero), (j, zero)].map(|(x, miss)| {
+            let x = self.s.m.select(c, inside, x, miss);
+            self.as_int(x)
+        });
+        let found: Vec<(V, V)> = out.iter().zip(&r).map(|(&x, &before)| (x, before)).collect();
+        let r = self.end_guarded(place, &found);
+        [r[0], r[1], r[2], r[3]]
+    }
+
     /// The host's view of a buffer whose descriptor the code makes, the byte
     /// its base is at, and its stride.
     fn made_buffer(&mut self, inst: &Inst, rsrc: &Operand) -> Result<(V, V, V), Why> {
@@ -9673,6 +9844,27 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("a ray intersection's result");
             };
+            if name == "image_bvh64_intersect_ray" && !*a16 && self.x.res.addresses {
+                let mut regs = Vec::new();
+                for a in addr {
+                    if let Operand::Vector { reg, dwords } = *a {
+                        regs.extend((0..dwords).map(|k| reg + k));
+                    }
+                }
+                let words = regs
+                    .iter()
+                    .map(|&r| {
+                        let v = inst.read(Reg::V(r)).ok_or("a ray")?;
+                        self.i32_of(v)
+                    })
+                    .collect::<Result<Vec<V>, Why>>()?;
+                let words: [V; 12] = words.try_into().map_err(|_| "a ray")?;
+                let r = self.intersect(&words, guard);
+                for (k, x) in r.into_iter().enumerate() {
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                }
+                return Ok(());
+            }
             let none = self.s.m.i32(u32::MAX);
             for k in 0..4 {
                 self.write(inst, Reg::V(reg + k), none, guard);

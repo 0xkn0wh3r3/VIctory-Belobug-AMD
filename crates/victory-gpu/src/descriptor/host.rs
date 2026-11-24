@@ -55,6 +55,8 @@ pub(crate) struct HostHeap {
     recheck_at: AtomicU64,
     /// The rewritten textures ([`crate::resource::rewrites`]) seen.
     rewrites_seen: AtomicU64,
+    /// The views of memory by address made ([`crate::memory::fill`]).
+    memory_seen: Mutex<u64>,
 }
 
 struct StrideTable {
@@ -498,6 +500,7 @@ impl HostHeap {
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
         };
         let make = |count: u32| -> windows::core::Result<ID3D12DescriptorHeap> {
+            let count = if sampler { count } else { count + crate::memory::SLOTS };
             // SAFETY: plain heap creation.
             unsafe {
                 host.device
@@ -532,7 +535,7 @@ impl HostHeap {
         let wanted = count;
         let (heap, count, extra) = match make(count + extra) {
             Ok(heap) => (heap, count, extra),
-            Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
+            Err(e) if !sampler && count + extra + crate::memory::SLOTS > PORTABLE_VIEWS => {
                 // shortcut: descriptors past the host's limit are left out;
                 // draw::tables now remaps the root tables that reach them.
                 tracing::warn!(
@@ -543,8 +546,8 @@ impl HostHeap {
                     "host view heap capped at {PORTABLE_VIEWS}"
                 );
                 (
-                    make(PORTABLE_VIEWS).ok()?,
-                    PORTABLE_VIEWS - DYNAMIC_CAPPED,
+                    make(PORTABLE_VIEWS - crate::memory::SLOTS).ok()?,
+                    PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS,
                     DYNAMIC_CAPPED,
                 )
             }
@@ -604,17 +607,29 @@ impl HostHeap {
             record_looked: [AtomicU64::new(0), AtomicU64::new(0)],
             recheck_at: AtomicU64::new(u64::MAX),
             rewrites_seen: AtomicU64::new(0),
+            memory_seen: Mutex::new(0),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
         // used-resource entry names) read a wild address. Every slot starts
         // null instead.
         let started = std::time::Instant::now();
-        if let Err(e) = h.fill_null(kind, count + extra) {
+        let ours = if sampler { 0 } else { crate::memory::SLOTS };
+        if let Err(e) = h.fill_null(kind, count + extra + ours) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
         h
+    }
+
+    /// The first slot of memory by address, its views made.
+    pub(crate) fn memory(&self) -> u32 {
+        let first = self.count + self.spare;
+        if let Some(host) = host() {
+            let mut seen = self.memory_seen.lock().unwrap_or_else(|e| e.into_inner());
+            *seen = crate::memory::fill(&host.device, *seen, |k| self.cpu(first + k));
+        }
+        first
     }
 
     /// Makes the first `total` slots null: one null slot in a CPU-side heap,

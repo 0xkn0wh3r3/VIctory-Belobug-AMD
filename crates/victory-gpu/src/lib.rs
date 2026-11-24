@@ -34,6 +34,8 @@ mod indirect;
 pub mod list;
 #[cfg(windows)]
 mod memwait;
+#[cfg(windows)]
+mod memory;
 mod timeline;
 pub mod memstat;
 pub mod object;

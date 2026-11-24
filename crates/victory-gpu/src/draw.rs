@@ -417,6 +417,7 @@ impl State {
                     0
                 }
             },
+            (Some(Root::View(address)), RootType::Descriptor) => (address >> (32 * dword.min(1))) as u32,
             (Some(Root::Constants(c)), RootType::Constants) => {
                 c.get(dword as usize).copied().unwrap_or(0)
             }
@@ -429,6 +430,50 @@ impl State {
                 0
             }
         }
+    }
+
+    /// For shaders that reach memory by its address: the memory the roots
+    /// lead to made reachable, and the bound heap's first slot of it (a
+    /// heap of ours bound if the title bound none).
+    fn memory(&mut self, list: &HostList, compute: bool) -> Option<u32> {
+        // How much a root view or a pointer leads to is not known.
+        const REACH: u64 = 1 << 20;
+        for root in self.roots_ref(compute) {
+            match root {
+                Root::View(address) => crate::shadow::declare(list, *address, REACH),
+                Root::Constants(words) => {
+                    for w in words.windows(2) {
+                        let address = u64::from(w[0]) | u64::from(w[1]) << 32;
+                        if (1..=0xff).contains(&w[1]) && w[0] != u32::MAX && address % 4 == 0 {
+                            crate::shadow::declare(list, address, REACH);
+                        }
+                    }
+                    // Pointers over 256, as the acceleration structures'.
+                    for &w in words {
+                        if (0x50_0000..0xff_0000).contains(&(w >> 4)) {
+                            crate::shadow::declare(list, u64::from(w) << 8, REACH);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if self.heaps[0] != 0 {
+            return Some(crate::descriptor::heap(self.heaps[0] as This).host()?.memory());
+        }
+        static OURS: std::sync::OnceLock<Option<crate::descriptor::host::HostHeap>> =
+            std::sync::OnceLock::new();
+        let heap = OURS
+            .get_or_init(|| crate::descriptor::host::HostHeap::new(false, 16))
+            .as_ref()?;
+        const OURS_BOUND: [usize; 2] = [usize::MAX, 0];
+        if self.host_heaps != OURS_BOUND {
+            // SAFETY: an open list and a shader-visible heap.
+            unsafe { list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]) };
+            self.host_heaps = OURS_BOUND;
+            self.host_roots = [0; 2];
+        }
+        Some(heap.memory())
     }
 
     /// The bound heap holding `handle`.
@@ -541,9 +586,20 @@ impl State {
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         self.null_uav = false;
         let l = &list.list;
+        let by_address = p.stages.iter().any(|s| {
+            s.translated()
+                .host
+                .user_data
+                .iter()
+                .any(|u| u.root == RootType::MEMORY)
+        });
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        if self.host_heaps != self.heaps {
+        let memory = by_address.then(|| self.memory(list, compute)).flatten();
+        if by_address && memory.is_none() {
+            return false;
+        }
+        if self.host_heaps != self.heaps && !(by_address && self.heaps[0] == 0) {
             let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
                 .heaps
                 .iter()
@@ -603,6 +659,10 @@ impl State {
                     let fresh = made
                         .iter()
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
+                    if u.root == RootType::MEMORY {
+                        values[u.index as usize] = memory.unwrap_or(0);
+                        continue;
+                    }
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
                         None => self.user_value(compute, u.slot, u.root, u.dword),
