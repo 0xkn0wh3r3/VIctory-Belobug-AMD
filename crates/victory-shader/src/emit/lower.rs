@@ -682,8 +682,7 @@ impl<'a> Lower<'a> {
         };
         let c = self.cur;
         let mut off = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
-            let d = self.i32_of(d)?;
+        if let Some(d) = self.dynamic_term(&a)? {
             off = self.s.m.bin(c, Bin::Add, off, d);
         }
         let h = if a.param == CODE {
@@ -1279,6 +1278,25 @@ impl<'a> Lower<'a> {
         e.interp = mode;
         self.s.flags |= flags::BARYCENTRICS;
         self.load_any_input(id, index + 1)
+    }
+
+    /// The computed byte offset `a` adds to its parameter's address: its
+    /// computed term, less the parameter's address when that term is a
+    /// pointer that holds it (see [`Address::includes_base`]).
+    fn dynamic_term(&mut self, a: &Address) -> Result<Option<V>, Why> {
+        let Some(d) = a.dynamic else { return Ok(None) };
+        let d = self.i32_of(d)?;
+        if !a.includes_base {
+            return Ok(Some(d));
+        }
+        if a.param == CODE {
+            return Err("an address from a phi");
+        }
+        let base = match self.user(a.param, 0) {
+            Val::I32(x) => x,
+            _ => return Err("an advanced pointer into a root descriptor"),
+        };
+        Ok(Some(self.s.m.bin(self.cur, Bin::Sub, d, base)))
     }
 
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {
@@ -3373,8 +3391,7 @@ impl<'a> Lower<'a> {
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let mut addr = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
-            let d = self.i32_of(d)?;
+        if let Some(d) = self.dynamic_term(&a)? {
             addr = self.s.m.bin(c, Bin::Add, addr, d);
         }
         let constant = a.dynamic.is_none().then_some(a.offset);
@@ -3603,8 +3620,7 @@ impl<'a> Lower<'a> {
             .ok_or("a scalar load from the code")?;
         let c = self.cur;
         let mut addr = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
-            let d = self.i32_of(d)?;
+        if let Some(d) = self.dynamic_term(&a)? {
             addr = self.s.m.bin(c, Bin::Add, addr, d);
         }
         for k in 0..count {
@@ -3763,10 +3779,7 @@ impl<'a> Lower<'a> {
     fn built_offset(&mut self, src: &Source) -> Result<(u32, Option<V>), Why> {
         match src {
             Source::Built { address, .. } => {
-                let x = match address.dynamic {
-                    Some(v) => Some(self.i32_of(v)?),
-                    None => None,
-                };
+                let x = self.dynamic_term(address)?;
                 Ok((address.offset, x))
             }
             _ => Ok((0, None)),
@@ -7817,6 +7830,88 @@ mod tests {
             }]
         };
         lower_with(&words, layout(), used()).unwrap();
+    }
+
+    /// A table at s0 holding structured buffers of dwords.
+    fn dword_buffers() -> Vec<UsedResource> {
+        vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }]
+    }
+
+    #[test]
+    fn descriptors_loaded_through_pointers_kept_in_phis() {
+        // A buffer descriptor loaded from the table at s0 through a pointer
+        // a root constant (s1) picks by a branch, then loaded through by
+        // index and stored to LDS so the load is needed.
+        let picked = [
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0xBF85_0002, // s_cbranch_scc1 -> 0x10
+            0x8004_9000, // s_add_u32 s4, s0, 16
+            0xBF82_0001, // s_branch -> 0x14
+            0x8004_A000, // 0x10: s_add_u32 s4, s0, 32
+            0xBE85_0380, // 0x14: s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        // The same through a pointer advanced over four descriptors.
+        let advanced = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xF408_0202,
+            0xFA00_0000, // 0xc: s_load_dwordx4 s[8:11], s[4:5], null
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            0x8004_9004, // s_add_u32 s4, s4, 16
+            0x8006_8106, // s_add_u32 s6, s6, 1
+            0xBF07_8406, // s_cmp_lg_u32 s6, 4
+            0xBF85_FFF6, // s_cbranch_scc1 -> 0xc
+            S_ENDPGM,
+        ];
+        let layout = || vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        lower_with(&picked, layout(), dword_buffers()).unwrap();
+        lower_with(&advanced, layout(), dword_buffers()).unwrap();
+    }
+
+    #[test]
+    fn data_read_through_a_pointer_into_a_root_descriptor_stops() {
+        // A root descriptor's address (s[0:1]) advanced in a loop and read
+        // through: its address is no value the translation has, so the
+        // offset from it is unknown.
+        let words = [
+            0xBE82_0300, // s_mov_b32 s2, s0
+            0xBE83_0301, // s_mov_b32 s3, s1
+            0xF400_0101,
+            0xFA00_0000, // 0x8: s_load_dword s4, s[2:3], null
+            0x8002_9002, // s_add_u32 s2, s2, 16
+            0x8203_8003, // s_addc_u32 s3, s3, 0
+            0xBF06_8004, // s_cmp_eq_u32 s4, 0
+            0xBF84_FFFA, // s_cbranch_scc0 -> 0x8
+            S_ENDPGM,
+        ];
+        let e = lower_with(&words, vec![root(RootType::Descriptor, 0, 3)], vec![])
+            .err()
+            .unwrap();
+        assert!(
+            e.to_string()
+                .contains("an advanced pointer into a root descriptor"),
+            "{e}"
+        );
     }
 
     #[test]
