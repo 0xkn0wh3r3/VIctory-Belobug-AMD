@@ -1048,6 +1048,8 @@ struct Tile {
     data: usize,
     heap: usize,
     offset: u32,
+    /// The frame it was last brought up to date or written in.
+    used: u64,
 }
 
 /// Address space a sparse copy stands for.
@@ -1058,6 +1060,8 @@ struct TilePool {
     heaps: Vec<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, ID3D12Resource, usize)>,
     /// Tiles used of the last one.
     used: u32,
+    /// Tiles given back.
+    free: Vec<Tile>,
 }
 // SAFETY: free-threaded objects and a persistent mapping.
 unsafe impl Send for TilePool {}
@@ -1065,6 +1069,7 @@ unsafe impl Send for TilePool {}
 static TILES: Mutex<TilePool> = Mutex::new(TilePool {
     heaps: Vec::new(),
     used: 0,
+    free: Vec::new(),
 });
 
 const POOL_TILES: u32 = 512;
@@ -1072,6 +1077,10 @@ const POOL_TILES: u32 = 512;
 fn new_tile() -> Option<Tile> {
     use windows::Win32::Graphics::Direct3D12::*;
     let mut pool = TILES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(tile) = pool.free.pop() {
+        crate::memstat::add(&crate::memstat::SHADOWS, PAGE as u64);
+        return Some(tile);
+    }
     if pool.heaps.is_empty() || pool.used == POOL_TILES {
         let size = u64::from(POOL_TILES) * PAGE as u64;
         let desc = D3D12_HEAP_DESC {
@@ -1110,7 +1119,9 @@ fn new_tile() -> Option<Tile> {
             tracing::warn!(%error, "no memory for copies of title memory");
             return None;
         }
-        pool.heaps.push((heap?, whole?, data as usize));
+        let heap = heap?;
+        crate::memstat::track(&heap, 5, size);
+        pool.heaps.push((heap, whole?, data as usize));
         pool.used = 0;
     }
     let heap = pool.heaps.len() - 1;
@@ -1121,7 +1132,112 @@ fn new_tile() -> Option<Tile> {
         data: pool.heaps[heap].2 + offset as usize * PAGE,
         heap,
         offset,
+        used: 0,
     })
+}
+
+/// Gives back the tiles nothing has asked about for some frames: what
+/// viewed them is gone. At the present of `frame`.
+pub(crate) fn sweep(frame: u64) {
+    const EVERY: u64 = 32;
+    const KEEP: u64 = 120;
+    if !frame.is_multiple_of(EVERY) {
+        return;
+    }
+    let all: Vec<Arc<Shadow>> = SPARSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .flatten()
+        .cloned()
+        .collect();
+    for shadow in all {
+        let Some(s) = &shadow.sparse else { continue };
+        if !shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            continue;
+        }
+        let old: Vec<(u32, Tile)> = {
+            let mut tiles = s.tiles.lock().unwrap_or_else(|e| e.into_inner());
+            let old: Vec<(u32, Tile)> = tiles
+                .iter()
+                .filter(|(_, t)| t.used + KEEP < frame)
+                .map(|(&at, &t)| (at, t))
+                .collect();
+            for (at, _) in &old {
+                tiles.remove(at);
+            }
+            old
+        };
+        if old.is_empty() {
+            continue;
+        }
+        {
+            let mut looks = s.looks.lock().unwrap_or_else(|e| e.into_inner());
+            for (at, _) in &old {
+                looks.remove(at);
+            }
+        }
+        {
+            let base = shadow.start as usize / PAGE;
+            let mut copied = shadow.copied.lock().unwrap_or_else(|e| e.into_inner());
+            for (at, _) in &old {
+                let page = (shadow.start as usize / PAGE + *at as usize) - base;
+                if let Some(c) = copied.get_mut(page) {
+                    *c = 0;
+                }
+            }
+        }
+        shadow
+            .unwatched
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        unmap_tiles(&shadow.buffer, old.iter().map(|o| o.0));
+        for alias in s.aliases.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            let shift = ((alias.start - shadow.start) / PAGE as u64) as u32;
+            unmap_tiles(
+                &alias.buffer,
+                old.iter().filter(|o| o.0 >= shift).map(|o| o.0 - shift),
+            );
+        }
+        crate::memstat::sub(&crate::memstat::SHADOWS, (old.len() * PAGE) as u64);
+        TILES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .free
+            .extend(old.into_iter().map(|o| o.1));
+    }
+}
+
+/// Reads of these tiles give zeros again.
+fn unmap_tiles(buffer: &ID3D12Resource, tiles: impl Iterator<Item = u32>) {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let Some(host) = host() else { return };
+    for at in tiles {
+        let coordinate = D3D12_TILED_RESOURCE_COORDINATE {
+            X: at,
+            ..Default::default()
+        };
+        let region = D3D12_TILE_REGION_SIZE {
+            NumTiles: 1,
+            ..Default::default()
+        };
+        // SAFETY: a live sparse buffer, a tile inside it.
+        unsafe {
+            host.queue().UpdateTileMappings(
+                buffer,
+                1,
+                Some(&coordinate),
+                Some(&region),
+                None,
+                1,
+                Some(&D3D12_TILE_RANGE_FLAG_NULL),
+                None,
+                Some(&1),
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            );
+        }
+    }
 }
 
 fn buffer_desc(
@@ -1247,10 +1363,13 @@ impl Shadow {
     fn tile(&self, s: &Sparse, address: usize) -> Option<usize> {
         let at = ((address - self.start as usize) / PAGE) as u32;
         let mut tiles = s.tiles.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(t) = tiles.get(&at) {
+        let frame = crate::queue::presented();
+        if let Some(t) = tiles.get_mut(&at) {
+            t.used = frame;
             return Some(t.data);
         }
-        let tile = new_tile()?;
+        let mut tile = new_tile()?;
+        tile.used = frame;
         tiles.insert(at, tile);
         map_tiles(&self.buffer, &[(at, tile)]);
         for alias in s.aliases.lock().unwrap_or_else(|e| e.into_inner()).iter() {

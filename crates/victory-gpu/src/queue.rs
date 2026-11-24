@@ -297,10 +297,36 @@ pub(crate) fn pass_frame() {
     FRAMES.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Shows the first plane's first resource in our window.
+/// The second of several planes: they follow each other with the same frame
+/// token. (Where a plane ends is not known; its start is.)
+#[cfg(windows)]
+fn second_plane(first: *const Plane) -> Option<This> {
+    // SAFETY: the title passes plane descriptions.
+    let token = unsafe { (*first).token };
+    (24..=256).step_by(8).find_map(|offset| {
+        let mut words = [0u64; 3];
+        // SAFETY: plain words.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), 24) };
+        if !crate::host::read_into(first.cast::<u8>().wrapping_add(offset), bytes)
+            || words[0] != token
+            || !(1..=4).contains(&(words[1] as u32))
+            || words[2] < 0x10000
+            || words[2] % 8 != 0
+        {
+            return None;
+        }
+        let mut resource = [0u8; 8];
+        crate::host::read_into(words[2] as *const u8, &mut resource)
+            .then(|| u64::from_le_bytes(resource) as This)
+            .filter(|r| !r.is_null() && crate::resource::is_texture(*r))
+    })
+}
+
+/// Shows the planes' first resources in our window, the second over the
+/// first.
 ///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// shortcut: two planes at most, each over the whole screen, the sources
+/// expected in the common state.
 extern "system" fn present(
     this: This,
     planes: u32,
@@ -308,6 +334,14 @@ extern "system" fn present(
     _parameters: *const u8,
 ) -> HRESULT {
     let mut shown = None;
+    #[allow(unused_mut)]
+    let mut over: Option<object::Ref> = None;
+    #[cfg(windows)]
+    if planes > 1 && !plane_parameters.is_null() {
+        over = second_plane(plane_parameters).map(object::Ref::new);
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::info!(planes, found = over.is_some(), "several planes presented"));
+    }
     if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
         && let Some(plane) = unsafe { plane_parameters.as_ref() }
@@ -321,13 +355,15 @@ extern "system" fn present(
     // After the work the queue holds back.
     queue(this)
         .timeline
-        .submit(Op::Work(Box::new(move || show(shown))));
+        .submit(Op::Work(Box::new(move || show(shown, over))));
     S_OK
 }
 
 /// Shows a frame.
-fn show(shown: Option<object::Ref>) {
+fn show(shown: Option<object::Ref>, over: Option<object::Ref>) {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(windows)]
+    crate::shadow::sweep(frame);
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -365,7 +401,21 @@ fn show(shown: Option<object::Ref>) {
         && let Some(host) = crate::host::host()
     {
         let state = crate::host::legal_state(&target.texture, target.state.load(Ordering::Relaxed));
-        host.present(&target.texture, state, frame);
+        match plane(over.as_ref()) {
+            Some((texture, before)) => {
+                host.present_over(Some((&target.texture, state)), (texture, before), frame);
+            }
+            None => {
+                host.present(&target.texture, state, frame);
+            }
+        }
+        return;
+    }
+    #[cfg(windows)]
+    if let Some(over) = plane(over.as_ref())
+        && let Some(host) = crate::host::host()
+    {
+        host.present_over(plane(shown.as_ref()), over, frame);
         return;
     }
     #[cfg(windows)]
@@ -386,6 +436,20 @@ fn show(shown: Option<object::Ref>) {
     #[cfg(not(windows))]
     let _ = shown;
 }
+/// A presented resource's host texture and the host state it is in.
+#[cfg(windows)]
+fn plane(
+    resource: Option<&object::Ref>,
+) -> Option<(&'static windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
+    let resource = resource?.get();
+    let texture = crate::resource::host_resource(resource)?;
+    const COPY_SOURCE: u32 = 0x800;
+    let state = crate::resource::host_transition(resource, COPY_SOURCE)
+        .map_or(COPY_SOURCE, |(_, before)| before);
+    crate::resource::host_transition(resource, state);
+    Some((texture, state))
+}
+
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]

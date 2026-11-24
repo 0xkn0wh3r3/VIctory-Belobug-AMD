@@ -577,6 +577,7 @@ const STAMPS: u32 = 4096;
 
 impl Drop for HostList {
     fn drop(&mut self) {
+        crate::memstat::sub(&crate::memstat::LISTS, 1);
         self.release_kept();
     }
 }
@@ -647,7 +648,37 @@ struct Scratch {
 // SAFETY: the chunk pointers are persistent mappings of upload buffers.
 unsafe impl Send for Scratch {}
 
-const SCRATCH_CHUNK: u64 = 4 << 20;
+const SCRATCH_CHUNK: u64 = 512 << 10;
+
+/// Scratch chunks no list uses: lists give theirs back when reset. Each list
+/// keeping the chunks of its largest use added up to gigabytes, as the title
+/// has hundreds of lists.
+static SCRATCH_FREE: Mutex<Vec<(ID3D12Resource, usize, u64)>> = Mutex::new(Vec::new());
+/// Free chunks kept; more are released.
+const SCRATCH_KEPT: usize = 256;
+
+impl Scratch {
+    fn give_back(&mut self) {
+        (self.current, self.used) = (0, 0);
+        let mut free = SCRATCH_FREE.lock().unwrap_or_else(|e| e.into_inner());
+        free.append(&mut self.chunks);
+        let over = free.len().saturating_sub(SCRATCH_KEPT);
+        let over: Vec<_> = free.drain(..over).collect();
+        drop(free);
+        drop(over);
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if self.chunks.is_empty() {
+            return;
+        }
+        // A submission may still read them.
+        let chunks = std::mem::take(&mut self.chunks);
+        retire(chunks);
+    }
+}
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
@@ -821,6 +852,7 @@ impl Host {
                 None,
             )?;
             prelude.Close()?;
+            crate::memstat::add(&crate::memstat::LISTS, 1);
             Ok(HostList {
                 allocator,
                 depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
@@ -1358,7 +1390,7 @@ impl HostList {
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-            (scratch.current, scratch.used) = (0, 0);
+            scratch.give_back();
         }
         // SAFETY: the list is not executing.
         let reset = unsafe {
@@ -1772,11 +1804,18 @@ impl HostList {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
-            let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
-            name(&buffer, || "list scratch".into());
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            s.chunks.push((buffer, data as usize, gpu));
+            let free = SCRATCH_FREE.lock().unwrap_or_else(|e| e.into_inner()).pop();
+            let chunk = match free {
+                Some(chunk) => chunk,
+                None => {
+                    let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
+                    name(&buffer, || "list scratch".into());
+                    // SAFETY: a live buffer.
+                    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                    (buffer, data as usize, gpu)
+                }
+            };
+            s.chunks.push(chunk);
             s.used = 0;
         }
         let (_, data, gpu) = s.chunks[s.current];
@@ -2349,7 +2388,11 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                crate::memstat::track(&buffer, 0, size);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 wait_if_removed(&self.device, &e);
                 tracing::warn!(error = %e, size, "no upload buffer");
@@ -2396,7 +2439,11 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                crate::memstat::track(&buffer, 1, size);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no readback buffer");
                 None
@@ -2632,6 +2679,84 @@ impl Host {
         }
     }
 
+    /// As [`Host::present`], with the texture `over` put over `scene` (each
+    /// with the host state it is in and stays in).
+    pub(crate) fn present_over(
+        &self,
+        scene: Option<(&ID3D12Resource, u32)>,
+        over: (&ID3D12Resource, u32),
+        frame: u64,
+    ) -> Option<()> {
+        // SAFETY: live resources.
+        let (a, b) = unsafe { (scene.map(|s| s.0.GetDesc()), over.0.GetDesc()) };
+        // The scene's size; with a smaller one (or none) the screen's.
+        let (width, height) = match a {
+            Some(a) if a.Height >= 1080 => (a.Width as u32, a.Height),
+            _ => (1920, 1080),
+        };
+        let format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        if presenter.is_none() {
+            *presenter = self.presenter(width, height, format).ok();
+        }
+        let p = presenter.as_mut()?;
+        if (p.width, p.height, p.format) != (width, height, format) {
+            // SAFETY: no back buffer is held; every submission was waited for.
+            unsafe {
+                p.swap_chain
+                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+            }
+            .ok()?;
+            (p.width, p.height, p.format) = (width, height, format);
+        }
+        let view = |d: &D3D12_RESOURCE_DESC| swap_format(d.Format);
+        let planes = [
+            scene.and_then(|s| Some((s.0, view(&a?)?))),
+            Some((over.0, view(&b)?)),
+        ];
+        // SAFETY: our swap chain, list and live textures.
+        unsafe {
+            let index = p.swap_chain.GetCurrentBackBufferIndex();
+            let back = p.swap_chain.GetBuffer::<ID3D12Resource>(index).ok()?;
+            p.copy.reset();
+            let list = &p.copy.list;
+            let read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            let mut into = vec![transition(&back, D3D12_RESOURCE_STATE_PRESENT, target)];
+            let mut out = vec![transition(&back, target, D3D12_RESOURCE_STATE_PRESENT)];
+            for (texture, state) in scene.iter().chain([&over]) {
+                let state = D3D12_RESOURCE_STATES(*state as i32);
+                if state != read {
+                    into.push(transition(texture, state, read));
+                    out.push(transition(texture, read, state));
+                }
+            }
+            list.ResourceBarrier(&into);
+            crate::compose::record(self, list, planes, &back, (width, height, format));
+            #[cfg(feature = "diagnostics")]
+            let capture = {
+                list.ResourceBarrier(&[transition(&back, target, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                let capture = crate::capture::wanted(frame)
+                    .then(|| crate::capture::read_back(&self.device, list, &back))
+                    .flatten();
+                list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_SOURCE, target)]);
+                capture
+            };
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = frame;
+            list.ResourceBarrier(&out);
+            p.copy.close();
+            self.execute(&[&p.copy]);
+            #[cfg(feature = "diagnostics")]
+            if let Some((buffer, footprint)) = capture {
+                crate::capture::save_read_back(frame, &buffer, &footprint);
+            }
+            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            p.meter.frame(p.hwnd);
+        }
+        Some(())
+    }
+
     fn presenter(
         &self,
         width: u32,
@@ -2773,7 +2898,11 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                crate::memstat::track(&buffer, 2, size);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 wait_if_removed(&self.device, &e);
                 tracing::warn!(error = %e, size, "no shared buffer");
@@ -2816,7 +2945,12 @@ impl Host {
             )
         };
         match made {
-            Ok(()) => buffer,
+            Ok(()) => {
+                if let Some(b) = &buffer {
+                    crate::memstat::track(b, 3, size);
+                }
+                buffer
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no unordered-access buffer");
                 None

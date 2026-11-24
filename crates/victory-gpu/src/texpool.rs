@@ -142,7 +142,9 @@ pub(crate) fn place(
         let mut made: Option<ID3D12Heap> = None;
         // SAFETY: a whole description.
         unsafe { device.CreateHeap(&heap, &mut made) }.ok()?;
-        made.map(Memory::Heap)
+        let heap = made?;
+        crate::memstat::track(&heap, 4, bytes);
+        Some(Memory::Heap(heap))
     })?;
     let Memory::Heap(heap) = memory else {
         return None;

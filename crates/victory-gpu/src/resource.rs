@@ -1300,6 +1300,15 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
 }
 
+/// Whether `this` is one of our texture resources (it may be any address).
+#[cfg(windows)]
+pub(crate) fn is_texture(this: This) -> bool {
+    let mut vtable = [0u8; 8];
+    crate::host::read_into(this.cast::<u8>(), &mut vtable)
+        && u64::from_le_bytes(vtable) == RESOURCE_FUNCTIONS.0.as_ptr() as u64
+        && resource(this).host.is_some()
+}
+
 /// A buffer's host memory and size; `None` for textures.
 pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     if this.is_null() {
