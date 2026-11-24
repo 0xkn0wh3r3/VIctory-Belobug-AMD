@@ -403,7 +403,7 @@ impl Shadow {
                             merge_gpu_writes(title_slice, host, old)
                         {
                             let dirty_len = dirty_end - dirty_start;
-                            if mode == WATCHED_GUARDED {
+                            if mode != 1 {
                                 crate::watch::writing(start + at + dirty_start, dirty_len);
                             }
                             crate::host::write_mapped(

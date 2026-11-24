@@ -253,6 +253,14 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+/// Waits for any in-flight async host GPU submissions without creating the
+/// host device if it has not been initialised yet.
+pub(crate) fn wait_in_flight_if_ready() {
+    if let Some(Some(h)) = HOST.get() {
+        h.wait_in_flight();
+    }
+}
+
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {

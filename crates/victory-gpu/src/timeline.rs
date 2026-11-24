@@ -139,8 +139,16 @@ impl Timeline {
                     work
                 }
                 Some(Op::Signal(..) | Op::Work(_)) => match s.ops.pop_front() {
-                    Some(Op::Signal(fence, value)) => Box::new(move || fence.signal(value)),
-                    Some(Op::Work(work)) => work,
+                    Some(Op::Signal(fence, value)) => Box::new(move || {
+                        #[cfg(windows)]
+                        crate::host::wait_in_flight_if_ready();
+                        fence.signal(value);
+                    }),
+                    Some(Op::Work(work)) => Box::new(move || {
+                        #[cfg(windows)]
+                        crate::host::wait_in_flight_if_ready();
+                        work();
+                    }),
                     _ => return moved,
                 },
             };
