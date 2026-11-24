@@ -1070,6 +1070,9 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 thread_local! {
     /// The texture being made is one the title placed in memory it streams.
     static STREAMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Of it, the largest mip the title's view reads: memory of larger ones
+    /// may be another texture's.
+    static LARGEST: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// How much of the video memory we may use is in use, in percent, as last
@@ -1163,7 +1166,7 @@ fn host_texture(
     let mut d = *desc;
     d.layout = 0;
     d.alignment = 0;
-    let skip = over_cap(&d);
+    let skip = over_cap(&d).max(LARGEST.get().min(u32::from(d.mip_levels) - 1));
     d.width >>= skip;
     d.height >>= skip;
     d.mip_levels -= skip as u16;
@@ -1669,10 +1672,16 @@ pub(crate) fn placed_live() -> std::collections::HashSet<usize> {
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
-pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option<This> {
     if address == 0 {
         return None;
     }
+    // The description's padding holds anything; the same texture was made
+    // up to four times for it. It holds the largest mip here.
+    let mut desc = *desc;
+    desc[1] = 0;
+    desc[13] = largest;
+    let desc = &desc;
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
     if d.dimension == BUFFER {
@@ -1687,7 +1696,10 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
             return Some(r as This);
         }
     }
-    let size = footprint(&d).map_or(1, |info| info.size.max(1));
+    let size = match texture_layout(&d) {
+        Some(t) if largest > 0 && t.planes.len() == 1 => t.planes[0].layout.reach(largest),
+        _ => footprint(&d).map_or(1, |info| info.size.max(1)),
+    };
     let end = address.saturating_add(size);
     // The title's pages for it may not be there yet (streaming): nothing to
     // show, and the console's whole address space would not fit in memory.
@@ -1696,6 +1708,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     }
     let mut out = std::ptr::null();
     // Outside the lock: making one takes a while.
+    LARGEST.set(largest);
     let made = create_at_address(
         std::ptr::null(),
         address,
@@ -1705,6 +1718,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         &RESOURCE_IIDS[0],
         &mut out,
     );
+    LARGEST.set(0);
     if made != S_OK {
         return None;
     }
@@ -1752,6 +1766,10 @@ static REWRITTEN: std::sync::Mutex<std::collections::VecDeque<usize>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 #[cfg(windows)]
 static REWRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many placed textures were evicted so far.
+#[cfg(windows)]
+pub(crate) static EVICTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// How many textures were rewritten so far.
 #[cfg(windows)]
@@ -1822,6 +1840,7 @@ pub(crate) fn evict_placed_textures(start: u64, end: u64) {
             }
         }
     }
+    EVICTED.fetch_add(evicted.len() as u64, std::sync::atomic::Ordering::Relaxed);
     if !evicted.is_empty() {
         PLACED_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
         for res in evicted {

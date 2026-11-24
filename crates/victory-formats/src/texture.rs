@@ -575,6 +575,20 @@ impl Layout {
             + u64::from(self.pattern[0][(x % bw) as usize])
     }
 
+    /// Bytes from the texture's start that mips `first` and smaller take up
+    /// (of all slices). Mips are stored smallest first: titles that stream
+    /// textures give memory to the small ones only, and what follows is
+    /// another texture's, or nothing.
+    pub fn reach(&self, first: u32) -> u64 {
+        match first.min(self.first_tail_mip) {
+            0 => self.size,
+            k => match self.mips.get(k as usize - 1) {
+                Some(m) if m.offset != 0 => self.size - self.slice_size + m.offset,
+                _ => self.size,
+            },
+        }
+    }
+
     /// Depth slices a subresource of mip `mip` covers: the mip's depth for
     /// 3D textures, else 1 (one array slice).
     pub fn subresource_depth(&self, mip: u32) -> u32 {
@@ -582,7 +596,7 @@ impl Layout {
     }
 
     /// Copies one subresource out of tiled memory (the whole texture,
-    /// [`Layout::size`] bytes) into linear rows: mip `mip` of array slice
+    /// [`Layout::reach`] bytes of the mip at least) into linear rows: mip `mip` of array slice
     /// `slice` (3D: every depth slice of the mip, `slice` 0). Rows are
     /// `row_pitch` bytes apart, depth slices `depth_pitch`.
     pub fn detile(
@@ -650,7 +664,7 @@ impl Layout {
             .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
             .and_then(|offset| offset.checked_add(bytes))
             .ok_or(Error::TooSmall)?;
-        if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
+        if tiled_len < self.reach(mip) as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
@@ -987,6 +1001,12 @@ mod tests {
         assert_eq!(l.mips[2].offset, 4096);
         assert_eq!(l.mips[1].offset, 8192);
         assert_eq!(l.mips[0].offset, 8192 + 16384);
+        // What the small mips alone take up.
+        assert_eq!(l.reach(0), l.size);
+        assert_eq!(l.reach(1), 8192 + 16384);
+        assert_eq!(l.reach(2), 8192);
+        assert_eq!(l.reach(3), 4096);
+        assert_eq!(l.reach(8), 4096);
     }
 
     #[test]

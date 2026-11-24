@@ -245,7 +245,8 @@ impl Staging {
 
     /// Returns `(bytes_read, dirty)`.
     fn refresh_now(&self) -> (usize, bool) {
-        let size = self.layout.size as usize;
+        // The larger mips' memory may be another texture's.
+        let size = self.layout.reach(self.skip) as usize;
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
@@ -318,6 +319,8 @@ impl Staging {
         if last.hash == Some(hash) {
             return (size, false);
         }
+        #[cfg(feature = "diagnostics")]
+        flips::note(self, &hash, tiled, told, last.hash.is_some());
         if last.hash.replace(hash).is_some() {
             // A texture in use changed: how it was found.
             CHANGED[usize::from(told)].fetch_add(1, Ordering::Relaxed);
@@ -386,6 +389,98 @@ impl Staging {
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
+            }
+        }
+    }
+}
+
+/// Diagnostics: which textures' contents change, how often, and whether they
+/// come back to contents they had.
+#[cfg(feature = "diagnostics")]
+pub(crate) mod flips {
+    use super::*;
+
+    #[derive(Default)]
+    struct Seen {
+        hashes: Vec<[u8; 8]>,
+        changes: u32,
+        back: u32,
+        zero: u32,
+        told: u32,
+        /// Changes to the part of the memory with the largest mip.
+        desc: String,
+        first: u64,
+        last: u64,
+    }
+    static SEEN: Mutex<Option<HashMap<(usize, [u32; 4]), Seen>>> = Mutex::new(None);
+    /// The views made of placed textures, by address.
+    pub(crate) static VIEWS: Mutex<std::collections::BTreeMap<u64, Vec<([u32; 14], [u32; 16])>>> =
+        Mutex::new(std::collections::BTreeMap::new());
+
+    /// A view of a placed texture.
+    pub(crate) fn view(address: u64, resource: &[u32; 14], desc: [u32; 16]) {
+        let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        let list = views.entry(address).or_default();
+        if !list.contains(&(*resource, desc)) && list.len() < 16 {
+            list.push((*resource, desc));
+        }
+    }
+
+    pub(super) fn note(s: &Staging, hash: &blake3::Hash, tiled: &[u8], told: bool, again: bool) {
+        let frame = crate::queue::presented();
+        let d = &s.layout.desc;
+        let key = (
+            s.memory as usize,
+            [s.layout.size as u32, s.mips, s.footprints.len() as u32, s.skip],
+        );
+        let mut h = [0u8; 8];
+        h.copy_from_slice(&hash.as_bytes()[..8]);
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let e = seen.get_or_insert_with(HashMap::new).entry(key).or_default();
+        if e.hashes.is_empty() {
+            e.desc = format!("{d:?}");
+            e.first = frame;
+        }
+        e.last = frame;
+        if again || !e.hashes.is_empty() {
+            e.changes += 1;
+            e.told += u32::from(told);
+        }
+        if e.hashes.iter().rev().skip(1).any(|x| *x == h) {
+            e.back += 1;
+        }
+        if tiled.iter().step_by(61).all(|&b| b == 0) {
+            e.zero += 1;
+        }
+        if e.hashes.len() > 64 {
+            e.hashes.remove(0);
+        }
+        e.hashes.push(h);
+    }
+
+    /// Logs the textures that changed most.
+    pub(crate) fn log() {
+        let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(seen) = seen.as_ref() else { return };
+        let (mut changed, mut back, mut zero) = (0, 0, 0);
+        for s in seen.values() {
+            changed += s.changes;
+            back += s.back;
+            zero += s.zero;
+        }
+        let mut most: Vec<_> = seen.iter().collect();
+        most.sort_by_key(|(_, s)| std::cmp::Reverse((s.back, s.changes)));
+        tracing::info!(textures = seen.len(), changed, back, zero, "texture contents");
+        for ((at, k), s) in most.into_iter().take(12) {
+            tracing::info!(
+                "  texture {at:#x} {k:?} changed {} (told {}), back {}, zero {}, frames {}-{}: {}",
+                s.changes, s.told, s.back, s.zero, s.first, s.last, s.desc
+            );
+            let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+            for (a, list) in views.range(*at as u64..*at as u64 + u64::from(k[0])).take(6) {
+                for (r, d) in list.iter().take(3) {
+                    tracing::info!("    view at {a:#x}: resource {r:x?} srv {d:x?}");
+                }
             }
         }
     }

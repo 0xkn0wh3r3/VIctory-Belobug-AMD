@@ -489,6 +489,13 @@ pub(crate) extern "system" fn create_uav(
     record(handle, view);
 }
 
+/// A resource description's padding (after the dimension and the flags):
+/// whatever was on the title's stack.
+fn clear_padding(resource: &mut [u32; 14]) {
+    resource[1] = 0;
+    resource[13] = 0;
+}
+
 /// Device methods 0x230 and 0x238: shader resource and unordered access
 /// views of memory the title placed itself, `(resource desc, view desc,
 /// handle)`.
@@ -498,7 +505,17 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(mut resource), Some(mut desc)) = (words::<14>(resource), words::<16>(desc)) {
+        clear_padding(&mut resource);
+        // After the component mapping, and what the dimension does not use.
+        desc[3] = 0;
+        match desc[1] {
+            1 => desc[9] = 0,
+            4 => desc[8..10].fill(0),
+            8 | 9 => desc[7..10].fill(0),
+            10 => desc[9] = 0,
+            _ => {}
+        }
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -509,7 +526,8 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(mut resource), Some(desc)) = (words::<14>(resource), words::<16>(desc)) {
+        clear_padding(&mut resource);
         record(handle, View::Placed(true, resource, desc));
     }
 }

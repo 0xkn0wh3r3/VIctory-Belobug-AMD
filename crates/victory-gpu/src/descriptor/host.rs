@@ -2332,6 +2332,31 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     }
 }
 
+/// The largest mip of a placed 2D texture (or array, or cube) that a shader
+/// view reads, if the host texture can do without the larger ones.
+fn largest_mip(resource: &[u32; 14], desc: &[u32; 16]) -> u32 {
+    const TEXTURE2D: u32 = 3;
+    // Textures, arrays, cubes and arrays of cubes: their descriptions start
+    // with the largest mip.
+    if resource[0] != TEXTURE2D || !matches!(desc[1], 4 | 5 | 9 | 10) || cfg!(test) {
+        return 0;
+    }
+    let (width, height) = (resource[4], resource[6]);
+    let (format, mips) = (resource[8], resource[7] >> 16);
+    let mut first = desc[4].min(mips.saturating_sub(1));
+    let block = (70..=84).contains(&format) || (94..=99).contains(&format);
+    let fits = |k: u32| {
+        (width >> k) > 0
+            && (height >> k) > 0
+            && (!block || (width >> k).is_multiple_of(4) && (height >> k).is_multiple_of(4))
+    };
+    while first > 0 && !fits(first) {
+        first -= 1;
+    }
+    // Not textures the host GPU writes.
+    if resource[12] & 7 != 0 { 0 } else { first }
+}
+
 /// A shader view of a texture the title placed in memory itself, as a view
 /// of the resource made for that memory (on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
@@ -2343,7 +2368,9 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
+    #[cfg(feature = "diagnostics")]
+    crate::texture::flips::view(address, resource, *desc);
+    let texture = crate::resource::texture_at(address, resource, largest_mip(resource, desc))?;
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
 }
 
@@ -3311,8 +3338,8 @@ void main(uint3 id : SV_DispatchThreadID) {
             0,
         ];
 
-        assert!(crate::resource::texture_at(addr_a, &desc).is_some());
-        assert!(crate::resource::texture_at(addr_b, &desc).is_some());
+        assert!(crate::resource::texture_at(addr_a, &desc, 0).is_some());
+        assert!(crate::resource::texture_at(addr_b, &desc, 0).is_some());
         assert!(crate::resource::has_placed_texture(addr_a, &desc));
         assert!(crate::resource::has_placed_texture(addr_b, &desc));
 
