@@ -190,13 +190,16 @@ pub(crate) fn dispatched() -> u64 {
 /// copy in upload memory.
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
 /// other views as 1 MiB (both cut at their buffer's end).
-fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
-    let reach = if srv { 1 << 20 } else { 1 << 16 };
+fn root_view(list: &HostList, address: u64, kind: u8) -> Option<u64> {
+    let reach = if kind == 0 { 1 << 16 } else { 1 << 20 };
     let shadow = crate::shadow::find_reaching(address, reach)?;
     let len = shadow.left(address).min(reach);
     let gpu = shadow.gpu(address);
-    if srv || gpu % 256 == 0 {
+    if kind != 0 || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        if kind == 2 {
+            shadow.gpu_writes(list, address, len);
+        }
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -690,17 +693,21 @@ impl State {
                     }
                 }
             }
-            for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
+            for (views, kind) in [
+                (&stage.root_cbvs, 0u8),
+                (&stage.root_srvs, 1u8),
+                (&stage.root_uavs, 2u8),
+            ] {
                 for &(slot, param) in views {
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
-                        once!(slot, srv, "a shader reads a root view the title did not set");
+                        once!(slot, kind, "a shader reads a root view the title did not set");
                         return false;
                     };
-                    let Some(gpu) = root_view(list, *address, srv) else {
+                    let Some(gpu) = root_view(list, *address, kind) else {
                         once!(
                             slot,
-                            srv,
+                            kind,
                             address = format_args!("{address:#x}"),
                             "a shader reads a root view outside title buffers"
                         );
@@ -708,11 +715,13 @@ impl State {
                     };
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+                        match (compute, kind) {
+                            (false, 0) => l.SetGraphicsRootConstantBufferView(param, gpu),
+                            (false, 1) => l.SetGraphicsRootShaderResourceView(param, gpu),
+                            (false, _) => l.SetGraphicsRootUnorderedAccessView(param, gpu),
+                            (true, 0) => l.SetComputeRootConstantBufferView(param, gpu),
+                            (true, 1) => l.SetComputeRootShaderResourceView(param, gpu),
+                            (true, _) => l.SetComputeRootUnorderedAccessView(param, gpu),
                         }
                     }
                 }
@@ -898,7 +907,12 @@ impl State {
                     let _ = write!(text, " [heap {index}: {slot}]");
                 }
             }
-            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs) {
+            for &(slot, _) in stage
+                .root_cbvs
+                .iter()
+                .chain(&stage.root_srvs)
+                .chain(&stage.root_uavs)
+            {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
                     let host = crate::shadow::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));
