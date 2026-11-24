@@ -1100,7 +1100,7 @@ fn over_cap(d: &ResourceDesc) -> u32 {
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
     });
-    if !STREAMED.get() {
+    if !STREAMED.get() || textures() != Textures::Stream {
         return 0;
     }
     let max = set.unwrap_or_else(|| match video_memory_percent() {
@@ -1725,10 +1725,83 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     Some(out)
 }
 
+/// What is done about textures whose title memory changes
+/// (`VICTORY_TEXTURES`, to tell what texture streaming here costs and does):
+/// `keep` uploads each once, whole, and keeps it whatever the title does
+/// with its memory; `always` looks at each at every use, whole.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Textures {
+    Stream,
+    Keep,
+    Always,
+}
+
+pub(crate) fn textures() -> Textures {
+    static MODE: std::sync::OnceLock<Textures> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_TEXTURES").as_deref() {
+        Ok("keep") => Textures::Keep,
+        Ok("always") => Textures::Always,
+        _ => Textures::Stream,
+    })
+}
+
+/// Placed textures whose memory the runtime wrote since they were uploaded,
+/// and how many were (bindless heaps take those they have not seen).
+#[cfg(windows)]
+static REWRITTEN: std::sync::Mutex<std::collections::VecDeque<usize>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+#[cfg(windows)]
+static REWRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many textures were rewritten so far.
+#[cfg(windows)]
+pub(crate) fn rewrites() -> u64 {
+    REWRITES.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The textures rewritten after the first `seen`, and how many were by now.
+#[cfg(windows)]
+pub(crate) fn rewritten_since(seen: u64) -> (Vec<usize>, u64) {
+    let list = REWRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let now = rewrites();
+    let new = now.saturating_sub(seen).min(list.len() as u64) as usize;
+    (list.iter().skip(list.len() - new).copied().collect(), now)
+}
+
+/// The runtime wrote `[start, end)`: the textures placed there are stale.
+#[cfg(windows)]
+pub(crate) fn textures_rewritten(start: u64, end: u64) {
+    if textures() == Textures::Keep {
+        return;
+    }
+    let found: Vec<usize> = {
+        let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let longest = PLACED_LONGEST.load(std::sync::atomic::Ordering::Acquire);
+        let from = (start.saturating_sub(longest), [0u32; 14]);
+        map.range(from..(end, [0u32; 14]))
+            .filter(|(_, (_, tex_end))| *tex_end > start)
+            .map(|(_, &(r, _))| r)
+            .collect()
+    };
+    if found.is_empty() {
+        return;
+    }
+    for &r in &found {
+        crate::texture::rewritten(r);
+    }
+    const KEPT: usize = 1 << 16;
+    let mut list = REWRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    list.extend(&found);
+    while list.len() > KEPT {
+        list.pop_front();
+    }
+    REWRITES.fetch_add(found.len() as u64, std::sync::atomic::Ordering::Release);
+}
+
 /// Releases placed textures whose backing range overlaps `[start, end)`.
 #[cfg(windows)]
 pub(crate) fn evict_placed_textures(start: u64, end: u64) {
-    if start >= end {
+    if start >= end || textures() == Textures::Keep {
         return;
     }
     let mut evicted = Vec::new();

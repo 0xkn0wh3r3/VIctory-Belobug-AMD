@@ -52,6 +52,8 @@ pub(crate) struct Staging {
     skip: u32,
     memory: *const u8,
     last: Mutex<Last>,
+    /// The runtime wrote the memory since it was last looked at.
+    rewritten: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     gpu_uploads: std::sync::atomic::AtomicU64,
 }
@@ -73,6 +75,10 @@ struct Last {
 unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
+
+/// Textures found changed since they were uploaded: by chance (looked at
+/// again when their turn came), and because the runtime wrote them.
+pub(crate) static CHANGED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 
@@ -157,6 +163,19 @@ pub(crate) fn host_written(resource: This) {
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     set.get_or_insert_with(Default::default)
         .insert(resource as usize);
+}
+
+/// The runtime wrote new contents into the texture `resource`'s memory.
+pub(crate) fn rewritten(resource: usize) {
+    if let Some(map) = STAGING.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+        && let Some(s) = map.get(&resource)
+    {
+        s.rewritten.store(true, Ordering::Release);
+    }
+    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(set) = set.as_mut() {
+        set.remove(&resource);
+    }
 }
 
 /// The title released a resource.
@@ -255,7 +274,16 @@ impl Staging {
         // shortcut: contents that did not change the last times are looked at
         // every 2, 4 and at most 8 frames.
         let frame = crate::queue::presented() + 1;
-        if !cfg!(test) && last.hash.is_some() && frame < last.next {
+        let mode = crate::resource::textures();
+        let rewritten = self.rewritten.swap(false, Ordering::AcqRel)
+            || mode == crate::resource::Textures::Always;
+        if rewritten {
+            last.still = 0;
+        }
+        if !cfg!(test)
+            && last.hash.is_some()
+            && (frame < last.next && !rewritten || mode == crate::resource::Textures::Keep)
+        {
             return (0, false);
         }
         // Read through the kernel, as above: the title may unmap the pages
@@ -264,7 +292,7 @@ impl Staging {
         SCRATCH.with_borrow_mut(|tiled| {
             tiled.resize(size, 0);
             crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
-            let read = self.changed(last, tiled);
+            let read = self.changed(last, tiled, rewritten);
             last.still = if read.1 { 0 } else { (last.still + 1).min(5) };
             // Not all in the same frame.
             last.next = match last.still {
@@ -282,7 +310,7 @@ impl Staging {
     /// After reading the texture's memory into `tiled`: detiles it unless
     /// its hash is the last one's. Returns the bytes read and whether the
     /// staging buffer got new contents.
-    fn changed(&self, last: &mut Last, tiled: &[u8]) -> (usize, bool) {
+    fn changed(&self, last: &mut Last, tiled: &[u8], told: bool) -> (usize, bool) {
         let size = tiled.len();
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
@@ -290,7 +318,10 @@ impl Staging {
         if last.hash == Some(hash) {
             return (size, false);
         }
-        last.hash = Some(hash);
+        if last.hash.replace(hash).is_some() {
+            // A texture in use changed: how it was found.
+            CHANGED[usize::from(told)].fetch_add(1, Ordering::Relaxed);
+        }
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -512,6 +543,7 @@ fn create_staging(
         skip: crate::resource::skipped_mips(resource),
         memory,
         last: Mutex::default(),
+        rewritten: Default::default(),
         #[cfg(test)]
         gpu_uploads: std::sync::atomic::AtomicU64::new(0),
     }))

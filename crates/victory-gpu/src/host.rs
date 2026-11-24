@@ -2547,6 +2547,12 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
+                tracing::info!(
+                    written = crate::resource::rewrites(),
+                    late = crate::texture::CHANGED[0].load(Ordering::Relaxed),
+                    at_once = crate::texture::CHANGED[1].load(Ordering::Relaxed),
+                    "textures changed in place"
+                );
                 crate::copystat::log(frames);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(

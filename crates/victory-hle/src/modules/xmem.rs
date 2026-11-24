@@ -572,6 +572,32 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     true
 }
 
+/// DirectStorage filled bytes `[offset, offset + len)` of `pages`: tells the
+/// GPU side the addresses they are shown at (it keeps copies of textures).
+pub(crate) fn physical_written(pages: &[usize], offset: usize, len: usize) {
+    let Some(runs) = runs(pages, offset, len) else {
+        return;
+    };
+    let shown: Vec<(usize, usize)> = {
+        let physical = physical();
+        let mut shown = Vec::new();
+        for (slice, n) in &runs {
+            let (from, to) = (slice.index, slice.index + n);
+            for (&base, (size, view)) in &physical.views {
+                let (first, last) = (view.index, view.index + size / PAGE);
+                if first < to && from < last && Arc::ptr_eq(&view.section, &slice.section) {
+                    let (a, b) = (from.max(first), to.min(last));
+                    shown.push((base + (a - first) * PAGE, (b - a) * PAGE));
+                }
+            }
+        }
+        shown
+    };
+    for (at, len) in shown {
+        victory_gpu::title_memory_written(at, len);
+    }
+}
+
 /// Bytes `[offset, offset + len)` of physical pages, writable in place
 /// until dropped: DirectStorage decodes into it instead of a buffer it
 /// would then copy.

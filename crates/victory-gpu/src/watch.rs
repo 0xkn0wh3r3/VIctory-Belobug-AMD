@@ -279,6 +279,15 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::descriptor::host::bindless_memory_changed(at as u64, end as u64);
 }
 
+/// The runtime wrote new contents into title memory `[at, at + len)` (a
+/// streamed file arrived): textures placed there are uploaded again at their
+/// next use, not when their turn to be looked at comes.
+pub fn title_memory_written(at: usize, len: usize) {
+    if len != 0 {
+        crate::resource::textures_rewritten(at as u64, (at + len) as u64);
+    }
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 fn install() {

@@ -53,6 +53,8 @@ pub(crate) struct HostHeap {
     record_looked: [AtomicU64; 2],
     /// The frame the oldest uploaded texture is due a look again in.
     recheck_at: AtomicU64,
+    /// The rewritten textures ([`crate::resource::rewrites`]) seen.
+    rewrites_seen: AtomicU64,
 }
 
 struct StrideTable {
@@ -246,9 +248,9 @@ struct SlotUse {
 /// shows its new contents up to this many frames late through bindless
 /// access (tables still upload what their draws read). Hashing all of them
 /// at each submission cost seconds per frame while the world streams in.
-const RECHECK_FRAMES: u64 = 60;
+const RECHECK_FRAMES: u64 = 30;
 /// ... and at most this many of them per frame.
-const RECHECKS: u32 = 8;
+const RECHECKS: u32 = 16;
 
 /// Bumped when views go stale or title memory is mapped or unmapped: what
 /// bindless slots view may have changed though no slot was written (their
@@ -601,6 +603,7 @@ impl HostHeap {
             record_hint: std::sync::atomic::AtomicBool::new(false),
             record_looked: [AtomicU64::new(0), AtomicU64::new(0)],
             recheck_at: AtomicU64::new(u64::MAX),
+            rewrites_seen: AtomicU64::new(0),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1219,7 +1222,9 @@ impl HostHeap {
         // Most draws find nothing to do: a few atomics, no lock.
         let evictions = self.record_looked[0].load(Ordering::Acquire) != epoch
             && self.record_looked[1].load(Ordering::Acquire) != frame + 1;
+        let rewrites = self.rewrites_seen.load(Ordering::Acquire) != crate::resource::rewrites();
         if !evictions
+            && !rewrites
             && !self.record_hint.load(Ordering::Acquire)
             && self.recheck_at.load(Ordering::Acquire) > frame
         {
@@ -1269,10 +1274,23 @@ impl HostHeap {
                 }
             }
             let mut due = Vec::new();
-            while due.len() < RECHECKS as usize
-                && (b.rechecks.0 != frame || b.rechecks.1 < RECHECKS)
+            if rewrites {
+                let (list, now) =
+                    crate::resource::rewritten_since(self.rewrites_seen.load(Ordering::Acquire));
+                self.rewrites_seen.store(now, Ordering::Release);
+                let list: std::collections::HashSet<usize> = list.into_iter().collect();
+                for t in list {
+                    if b.uploaded.remove(&t).is_some() {
+                        due.push(t as crate::object::This);
+                    }
+                }
+            }
+            let always = crate::resource::textures() == crate::resource::Textures::Always;
+            let rechecks = due.len() + RECHECKS as usize;
+            while (due.len() < rechecks && (b.rechecks.0 != frame || b.rechecks.1 < RECHECKS)
+                || always)
                 && let Some(&(f, t)) = b.recheck.front()
-                && f + RECHECK_FRAMES <= frame
+                && f + if always { 1 } else { RECHECK_FRAMES } <= frame
             {
                 b.recheck.pop_front();
                 due.push(t as crate::object::This);
@@ -1392,10 +1410,13 @@ impl HostHeap {
         use windows::core::Interface;
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
         let b = &mut *b;
+        let mode = crate::resource::textures();
         let due = match b.uploaded.get(&(texture as usize)) {
             None => true,
+            Some((h, _)) if mode == crate::resource::Textures::Keep && h.as_raw() == host.as_raw() => false,
             // Another texture at the object's address.
             Some((h, _)) if h.as_raw() != host.as_raw() => true,
+            Some((_, last)) if mode == crate::resource::Textures::Always => frame > *last,
             Some((_, last)) if frame >= last + RECHECK_FRAMES => {
                 if b.rechecks.0 != frame {
                     b.rechecks = (frame, 0);

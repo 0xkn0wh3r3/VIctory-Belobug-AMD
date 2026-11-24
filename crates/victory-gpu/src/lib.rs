@@ -66,4 +66,4 @@ mod watch;
 pub use host::on_failure;
 pub use memstat::report as memory_report;
 #[cfg(windows)]
-pub use watch::{title_memory_remapped, writing as kernel_will_write};
+pub use watch::{title_memory_remapped, title_memory_written, writing as kernel_will_write};
