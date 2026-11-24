@@ -160,19 +160,84 @@ impl Making {
     }
 }
 
+/// Workers (threads) lost to compiles that crashed, not replaced yet.
+static LOST: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Suspends thread `id`, at work in the driver's compiler (never in a heap
+/// function, whose lock it would keep); false if it was not caught there.
+fn suspend(id: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, HMODULE};
+    use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, GetThreadContext};
+    use windows::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        GetModuleHandleExW, GetModuleHandleW,
+    };
+    use windows::Win32::System::Threading::{
+        OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SUSPEND_RESUME,
+    };
+    const CONTEXT_CONTROL_AMD64: u32 = 0x10_0001;
+    #[repr(align(16))]
+    struct Aligned(CONTEXT);
+    // SAFETY: plain calls on a thread of ours; the context is whole and
+    // aligned; nothing that may need the suspended thread's locks is called
+    // while it is suspended (the modules are asked about after it runs on).
+    unsafe {
+        let Ok(thread) = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, false, id) else {
+            return false;
+        };
+        let module = |at: u64| {
+            let mut m = HMODULE::default();
+            let _ = GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                PCWSTR(at as *const u16),
+                &mut m,
+            );
+            m.0 as usize
+        };
+        let named = |s: &str| GetModuleHandleW(&HSTRING::from(s)).map_or(0, |m| m.0 as usize);
+        let (ntdll, ucrt) = (named("ntdll.dll"), named("ucrtbase.dll"));
+        let mut caught = false;
+        let mut last = Vec::new();
+        for _ in 0..500 {
+            if SuspendThread(thread) == u32::MAX {
+                break;
+            }
+            let mut context: Aligned = std::mem::zeroed();
+            context.0.ContextFlags = CONTEXT_CONTROL_AMD64;
+            let known = GetThreadContext(thread.0, &mut context.0) != 0;
+            let at = context.0.Rip >> 12;
+            if known && last.contains(&at) {
+                caught = true;
+                break;
+            }
+            ResumeThread(thread);
+            // A page of the driver's own code: caught there next time.
+            let m = module(at << 12);
+            if known && m != 0 && m != ntdll && m != ucrt {
+                last.push(at);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let _ = CloseHandle(thread);
+        caught
+    }
+}
+
 /// Notes pipelines the driver's compiler has worked on for long
 /// ([`ENDLESS`]): they are left out from the next run on. AMD's never ends
 /// some of the world's ray tracing programs, and takes memory all the while
-/// (16 GB in two minutes).
+/// (16 GB in two minutes), so their threads are stopped.
 fn endless(name: &str, begins: bool) {
     use std::time::{Duration, Instant};
     const ENDLESS: Duration = Duration::from_secs(20);
-    static AT_WORK: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
+    static AT_WORK: Mutex<Vec<(String, Instant, u32)>> = Mutex::new(Vec::new());
     static WATCH: std::sync::Once = std::sync::Once::new();
     {
         let mut at_work = AT_WORK.lock().unwrap_or_else(|e| e.into_inner());
         if begins {
-            at_work.push((name.to_owned(), Instant::now()));
+            // SAFETY: a plain call.
+            let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+            at_work.push((name.to_owned(), Instant::now(), id));
         } else if let Some(i) = at_work.iter().position(|w| w.0 == name) {
             at_work.swap_remove(i);
         }
@@ -184,16 +249,25 @@ fn endless(name: &str, begins: bool) {
                 let mut noted: Vec<String> = Vec::new();
                 loop {
                     std::thread::sleep(Duration::from_secs(2));
-                    let long: Vec<String> = AT_WORK
+                    let lost = std::mem::take(&mut *LOST.lock().unwrap_or_else(|e| e.into_inner()));
+                    for id in lost {
+                        super::make::worker_lost(id);
+                    }
+                    let long: Vec<(String, u32)> = AT_WORK
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .iter()
                         .filter(|w| w.1.elapsed() > ENDLESS && !noted.contains(&w.0))
-                        .map(|w| w.0.clone())
+                        .map(|w| (w.0.clone(), w.2))
                         .collect();
-                    for name in long {
+                    for (name, id) in long {
+                        let stopped = suspend(id);
+                        if stopped {
+                            super::make::worker_lost(id);
+                        }
                         tracing::error!(
                             name,
+                            stopped,
                             "the driver's compiler does not end a pipeline: it is left out from the next run on"
                         );
                         note_crashed(&name);
@@ -229,6 +303,10 @@ unsafe extern "system" fn compiler_crashed(
     }
     tracing::error!(name, "the driver's compiler crashed making a pipeline: it is left out");
     note_crashed(&name);
+    endless(&name, false);
+    // SAFETY: a plain call.
+    let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+    LOST.lock().unwrap_or_else(|e| e.into_inner()).push(id);
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
     }

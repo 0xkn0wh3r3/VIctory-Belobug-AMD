@@ -12,7 +12,7 @@
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //!
-//! shortcut: the budget (half a second of waiting per title frame) is a
+//! shortcut: the budget (a tenth of a second of waiting per title frame) is a
 //! guess; a pass the title runs only once and whose pipeline takes longer
 //! is lost.
 
@@ -29,6 +29,8 @@ pub(crate) struct Pending {
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queued: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    /// Its worker was lost to it: it will not be made.
+    lost: AtomicBool,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
     key: String,
@@ -54,14 +56,16 @@ impl Pending {
             graphics,
             queued: AtomicBool::new(false),
             made: OnceLock::new(),
+            lost: AtomicBool::new(false),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        // Not `get_or_init`: a worker lost in it would leave it locked.
+        let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+        let _ = self.made.set(made);
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -95,7 +99,7 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Waiting allowed per title frame, over all threads.
-const BUDGET: Duration = Duration::from_millis(500);
+const BUDGET: Duration = Duration::from_millis(100);
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -110,7 +114,13 @@ pub(crate) fn waiting() -> u64 {
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         start(p);
-        wait(p, crate::frame::current());
+        if p.lost.load(Ordering::Relaxed) {
+            return None;
+        }
+        // With a world's worth queued there is no use in waiting.
+        if waiting() < 64 {
+            wait(p, crate::frame::current());
+        }
     }
     let made = p.made.get()?.as_ref();
     if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
@@ -157,39 +167,72 @@ fn wait(p: &Pending, frame: u64) {
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
+static RECEIVER: OnceLock<Mutex<std::sync::mpsc::Receiver<Arc<Pending>>>> = OnceLock::new();
+
+/// What the workers (by thread) are making.
+static AT_WORK: Mutex<Vec<(u32, Arc<Pending>)>> = Mutex::new(Vec::new());
+
+/// Starts worker `i`.
+fn worker(i: usize) {
+    let spawned = std::thread::Builder::new()
+        .name(format!("victory-pipelines-{i}"))
+        .spawn(move || {
+            // Below the title's own threads (loading, recording).
+            // SAFETY: a plain call on our own thread.
+            unsafe {
+                use windows::Win32::System::Threading::*;
+                let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            }
+            let Some(receiver) = RECEIVER.get() else { return };
+            loop {
+                let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                let Ok(p) = next else { return };
+                // SAFETY: a plain call.
+                let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+                AT_WORK.lock().unwrap_or_else(|e| e.into_inner()).push((id, p.clone()));
+                p.make();
+                AT_WORK.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| w.0 != id);
+                if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                    drained();
+                } else {
+                    super::library::save(false);
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "no pipeline worker");
+    }
+}
+
+/// A worker is lost to a compile that crashed or never ends: another takes
+/// its place (its pipeline stays unmade). With all of them lost, the rest of
+/// a world's pipelines waited forever.
+pub(super) fn worker_lost(id: u32) {
+    static LOST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(100);
+    let mut lost = false;
+    AT_WORK.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| {
+        if w.0 == id {
+            w.1.lost.store(true, Ordering::Relaxed);
+            lost = true;
+        }
+        w.0 != id
+    });
+    if lost {
+        WAITING.fetch_sub(1, Ordering::Relaxed);
+        worker(LOST.fetch_add(1, Ordering::Relaxed));
+    }
+}
+
 /// Hands `p` to the workers (half the logical processors, 2 to 8), started
 /// on first use.
 fn queue(p: Arc<Pending>) {
     static SENDER: OnceLock<std::sync::mpsc::Sender<Arc<Pending>>> = OnceLock::new();
     let sender = SENDER.get_or_init(|| {
         let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
-        let receiver = Arc::new(Mutex::new(receiver));
+        let _ = RECEIVER.set(Mutex::new(receiver));
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
         for i in 0..workers {
-            let receiver = receiver.clone();
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(move || {
-                    // Below the title's own threads (loading, recording).
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                    }
-                    loop {
-                        let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                        let Ok(p) = next else { return };
-                        p.make();
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
-                    }
-                });
-            if let Err(e) = spawned {
-                tracing::warn!(error = %e, "no pipeline worker");
-            }
+            worker(i);
         }
         sender
     });
