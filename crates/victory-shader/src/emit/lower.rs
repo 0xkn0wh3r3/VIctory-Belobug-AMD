@@ -5846,6 +5846,15 @@ impl<'a> Lower<'a> {
                     _ => Err("a root UAV or typed root view"),
                 }
             }
+            // shortcut: of samplers given in the code that a branch picks one
+            // of (how they treat coordinates off the texture differs), the
+            // first is taken.
+            Source::Phi { args, .. }
+                if sampler
+                    && let Some(arg) = args.iter().find(|a| matches!(a, Source::Constant(_))) =>
+            {
+                self.handle(site, arg, sampler, props)
+            }
             Source::Phi { block, args } => {
                 // Each predecessor computes its heap index at its end; the
                 // join picks one with a phi.

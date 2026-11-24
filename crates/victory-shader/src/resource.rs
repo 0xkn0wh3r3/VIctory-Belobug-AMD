@@ -1380,12 +1380,11 @@ impl<'a> Tracer<'a> {
         if carried != words {
             return self.per_lane(&carried, joins).map(Some);
         }
-        let Some((block, _)) = words.iter().find_map(phi_of) else {
+        // Joined in several blocks: the last is looked at first, and its
+        // edges bring what the others joined.
+        let Some(block) = words.iter().filter_map(phi_of).map(|p| p.0).max() else {
             unreachable!()
         };
-        if words.iter().filter_map(phi_of).any(|(b, _)| b != block) {
-            return Err("a per-lane descriptor joined in several blocks");
-        }
         if joins.contains(&block) {
             // Back at a join being traced: through a loop's back edge, the
             // dwords it joined on the previous pass.
@@ -1405,8 +1404,10 @@ impl<'a> Tracer<'a> {
                 let edge: Vec<Term> = words
                     .iter()
                     .map(|w| match phi_of(w) {
-                        Some((_, i)) => self.lane_term(Term::Value(phis[i].args[j])),
-                        None => *w,
+                        Some((b, i)) if b == block => {
+                            self.lane_term(Term::Value(phis[i].args[j]))
+                        }
+                        _ => *w,
                     })
                     .collect();
                 if edge.iter().all(|&t| self.unset_input(t)) {
