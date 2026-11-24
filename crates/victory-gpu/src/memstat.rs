@@ -13,6 +13,13 @@ pub(crate) static TITLE_GPU: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SHADOWS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SHADOW_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Host textures (the driver's allocations, video memory while it fits),
+/// how many, and how many are textures the title placed itself, never
+/// released (`resource::texture_at`).
+pub(crate) static HOST_TEXTURES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static HOST_TEXTURE_COUNT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PLACED_COUNT: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) fn add(counter: &AtomicU64, bytes: u64) {
     counter.fetch_add(bytes, Relaxed);
 }
@@ -28,10 +35,13 @@ pub fn report() -> String {
     let mib = |v: u64| v >> 20;
     #[allow(unused_mut)]
     let mut line = format!(
-        "title gpu heaps {} MiB, buffer copies {} MiB ({})",
+        "title gpu heaps {} MiB, buffer copies {} MiB ({}), host textures {} MiB ({}, {} placed)",
         mib(TITLE_GPU.load(Relaxed)),
         mib(SHADOWS.load(Relaxed)),
         SHADOW_COUNT.load(Relaxed),
+        mib(HOST_TEXTURES.load(Relaxed)),
+        HOST_TEXTURE_COUNT.load(Relaxed),
+        PLACED_COUNT.load(Relaxed),
     );
     #[cfg(windows)]
     {
