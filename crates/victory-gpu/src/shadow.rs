@@ -939,6 +939,37 @@ pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<Arc<Shado
 /// tiles that were brought up to date. Reads of the others give zeros, where
 /// a copy ending too soon was a GPU page fault; and memory many buffers of
 /// the title overlap in is copied once.
+/// The first dwords at `address`: as the title has them, as the copy has
+/// them now, and what that is (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn args_text(address: u64) -> String {
+    let mut title = [0u32; 4];
+    // SAFETY: plain words.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(title.as_mut_ptr().cast::<u8>(), 16) };
+    let read = crate::host::read_into(address as *const u8, bytes);
+    let Some(shadow) = find(address, 16) else {
+        return format!("{title:x?} {read} no buffer");
+    };
+    if shadow.is_direct() {
+        return format!("{title:x?} in place");
+    }
+    let mut copy = [0u32; 4];
+    if let Some(s) = &shadow.sparse {
+        if let Some(data) = shadow.tile(s, address as usize) {
+            // SAFETY: the tile's mapping.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (data as *const u8).add(address as usize % PAGE),
+                    copy.as_mut_ptr().cast(),
+                    16,
+                );
+            }
+        }
+        return format!("{title:x?} {read} sparse {copy:x?}");
+    }
+    format!("{title:x?} {read} copy")
+}
+
 /// What was seen of a tile's title memory.
 struct Look {
     /// The frame to look at it next in, and how often in a row it had not

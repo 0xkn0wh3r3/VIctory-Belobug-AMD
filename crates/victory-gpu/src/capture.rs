@@ -226,13 +226,89 @@ static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::Hos
 /// What the frame whose targets are dumped runs, as recorded: list, text.
 static PASSES: std::sync::Mutex<Vec<(usize, String)>> = std::sync::Mutex::new(Vec::new());
 
+/// Copies of the first render target taken within the frame (`VICTORY_SNAP`:
+/// names of programs, before the first draw of which), with the target the
+/// tiled lighting drew to.
+#[allow(clippy::type_complexity)]
+static SNAPS: std::sync::Mutex<(
+    usize,
+    Vec<(
+        String,
+        ID3D12Resource,
+        windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    )>,
+)> = std::sync::Mutex::new((0, Vec::new()));
+
+fn snap(list: &crate::host::HostList, text: &str, target: usize) {
+    let Ok(wanted) = std::env::var("VICTORY_SNAP") else {
+        return;
+    };
+    let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if snaps.0 == 0 && text.contains("TL_PS_") {
+        snaps.0 = target;
+    }
+    let Some(name) = wanted
+        .split(',')
+        .find(|w| text.contains(*w) && !snaps.1.iter().any(|s| s.0 == **w))
+    else {
+        return;
+    };
+    let resource = snaps.0 as crate::object::This;
+    let (Some(host), Some(texture)) = (
+        crate::host::host(),
+        (!resource.is_null())
+            .then(|| crate::resource::host_resource(resource))
+            .flatten(),
+    ) else {
+        return;
+    };
+    crate::list::ensure_state(list, resource, 0x800);
+    if let Some((buffer, footprint)) = read_back(&host.device, &list.list, texture) {
+        snaps.1.push((name.to_owned(), buffer, footprint));
+    }
+    if target == resource as usize {
+        crate::list::ensure_state(list, resource, 0x4);
+    }
+}
+
+fn save_snaps() {
+    let snaps = std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()));
+    let Some(folder) = folder() else { return };
+    for (i, (name, buffer, footprint)) in snaps.1.iter().enumerate() {
+        let f = footprint.Footprint;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the copy ran; the mapping spans the footprint's rows.
+        unsafe {
+            if buffer.Map(0, None, Some(&mut data)).is_err() {
+                continue;
+            }
+            let rows = std::slice::from_raw_parts(
+                data.cast::<u8>(),
+                f.RowPitch as usize * f.Height as usize,
+            );
+            let file = format!(
+                "raw-{:03}-{}x{}-f{}-p{}.raw",
+                900 + i,
+                f.Width,
+                f.Height,
+                f.Format.0,
+                f.RowPitch
+            );
+            let _ = std::fs::write(folder.join(file), rows);
+            buffer.Unmap(0, None);
+        }
+        tracing::info!(i, name, "snapshot saved");
+    }
+}
+
 /// Notes a draw or dispatch of `list`.
-pub(crate) fn pass(list: &crate::host::HostList, text: impl FnOnce() -> String) {
+pub(crate) fn pass(list: &crate::host::HostList, target: usize, text: impl FnOnce() -> String) {
     if dump_on()
         && std::env::var_os("VICTORY_DUMP_RAW").is_some()
         && listed(crate::queue::presented() + 1)
     {
         let text = text();
+        snap(list, &text, target);
         PASSES
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -332,11 +408,26 @@ pub(crate) fn note_target(resource: crate::object::This) {
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
+    save_snaps();
     let passes = std::mem::take(&mut *PASSES.lock().unwrap_or_else(|e| e.into_inner()));
     if let Some(folder) = folder()
         && !passes.is_empty()
     {
         let text: Vec<String> = passes.iter().map(|(l, t)| format!("{l:x} {t}")).collect();
+        // What indirect draws' arguments are now that everything ran.
+        let mut args = String::new();
+        for (i, (_, t)) in passes.iter().enumerate() {
+            if let Some(at) = t
+                .strip_prefix("indirect")
+                .and_then(|t| t.split_once(" at 0x"))
+                .and_then(|(_, t)| t.split_once(' '))
+                .and_then(|(t, _)| u64::from_str_radix(t, 16).ok())
+            {
+                args.push_str(&format!("{i} {at:#x} {}
+", crate::shadow::args_text(at)));
+            }
+        }
+        let _ = std::fs::write(folder.join("args.txt"), args);
         let _ = std::fs::write(folder.join("passes.txt"), text.join("
 "));
     }

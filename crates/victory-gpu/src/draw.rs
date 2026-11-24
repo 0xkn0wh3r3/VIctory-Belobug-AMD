@@ -705,7 +705,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true, false));
         #[cfg(feature = "diagnostics")]
-        crate::capture::pass(list, || self.op_text(format!("dispatch {x}x{y}x{z}"), true, true));
+        crate::capture::pass(list, self.targets.first().copied().unwrap_or(0), || self.op_text(format!("dispatch {x}x{y}x{z}"), true, true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         list.count_work();
@@ -773,7 +773,7 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false, false));
         #[cfg(feature = "diagnostics")]
-        crate::capture::pass(list, || self.op_text(format!("mesh {x}"), false, true));
+        crate::capture::pass(list, self.targets.first().copied().unwrap_or(0), || self.op_text(format!("mesh {x}"), false, true));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     list.count_work();
@@ -1056,7 +1056,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false, false));
         #[cfg(feature = "diagnostics")]
-        crate::capture::pass(list, || self.op_text(format!("draw {count}x{instances}"), false, true));
+        crate::capture::pass(list, self.targets.first().copied().unwrap_or(0), || self.op_text(format!("draw {count}x{instances}"), false, true));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1153,7 +1153,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false, false));
         #[cfg(feature = "diagnostics")]
-        crate::capture::pass(list, || self.op_text(format!("indexed {indices}x{instances}"), false, true));
+        crate::capture::pass(list, self.targets.first().copied().unwrap_or(0), || self.op_text(format!("indexed {indices}x{instances}"), false, true));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1384,9 +1384,9 @@ impl State {
             )
         });
         #[cfg(feature = "diagnostics")]
-        crate::capture::pass(list, || {
+        crate::capture::pass(list, self.targets.first().copied().unwrap_or(0), || {
             self.op_text(
-                format!("indirect kind {kind} max {max} at {arguments:#x}"),
+                format!("indirect kind {kind} max {max} at {arguments:#x} args {}", crate::shadow::args_text(arguments)),
                 kind == DISPATCH,
                 true,
             )
