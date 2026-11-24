@@ -5871,12 +5871,22 @@ impl<'a> Lower<'a> {
                     if self.block[q].is_none() {
                         continue;
                     }
-                    let (Some(tail), Source::Loaded { load, first }) = (self.tail[q], arg) else {
+                    let Some(tail) = self.tail[q] else {
                         return Err("a descriptor chosen by control flow");
                     };
                     let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
                     let here = std::mem::replace(&mut self.cur, at);
-                    let index = self.heap_index(*load, *first, sampler);
+                    let index = match arg {
+                        Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
+                        Source::Phi { .. } | Source::Select { .. } => self.heap_slot(arg, sampler),
+                        Source::Unset => Ok(self.s.m.i32(0)),
+                        _ => {
+                            if std::env::var_os("VICTORY_WHY").is_some() {
+                                eprintln!("phi of {arg:?}");
+                            }
+                            Err("a descriptor chosen by control flow")
+                        }
+                    };
                     self.cur = here;
                     incoming.push((index?, at));
                 }
@@ -6119,12 +6129,22 @@ impl<'a> Lower<'a> {
                     if self.block[q].is_none() {
                         continue;
                     }
-                    let (Some(tail), Source::Loaded { load, first }) = (self.tail[q], arg) else {
+                    let Some(tail) = self.tail[q] else {
                         return Err("a descriptor chosen by control flow");
                     };
                     let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
                     let here = std::mem::replace(&mut self.cur, at);
-                    let index = self.heap_index(*load, *first, sampler);
+                    let index = match arg {
+                        Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
+                        Source::Phi { .. } | Source::Select { .. } => self.heap_slot(arg, sampler),
+                        Source::Unset => Ok(self.s.m.i32(0)),
+                        _ => {
+                            if std::env::var_os("VICTORY_WHY").is_some() {
+                                eprintln!("phi of {arg:?}");
+                            }
+                            Err("a descriptor chosen by control flow")
+                        }
+                    };
                     self.cur = here;
                     incoming.push((index?, at));
                 }

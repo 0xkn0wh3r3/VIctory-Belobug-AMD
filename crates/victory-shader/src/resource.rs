@@ -1143,9 +1143,28 @@ impl<'a> Tracer<'a> {
                     .collect();
                 self.classify(&edge, joins)
             })
-            .collect::<Result<_, _>>();
+            .collect::<Vec<Result<Source, &'static str>>>();
         joins.pop();
-        Ok(Some(Source::Phi { block, args: args? }))
+        // shortcut: as for lanes ([`Self::lane_phi`]): the registers' former
+        // use, on a path that does not read them as a descriptor.
+        const FORMER: &str = "a descriptor neither loaded nor built";
+        let known = args.iter().find_map(|a| match a {
+            Ok(s @ (Source::Constant(_) | Source::Loaded { .. })) => Some(s.clone()),
+            _ => None,
+        });
+        let args: Vec<Source> = args
+            .into_iter()
+            .map(|a| match a {
+                Err(FORMER) if known.is_some() => Ok(Source::Unset),
+                a => a,
+            })
+            .collect::<Result<_, _>>()?;
+        if let Some(one @ Source::Constant(_)) = known
+            && args.iter().all(|a| *a == one || matches!(a, Source::Unset))
+        {
+            return Ok(Some(one));
+        }
+        Ok(Some(Source::Phi { block, args }))
     }
 
     /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced
@@ -1430,7 +1449,11 @@ impl<'a> Tracer<'a> {
         let args = args
             .into_iter()
             .map(|a| match a {
-                Err(why) if known && why.starts_with("a descriptor read from the first lane of") => {
+                Err(why)
+                    if known
+                        && why.starts_with("a descriptor read from the first lane of")
+                        && !why.ends_with("LDS read") =>
+                {
                     Ok(Source::Unset)
                 }
                 a => a,
