@@ -139,6 +139,12 @@ fn evict(map: &mut HashMap<usize, Arc<Staging>>, more: u64) {
     }
 }
 
+thread_local! {
+    /// Texture memory read for hashing and detiling: one per submitting
+    /// thread, as large as the largest texture it read.
+    static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
 static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
@@ -294,8 +300,20 @@ impl Staging {
             );
             return 0;
         }
-        // SAFETY: committed memory of the texture's layout size.
-        let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+        // Read through the kernel, as above: the title may unmap the pages
+        // (evicting a texture a big table lists) while we read them, and a
+        // direct read would fault. The copy is reused, not kept per texture.
+        SCRATCH.with_borrow_mut(|tiled| {
+            tiled.resize(size, 0);
+            crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
+            self.changed(last, tiled)
+        })
+    }
+
+    /// After reading the texture's memory into `tiled`: detiles it unless
+    /// its hash is the last one's. Returns the bytes read.
+    fn changed(&self, last: &mut Last, tiled: &[u8]) -> usize {
+        let size = tiled.len();
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
