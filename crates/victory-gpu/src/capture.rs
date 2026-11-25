@@ -454,6 +454,15 @@ pub(crate) fn dump_targets(frame: u64) {
                         None
                     }
                 });
+            // A fourth part, a hex length: that many bytes there, as a file.
+            if let (Some(at), Some(len)) =
+                (found, parts.next().and_then(|l| usize::from_str_radix(l, 16).ok()))
+            {
+                let mut bytes = vec![0u8; len.min(1 << 26)];
+                if crate::host::read_into((at + offset) as *const u8, &mut bytes) {
+                    let _ = std::fs::write(folder.join(format!("peek-{:x}.bin", at + offset)), bytes);
+                }
+            }
             if let Some(at) = found {
                 args.push_str(&format!(
                     "peek {peek} {at:#x}: {}

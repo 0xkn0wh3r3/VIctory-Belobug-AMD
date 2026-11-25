@@ -1084,3 +1084,38 @@ mod tests {
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
     }
 }
+
+#[cfg(test)]
+mod peek {
+    use super::*;
+    /// Diagnostics: `VICTORY_PEEK_LUT=<file>` (a 256x16 BGRA8 SW_4KB_S
+    /// texture's memory), detiled to `<file>.rgb` (256x16 RGB, per mips).
+    #[test]
+    fn detile_a_peeked_texture() {
+        let Ok(path) = std::env::var("VICTORY_PEEK_LUT") else { return };
+        let bytes = std::fs::read(&path).unwrap();
+        for mips in [1u32, 0] {
+            let t = Texture::new(&TextureDesc {
+                dimension: Dimension::Tex2d,
+                width: 256,
+                height: 16,
+                depth_or_array: 1,
+                mips,
+                format: 87,
+                samples: 1,
+                swizzle: Swizzle::SW_4KB_S,
+            })
+            .unwrap();
+            let l = &t.planes[0].layout;
+            let mut out = Vec::new();
+            for y in 0..16 {
+                for x in 0..256 {
+                    let o = l.offset(0, x, y, 0).unwrap() as usize;
+                    out.extend_from_slice(&[bytes[o + 2], bytes[o + 1], bytes[o]]);
+                }
+            }
+            eprintln!("mips {mips} size {} first offsets {:?}", t.size, (0..4).map(|x| l.offset(0, x, 0, 0).unwrap()).collect::<Vec<_>>());
+            std::fs::write(format!("{path}.{mips}.rgb"), out).unwrap();
+        }
+    }
+}
