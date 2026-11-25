@@ -538,15 +538,18 @@ fn protect(g: &mut Guards, from: usize, to: usize, written: &mut Vec<usize>) {
     // through one of those faults. They are not noted clean: the copies
     // taken at those views have not taken the pages, and their next check
     // must report them (a block read-only and not clean is reported).
+    // One look at the views for the whole run, and no list made for a page
+    // with one view (most of them): this runs under the guards' lock, which
+    // every copy's check waits for (6 % of the submitting thread's time when
+    // it asked block by block, run p1).
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(views) = views.as_ref() else { return };
     for block in from..to {
-        if !g.protected.contains(&block) {
+        let shown = views.shown(block * BLOCK);
+        if shown.len() < 2 || shown.len() > MANY_VIEWS || !g.protected.contains(&block) {
             continue;
         }
-        let shown = aliases(block * BLOCK);
-        if shown.len() < 2 || shown.len() > MANY_VIEWS {
-            continue;
-        }
-        for at in shown {
+        for &at in shown {
             let alias = at / BLOCK;
             g.aliased.insert(alias);
             if alias != block && !g.protected.contains(&alias) && !g.pinned(alias) {
