@@ -329,11 +329,11 @@ fn record_clamp(
 }
 
 /// Whether clamps of indirect draws are recorded in a list of their own
-/// before the list that draws (`VICTORY_HOIST_CLAMPS=1`), so that a run of
-/// draws is not interleaved with our dispatches.
+/// before the list that draws, so that a run of draws is not interleaved
+/// with our dispatches (`VICTORY_HOIST_CLAMPS=0`: each before its draw).
 pub(crate) fn hoisting() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HOIST_CLAMPS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOIST_CLAMPS").is_none_or(|v| v != "0"))
 }
 
 /// As [`bound`], recorded in `clamps`, a list that runs before the one that
