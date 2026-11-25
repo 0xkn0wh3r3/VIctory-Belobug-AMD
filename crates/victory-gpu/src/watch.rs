@@ -640,6 +640,22 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         for block in blocks {
             g.protected.remove(&block);
             g.clean.remove(&block);
+            // A view mapped a moment ago may already have been made
+            // read-only as another view of a guarded page (between the
+            // runtime's `title_memory_view` and this call): it is given
+            // back, or the title's next write there would fault with no
+            // guard to answer for it.
+            let mut old = 0;
+            // SAFETY: only the protection of title view memory changes; the
+            // call fails harmlessly on memory that is no longer a view.
+            unsafe {
+                windows_sys::Win32::System::Memory::VirtualProtect(
+                    (block * BLOCK) as *const _,
+                    BLOCK,
+                    windows_sys::Win32::System::Memory::PAGE_READWRITE,
+                    &mut old,
+                )
+            };
         }
         let aliased: Vec<usize> = g.aliased.range(at / BLOCK..end.div_ceil(BLOCK)).copied().collect();
         for block in aliased {
@@ -694,7 +710,30 @@ pub(crate) fn try_open_guarded(at: usize) -> bool {
         crate::copystat::add(crate::copystat::C::GuardFaults, 1);
         return true;
     }
-    writable(at)
+    if writable(at) {
+        return true;
+    }
+    // Read-only, in a view we were told of, and not noted guarded: only we
+    // make title views read-only, so it is ours to give back.
+    if view_guard() && !aliases(at).is_empty() {
+        let mut old = 0;
+        let block = at - at % BLOCK;
+        // SAFETY: only the protection of title view memory changes.
+        let opened = unsafe {
+            windows_sys::Win32::System::Memory::VirtualProtect(
+                block as *const _,
+                BLOCK,
+                windows_sys::Win32::System::Memory::PAGE_READWRITE,
+                &mut old,
+            )
+        } != 0;
+        if opened {
+            bump_region_epochs(block, block + BLOCK);
+            tracing::warn!(at = format_args!("{at:#x}"), "a read-only view block that no guard knew was opened");
+        }
+        return opened;
+    }
+    false
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
