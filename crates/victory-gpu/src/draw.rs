@@ -236,6 +236,15 @@ fn root_limit(address: u64) -> u32 {
     })
 }
 
+/// Why the last draw was not prepared.
+static WHY_NOT: std::sync::Mutex<&'static str> = std::sync::Mutex::new("");
+
+/// `false`, for `reason`.
+fn no(reason: &'static str) -> bool {
+    *WHY_NOT.lock().unwrap_or_else(|e| e.into_inner()) = reason;
+    false
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -577,17 +586,17 @@ impl State {
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            return false;
+            return no("skipped by name");
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            return false;
+            return no("no host pipeline");
         };
         if p.compute || p.mesh != mesh {
             once!(
                 mesh,
                 "a draw or mesh dispatch with another kind of pipeline"
             );
-            return false;
+            return no("another kind of pipeline");
         }
         if !self.bind(list, p, false) {
             return false;
@@ -623,7 +632,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
-                return false;
+                return no("no index buffer");
             };
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
@@ -664,7 +673,7 @@ impl State {
         // set after them.
         let memory = by_address.then(|| self.memory(list, compute)).flatten();
         if by_address && memory.is_none() {
-            return false;
+            return no("no view of memory");
         }
         if self.host_heaps != self.heaps && !(by_address && self.heaps[0] == 0) {
             let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
@@ -718,7 +727,7 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             let Some(made) = self.tables(list, &t.used, compute) else {
-                return false;
+                return no("a table not made");
             };
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
@@ -768,7 +777,7 @@ impl State {
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, kind, "a shader reads a root view the title did not set");
-                        return false;
+                        return no("a root view not set");
                     };
                     let Some(gpu) = root_view(list, *address, kind) else {
                         once!(
@@ -777,7 +786,7 @@ impl State {
                             address = format_args!("{address:#x}"),
                             "a shader reads a root view outside title buffers"
                         );
-                        return false;
+                        return no("a root view outside title buffers");
                     };
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
@@ -1656,8 +1665,11 @@ impl State {
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
                 Some(p) => why(&format!(
-                    "prepare failed (topology {}, vertex slots {:#x}, {})",
-                    self.topology, p.slots, p.name
+                    "prepare failed: {} (topology {}, vertex slots {:#x}, {})",
+                    std::mem::take(&mut *WHY_NOT.lock().unwrap_or_else(|e| e.into_inner())),
+                    self.topology,
+                    p.slots,
+                    p.name
                 )),
             }
             return false;
