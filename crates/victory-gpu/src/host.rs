@@ -70,6 +70,8 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    /// Device-local VRAM card buffer engine (Wave64 GPU page hashing), lazily initialized.
+    card: OnceLock<Option<Mutex<crate::card::CardEngine>>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -395,7 +397,51 @@ impl Host {
                 messages,
                 next_rtv: AtomicU32::new(0),
                 presenter: Mutex::new(None),
+                card: OnceLock::new(),
             })
+        }
+    }
+
+    fn card_engine(&self) -> Option<&Mutex<crate::card::CardEngine>> {
+        self.card
+            .get_or_init(|| match crate::card::CardEngine::new(self) {
+                Ok(engine) => {
+                    tracing::info!("VRAM card buffer engine ready (Wave64 GPU hashing)");
+                    Some(Mutex::new(engine))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "VRAM card buffer engine unavailable; falling back to host RAM"
+                    );
+                    None
+                }
+            })
+            .as_ref()
+    }
+
+    pub(crate) fn card_ready(&self) -> bool {
+        self.card_engine().is_some()
+    }
+
+    /// Executes a single command list on the direct queue and waits for it to
+    /// finish. Caller MUST hold `self.submitted`.
+    pub(crate) fn execute_and_wait_locked(&self, cmd: ID3D12CommandList, submitted: &mut u64) {
+        *submitted += 1;
+        let fence_val = *submitted;
+        // SAFETY: caller holds `self.submitted`; `cmd` is closed; fence & event are ours.
+        unsafe {
+            self.queue.ExecuteCommandLists(&[Some(cmd)]);
+            let waited = self
+                .queue
+                .Signal(&self.fence, fence_val)
+                .and_then(|()| self.fence.SetEventOnCompletion(fence_val, self.event));
+            match waited {
+                Ok(()) => {
+                    WaitForSingleObject(self.event, INFINITE);
+                }
+                Err(e) => tracing::warn!(error = %e, "card GPU wait failed"),
+            }
         }
     }
 
@@ -1056,6 +1102,56 @@ impl Host {
         }
         // The textures live (in `early`) until the submission is done.
         let first = early.record(self);
+        // Deduplicate GPU write ranges once before execution so VRAM card
+        // shadows get pre-uploaded / Wave64-hashed in the same GPU wait.
+        let mut card_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> =
+            Vec::new();
+        let mut cpu_back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::GpuWrite(shadow, address, len) = step {
+                    let target = if shadow.is_card() {
+                        &mut card_writes
+                    } else {
+                        &mut cpu_back
+                    };
+                    if !target.iter().any(|(s, a, l)| {
+                        std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len)
+                    }) {
+                        target.push((shadow.clone(), *address, *len));
+                    }
+                }
+            }
+        }
+        for (shadow, address, len) in batch.bindless_writes.drain(..) {
+            let target = if shadow.is_card() {
+                &mut card_writes
+            } else {
+                &mut cpu_back
+            };
+            if !target.iter().any(|(s, a, l)| {
+                std::sync::Arc::ptr_eq(s, &shadow) && (*a, *l) == (address, len)
+            }) {
+                target.push((shadow, address, len));
+            }
+        }
+        let (card_before, card_plan, mut card_after) =
+            if self.card.get().and_then(|o| o.as_ref()).is_some() || !card_writes.is_empty() {
+                if let Some(engine_lock) = self.card_engine() {
+                    let mut engine = engine_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    let (before, plan) = engine.record_before(self, &card_writes);
+                    let after = if plan.has_writes() {
+                        engine.record_after(self, &plan)
+                    } else {
+                        None
+                    };
+                    (before, Some(plan), after)
+                } else {
+                    (None, None, None)
+                }
+            } else {
+                (None, None, None)
+            };
         let prepared = std::time::Instant::now();
         // Each run (prelude and list) is a submission of its own: the host
         // resets the device when one submission runs for about 2 s, and
@@ -1075,18 +1171,22 @@ impl Host {
         let can_async = !cfg!(test)
             && !each
             && std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1")
-            && batch.bindless_writes.is_empty()
+            && card_writes.is_empty()
+            && cpu_back.is_empty()
             && runs.iter().all(|list| {
                 let d = list.deferred();
-                d.readbacks.is_empty()
-                    && d.writes[d.early..].is_empty()
-                    && !d.copies.iter().any(|s| matches!(s, Step::GpuWrite(..)))
+                d.readbacks.is_empty() && d.writes[d.early..].is_empty()
             });
         if let Some(first) = first {
             // SAFETY: a closed list.
             unsafe { self.queue.ExecuteCommandLists(&[Some(first)]) };
         }
+        if let Some(card_before) = card_before {
+            // SAFETY: a closed list.
+            unsafe { self.queue.ExecuteCommandLists(&[Some(card_before)]) };
+        }
         let mut async_signalled = false;
+        let mut card_after_ran = false;
         for (i, group) in groups.iter().enumerate() {
             // Diagnostics: everything but the GPU's work, to look at the
             // order of the title's submissions.
@@ -1100,6 +1200,13 @@ impl Host {
             unsafe { self.queue.ExecuteCommandLists(group) };
             if !each && i + 1 < groups.len() {
                 continue;
+            }
+            if !each
+                && let Some(after) = card_after.take()
+            {
+                // SAFETY: closed list; runs immediately after the final group under the same fence.
+                unsafe { self.queue.ExecuteCommandLists(&[Some(after)]) };
+                card_after_ran = true;
             }
             *submitted += 1;
             let fence_val = *submitted;
@@ -1140,8 +1247,21 @@ impl Host {
             }
             let _ = (i, started);
         }
+        if let Some(after) = card_after.take() {
+            #[cfg(feature = "diagnostics")]
+            let skip = no_work();
+            #[cfg(not(feature = "diagnostics"))]
+            let skip = false;
+            if !skip {
+                self.execute_and_wait_locked(after, &mut submitted);
+                card_after_ran = true;
+            }
+        }
         let _ = &firsts;
         if async_signalled {
+            if let Some(plan) = card_plan {
+                plan.clear_pending();
+            }
             SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
             for list in runs {
                 list.deferred().early = 0;
@@ -1185,27 +1305,20 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
-        // One list's lock at a time: a submission may name a list twice.
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-        for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && !back
-                        .iter()
-                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
-                {
-                    back.push((shadow.clone(), *address, *len));
+        if let Some(plan) = card_plan {
+            if card_after_ran {
+                if let Some(engine_lock) = self.card_engine() {
+                    let mut engine = engine_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    let written = engine.finish_back(self, plan, &mut submitted);
+                    COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                } else {
+                    plan.clear_pending();
                 }
+            } else {
+                plan.clear_pending();
             }
         }
-        for (shadow, address, len) in batch.bindless_writes.drain(..) {
-            if !back
-                .iter()
-                .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, &shadow) && (*a, *l) == (address, len))
-            {
-                back.push((shadow, address, len));
-            }
-        }
+        let back = cpu_back;
         if back.len() <= 1 {
             for (shadow, address, len) in &back {
                 let written = shadow.copy_back(*address, *len);
