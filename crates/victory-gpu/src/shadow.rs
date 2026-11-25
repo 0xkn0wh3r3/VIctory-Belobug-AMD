@@ -697,7 +697,13 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize, lazy: bool) -> usize {
-        let mode = self.watched.load(Ordering::Relaxed);
+        // Diagnostics (`VICTORY_ALWAYS_COPY=1`): no write watch and no
+        // guard, every copy taken again once a frame. Slow; it tells a
+        // picture fault that comes from a stale copy from one that does not.
+        static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let always = *ALWAYS.get_or_init(|| std::env::var_os("VICTORY_ALWAYS_COPY").is_some_and(|v| v == "1"));
+        let mode = if always { NOT_WATCHED } else { self.watched.load(Ordering::Relaxed) };
+        let lazy = lazy && !always;
         if mode == WATCHED_GUARDED {
             let ge = crate::watch::region_epoch(from, to);
             {

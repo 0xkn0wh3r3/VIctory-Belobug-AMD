@@ -1,3 +1,120 @@
+# VIctory fork for AMD Radeon (work in progress)
+
+This is a fork of [VIctory](https://github.com/Marvisak/VIctory) by Marvisak
+and its contributors. It follows upstream `main` up to `8e79c80` (2026-11-24),
+carries a number of upstream pull requests, and adds fixes found while running
+the game's world on one AMD card.
+
+**This repository contains no game files, code or assets.** You need your own
+copy of the game. It is not affiliated with or endorsed by the game's
+developer or publisher.
+
+## State of this fork (2026-11-25)
+
+**Not playable yet: 3 to 5 frames per second.** Tested on one machine only:
+Windows 11, AMD Radeon RX 9070 XT 16 GB, Ryzen 7 9800X3D, 64 GB RAM, Series X
+profile. Nothing here has been run on an NVIDIA or Intel card.
+
+| What | State on that machine |
+|------|-----------------------|
+| Boot, menus | work, 30 fps (as upstream) |
+| The world | renders lit, with textures, people, vehicles, vegetation, water and sky |
+| Saves | load and store |
+| Frame rate in the world | 3 to 5 fps (4.4 to 4.9 standing still in a heavy scene, about 3 while driving) |
+| Light in shadow | a constant: the game's ray-traced indirect light does not run, so shaded places are flat and rather dark |
+| Distant trees | not drawn (see below) |
+| Vehicles in motion | **broken**: parts of moving vehicles are left behind or stretched across the screen; under investigation |
+| Memory | about 22 GB of RAM and more video memory than a 16 GB card has |
+
+A driver timeout (Windows resets the display driver, every monitor goes black
+for a moment) happened once in the session this was written in. Expect it.
+
+### What this fork changes over upstream
+
+Picture:
+- The world's indirect diffuse light is replaced by a constant while the ray
+  passes do not run. What the game's resolve pass left instead was bright
+  magenta on leaves, cloth and paper, and blocks of colours indoors
+  (`VICTORY_AMBIENT=<level>`, 0.6 by default; `off` keeps the game's output).
+- In pixel shaders every read of another pixel of the same 2x2 quad goes
+  through quad reads, helper pixels included. Wave reads return 0 from helper
+  pixels on AMD, which showed as lines along every triangle on car paint,
+  glass and skin. Upstream does this after discards only.
+- A helper pixel's `v_readfirstlane` reads its own value (upstream `0601955`).
+- Twice the dynamic descriptor slots, so the tables of heavy frames fit.
+- Depth and stencil twins for depth textures written by compute, screen
+  passes with pipeline workers of their own, textures told apart by the mips
+  their memory really holds, and other fixes listed in the history.
+
+Speed:
+- The clamps of a run of indirect draws are recorded in a list before the
+  list that draws, and run one after another (`VICTORY_HOIST_CLAMPS`, 7 by
+  default, 0 for each before its draw): 225 to about 80 ms of GPU time per
+  frame in a scene of 9,000 draws.
+- Shader cache entries of another build can be reused
+  (`VICTORY_SHADER_BUILD_OF=<executable>`, diagnostics).
+
+AMD:
+- Shaders that crash or never leave the AMD driver's compiler cost only
+  their pipeline, not the run.
+- Buffer element counts come from the host's own table, not a size query the
+  driver's compiler crashes on.
+
+Diagnostics (diagnostics builds): `VICTORY_SHADER_PATCH` changes one word of a
+shader's machine code before translation, `VICTORY_SHADER_SWAP` replaces
+shader containers by files, `VICTORY_ALWAYS_COPY=1` refreshes every copy of
+title memory each frame, `VICTORY_GPU_TIMING=1` logs GPU time per pipeline.
+Each is described in a comment where it is read.
+
+### How it is run here
+
+A diagnostics build (`cargo build --profile diag -p victory --features
+diagnostics`), with:
+
+```
+VICTORY_PRESENT_TARGET=1x1:1
+VICTORY_HAIR=1
+VICTORY_SKIP_PIPELINES=4e35b816f2f91d68,b3ba0ef9ee352720,5d627391703fcb4c,ec6e4c363cf9ef2b,c89489afd89ee7f0,45f081396c2c59ba,63083c777948927a,0bd4d80ad23b106b
+victory run <game_scarlett_master.exe> --execute --console series-x
+```
+
+The skipped pipelines are the distant trees' imposters: their wind variants
+read volumes nothing fills yet and throw their quads across the screen.
+The first launch after a build translates every shader and builds about
+2,500 pipelines; the loading screen can stay frozen, with sound, for minutes.
+
+### Known problems
+
+- Moving vehicles lose or stretch parts (see the table).
+- No ray-traced light; the constant that stands in for it is the same
+  everywhere.
+- No distant trees.
+- Some compute programs do not translate (ray-tracing structure builders,
+  wind volumes, a few others) and their passes are dropped.
+- `crates/victory-shader/src/emit/lower.rs` is larger than the size limit of
+  `cargo xtask policy`; it is source code, not an asset.
+- Many changes are specific to this title and this GPU, and some are marked
+  `shortcut:` in the code where they approximate what the console does.
+
+### Credits
+
+- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
+  contributors is the base of everything here. Licensed GPL-3.0-or-later; so
+  is this fork. Upstream's history and the authors of the pull requests
+  carried here are kept in the commit history.
+- [fxceless/victory-fork](https://github.com/fxceless/victory-fork) and
+  [myokex/victory-amd](https://github.com/myokex/victory-amd) were read for
+  comparison; no code of theirs is in this fork.
+- [XCL](https://github.com/ivall/xcl) by ivall: its README was read; no code
+  of it is here.
+- This fork's changes were developed with
+  [Claude Code](https://claude.com/claude-code) and Gemini (Antigravity).
+
+Everything below this line is upstream VIctory's own README, unchanged; its
+status section describes upstream, not this fork.
+
+---
+
 # VIctory
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
