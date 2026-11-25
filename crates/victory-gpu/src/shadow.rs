@@ -1557,9 +1557,15 @@ pub(crate) fn sweep(frame: u64) {
     if !frame.is_multiple_of(EVERY) || mode == 0 {
         return;
     }
+    // Once a frame, whoever asks.
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if LAST.swap(frame, Ordering::Relaxed) == frame {
+        return;
+    }
     let gone_only = mode >= 2;
     let keep: u64 = if gone_only { 600 } else { 120 };
     let mut given = 0u64;
+    let started = std::time::Instant::now();
     let all: Vec<Arc<Shadow>> = SPARSE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1572,19 +1578,50 @@ pub(crate) fn sweep(frame: u64) {
         if !shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
             continue;
         }
+        // Those old enough, taken under the lock; whether their title memory
+        // is gone is asked of the system outside it, a region at a time (one
+        // question answers for every tile of an unmapped region); then those
+        // still as they were are taken out.
+        let mut candidates: Vec<(u32, u64)> = {
+            let tiles = s.tiles.lock().unwrap_or_else(|e| e.into_inner());
+            let kept = s.kept.lock().unwrap_or_else(|e| e.into_inner());
+            tiles
+                .iter()
+                .filter(|(at, t)| t.used + keep < frame && !kept.contains(at))
+                .map(|(&at, t)| (at, t.used))
+                .collect()
+        };
+        if gone_only && !candidates.is_empty() {
+            candidates.sort_unstable();
+            let mut gone_until = 0usize;
+            candidates.retain(|&(at, _)| {
+                let address = shadow.start as usize + at as usize * PAGE;
+                if address + PAGE <= gone_until {
+                    return true;
+                }
+                match unmapped(address) {
+                    Some(end) => {
+                        gone_until = end;
+                        address + PAGE <= end
+                    }
+                    None => false,
+                }
+            });
+        }
+        if candidates.is_empty() {
+            continue;
+        }
         let old: Vec<(u32, Tile)> = {
             let mut tiles = s.tiles.lock().unwrap_or_else(|e| e.into_inner());
             let kept = s.kept.lock().unwrap_or_else(|e| e.into_inner());
-            let old: Vec<(u32, Tile)> = tiles
-                .iter()
-                .filter(|(at, t)| t.used + keep < frame && !kept.contains(at))
-                .filter(|(at, _)| {
-                    !gone_only || unmapped(shadow.start as usize + **at as usize * PAGE).is_some()
-                })
-                .map(|(&at, &t)| (at, t))
-                .collect();
-            for (at, _) in &old {
-                tiles.remove(at);
+            let mut old = Vec::new();
+            for (at, used) in candidates {
+                if !kept.contains(&at)
+                    && tiles.get(&at).is_some_and(|t| t.used == used)
+                    && let Some(t) = tiles.remove(&at)
+                {
+                    old.push((at, t));
+                }
             }
             old
         };
@@ -1628,8 +1665,15 @@ pub(crate) fn sweep(frame: u64) {
             .free
             .extend(old.into_iter().map(|o| o.1));
     }
-    if given > 0 {
-        tracing::info!(tiles = given, megabytes = given * PAGE as u64 >> 20, frame, "tiles given back");
+    let took = started.elapsed();
+    if given > 0 || took > std::time::Duration::from_millis(20) {
+        tracing::info!(
+            tiles = given,
+            megabytes = given * PAGE as u64 >> 20,
+            frame,
+            ms = took.as_millis() as u64,
+            "tiles given back"
+        );
     }
 }
 
