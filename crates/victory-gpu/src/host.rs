@@ -2206,6 +2206,11 @@ impl HostList {
         *self.work.lock().unwrap_or_else(|e| e.into_inner()) > 0
     }
 
+    /// How many queries begun in the list still run.
+    pub(crate) fn open_queries(&self) -> usize {
+        self.queries.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
     /// Counts a dispatch or a copy: what may write indirect arguments.
     pub(crate) fn count_write(&self) {
         self.writes.fetch_add(1, Ordering::Relaxed);

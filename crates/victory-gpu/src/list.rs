@@ -230,10 +230,20 @@ fn hoist(this: This) {
         return;
     }
     state.end_hoist();
+    // A query that runs ends with the list it began in: its draws stay in
+    // one list, their clamps before each (modes 5 and 6 cut all the same,
+    // to find faults).
+    if current.open_queries() > 0 {
+        crate::indirect::CUTS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if crate::indirect::hoist_mode() < 5 {
+            return;
+        }
+    }
+    crate::indirect::CUTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Some(next) = spare() else { return };
     // What was recorded keeps its place; with no work in it, it holds the
     // clamps itself (the state set in it does them no harm).
-    let clamps = if current.worked() {
+    let clamps = if current.worked() || crate::indirect::hoist_mode() == 5 {
         let Some(clamps) = spare() else { return };
         if let Some(old) = host.replace(next) {
             old.close();

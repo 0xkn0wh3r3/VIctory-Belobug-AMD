@@ -1652,6 +1652,12 @@ impl State {
         // draw opened (`crate::list`), so that nothing of ours comes between
         // the draws.
         let before = (kind != DISPATCH
+            && match crate::indirect::hoist_mode() {
+                0 | 6 => false,
+                3 => kind == MESH,
+                4 => kind != MESH,
+                _ => true,
+            }
             && !(matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES)
             && self.hoists_into(list))
         .then(|| self.hoist.as_ref().map(|h| h.clamps.clone()))
@@ -1783,6 +1789,14 @@ impl State {
             )
         });
         let arg_buffer = rect_args.as_ref().unwrap_or(&bounded);
+        if !inline && crate::indirect::hoist_mode() == 2 {
+            let barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                ..Default::default()
+            };
+            // SAFETY: an open list; the barrier names no resource.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
         // SAFETY: an open list with everything set; the scratch buffers and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {

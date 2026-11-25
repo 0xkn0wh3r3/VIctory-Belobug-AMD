@@ -328,12 +328,53 @@ fn record_clamp(
     true
 }
 
-/// Whether clamps of indirect draws are recorded in a list of their own
-/// before the list that draws, so that a run of draws is not interleaved
-/// with our dispatches (`VICTORY_HOIST_CLAMPS=0`: each before its draw).
+/// How clamps of indirect draws are recorded: 0 each before its draw; 1 in
+/// a list of their own before the list that draws, so that a run of draws
+/// is not interleaved with our dispatches (the default); 2 as 1, with a
+/// barrier for shader writes before each draw as the clamps had.
+/// To find faults: 3 as 1 for mesh dispatches only, 4 as 1 for draws only,
+/// 5 as 1 with a new list for the clamps always, 6 the lists cut as for 1
+/// with each clamp before its draw all the same.
+/// 7 as 1 with the clamps run one after another (a barrier between them).
+/// `VICTORY_HOIST_CLAMPS=<n>` sets it; diagnostics builds read it again
+/// every half second from the file `VICTORY_HOIST_FILE` names, if any.
+pub(crate) fn hoist_mode() -> u8 {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static MODE: AtomicU8 = AtomicU8::new(u8::MAX);
+    let mode = MODE.load(Ordering::Relaxed);
+    if mode == u8::MAX {
+        let set = std::env::var("VICTORY_HOIST_CLAMPS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        MODE.store(set, Ordering::Relaxed);
+        if cfg!(feature = "diagnostics")
+            && let Some(file) = std::env::var_os("VICTORY_HOIST_FILE")
+        {
+            let _ = std::thread::Builder::new().name("victory-hoist".into()).spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let read = std::fs::read_to_string(&file).ok().and_then(|t| t.trim().parse::<u8>().ok());
+                    let cuts = CUTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+                    if cuts != [0, 0] {
+                        tracing::info!(cuts = cuts[0], queries = cuts[1], "lists cut for hoisted clamps");
+                    }
+                    if let Some(n) = read.filter(|&n| n < 8 && n != MODE.load(Ordering::Relaxed)) {
+                        MODE.store(n, Ordering::Relaxed);
+                        tracing::info!(mode = n, "clamps of indirect draws: mode changed");
+                    }
+                }
+            });
+        }
+        return set;
+    }
+    mode
+}
+
+/// Cuts made for hoisted clamps, and those not made for queries that run.
+pub(crate) static CUTS: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+/// Whether clamps of indirect draws go to a list before the one that draws.
 pub(crate) fn hoisting() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HOIST_CLAMPS").is_none_or(|v| v != "0"))
+    hoist_mode() != 0
 }
 
 /// As [`bound`], recorded in `clamps`, a list that runs before the one that
@@ -385,6 +426,11 @@ pub(crate) fn bound_before(
         l.SetComputeRootUnorderedAccessView(3, dst_gpu);
         l.SetComputeRootUnorderedAccessView(4, budget);
         l.Dispatch(records.div_ceil(64), 1, 1);
+        // Mode 7: one clamp after another, so that the budget is charged in
+        // the order of the draws as it is when each clamp precedes its draw.
+        if hoist_mode() == 7 {
+            l.ResourceBarrier(&[uav_barrier()]);
+        }
     }
     Some((dst, at))
 }
