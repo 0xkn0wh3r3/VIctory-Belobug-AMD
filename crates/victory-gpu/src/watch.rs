@@ -569,38 +569,36 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         g.protected.remove(&block);
         g.clean.remove(&block);
     }
-    // Coalesce contiguous blocks into a single VirtualProtect call to minimize
-    // kernel transitions and multi-core TLB shootdowns.
+    // Runs of blocks next to each other in one call (fewer kernel
+    // transitions and TLB shootdowns). One call cannot span two views: the
+    // title's page mappings are one view a page, and a run over several
+    // failed whole, leaving blocks read-only that were no longer noted
+    // guarded (a kernel read into them then failed and the title stopped).
+    // So a run that fails is given back block by block.
+    let give = |from: usize, to: usize| {
+        let mut old = 0;
+        // SAFETY: blocks we made read-only; only their protection changes.
+        let whole =
+            unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READWRITE, &mut old) } != 0;
+        if !whole && to - from > 1 {
+            for block in from..to {
+                // SAFETY: as above, one block.
+                unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+            }
+        }
+    };
     let mut run_start = blocks[0];
     let mut run_end = run_start + 1;
     for &block in &blocks[1..] {
         if block == run_end {
             run_end = block + 1;
         } else {
-            let mut old = 0;
-            // SAFETY: blocks we made read-only.
-            unsafe {
-                VirtualProtect(
-                    (run_start * BLOCK) as *const _,
-                    (run_end - run_start) * BLOCK,
-                    PAGE_READWRITE,
-                    &mut old,
-                );
-            }
+            give(run_start, run_end);
             run_start = block;
             run_end = block + 1;
         }
     }
-    let mut old = 0;
-    // SAFETY: blocks we made read-only.
-    unsafe {
-        VirtualProtect(
-            (run_start * BLOCK) as *const _,
-            (run_end - run_start) * BLOCK,
-            PAGE_READWRITE,
-            &mut old,
-        );
-    }
+    give(run_start, run_end);
     bump_region_epochs(start, end);
     true
 }
