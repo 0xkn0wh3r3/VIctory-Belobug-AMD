@@ -83,7 +83,19 @@ pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader
     let translate =
         |c: &[u8]| victory_shader::emit::translate_for(c, target).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, &key(build(), target), container, translate),
+        Some(cache) => {
+            let mut key = key(build(), target);
+            // A container a diagnostic patch may apply to has entries of its
+            // own, by the patches.
+            let patches = victory_shader::native::diagnostic_patches();
+            if patches.iter().any(|p| p.0 == container.len()) {
+                let mut h = blake3::Hasher::new();
+                h.update(&key);
+                h.update(format!("{patches:?}").as_bytes());
+                key = *h.finalize().as_bytes();
+            }
+            cached(cache, &key, container, translate)
+        }
         None => translate(container),
     }
 }
