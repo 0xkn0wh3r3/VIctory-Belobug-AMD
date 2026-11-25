@@ -6204,6 +6204,27 @@ impl<'a> Lower<'a> {
         if records.is_some() {
             props = (11 | props.0 & 0x1000, 0);
         }
+        // A typed or structured buffer's element count comes from the host's
+        // table of them by slot: the AMD driver's compiler crashes on a size
+        // query of a structured buffer from the heap (stride 60, nine
+        // compute programs of the world) and takes minutes over hundreds of
+        // a typed one's; the table holds the title's own count.
+        if image.is_none() && (records.is_some() || matches!(props.0 & 0xfff, 10 | 12)) {
+            let slot = if load == site {
+                self.heap_slot(&src, false)?
+            } else {
+                self.heap_index_at(site, skew.wrapping_neg(), false)?
+            };
+            let n = self.slot_dword(slot, super::OWN_SLOTS);
+            for k in 0..count {
+                if (k as i32).wrapping_add(skew) == 2 {
+                    self.write(inst, Reg::S(code + k as u8), n, None);
+                } else if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                    self.vals.insert(v, Val::Missing(OTHER));
+                }
+            }
+            return Ok(());
+        }
         // The handle is built from this load's own address (the other
         // load's registers need not hold it here): the descriptor starts
         // `skew` dwords before what this load reads.
@@ -7096,11 +7117,27 @@ impl<'a> Lower<'a> {
             .heap_slot(src, false)
             .map_err(|_| "a structured buffer of unknown stride")?;
         let c = self.cur;
+        let stride = self.slot_dword(slot, 0);
+        let elem_off = self.s.m.bin(c, Bin::Mul, index, stride);
+        Ok(self.s.m.bin(c, Bin::Add, elem_off, off))
+    }
+
+    /// What the host's table by heap slot (`t0`, [`super::STRIDE_SPACE`])
+    /// holds for `slot`, `from` dwords on: the element stride of its buffer
+    /// view from 0, the element count from [`super::OWN_SLOTS`].
+    fn slot_dword(&mut self, slot: V, from: u32) -> V {
+        let c = self.cur;
         let table = self.s.stride_table_handle();
         // A root view has no bounds: a wild index would read past the table.
-        let slot = if super::limits_indices() {
+        let slot = if super::limits_indices() || from != 0 {
             let (i32t, last) = (self.s.t.i32, self.s.m.i32(super::OWN_SLOTS - 1));
             self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last])
+        } else {
+            slot
+        };
+        let slot = if from != 0 {
+            let from = self.s.m.i32(from);
+            self.s.m.bin(c, Bin::Add, slot, from)
         } else {
             slot
         };
@@ -7117,10 +7154,8 @@ impl<'a> Lower<'a> {
             139,
             &[table, addr, iu, mask, align],
         );
-        let stride_f = self.s.m.extract(c, res, 0);
-        let stride = self.as_int(stride_f);
-        let elem_off = self.s.m.bin(c, Bin::Mul, index, stride);
-        Ok(self.s.m.bin(c, Bin::Add, elem_off, off))
+        let x = self.s.m.extract(c, res, 0);
+        self.as_int(x)
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar

@@ -63,6 +63,9 @@ pub(crate) struct HostHeap {
     memory_seen: Mutex<u64>,
 }
 
+/// The dword of the stride table the element counts start at.
+const COUNTS_AT: u32 = victory_shader::emit::OWN_SLOTS;
+
 struct StrideTable {
     _resource: ID3D12Resource,
     ptr: usize,
@@ -71,8 +74,10 @@ struct StrideTable {
 }
 
 impl StrideTable {
+    /// The element counts follow the strides, from [`COUNTS_AT`] dwords on
+    /// (where shaders, which know no heap's size, look for them).
     fn new(device: &ID3D12Device, len: u32) -> Option<Self> {
-        let bytes = (u64::from(len) * 4).max(4);
+        let bytes = ((u64::from(COUNTS_AT) + u64::from(len)) * 4).max(4);
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: bytes,
@@ -845,7 +850,11 @@ impl HostHeap {
             }
         }
         self.keep_with_view(index, kept.flatten(), view);
-        self.set_stride(index, if ok { view_stride(view) } else { 0 });
+        if ok {
+            self.set_stride_count(index, view_stride(view), view_count(view));
+        } else {
+            self.set_stride(index, 0);
+        }
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -955,11 +964,22 @@ impl HostHeap {
     }
 
     fn set_stride(&self, index: u32, stride: u32) {
+        self.set_stride_count(index, stride, 0);
+    }
+
+    /// The stride and the element count of the buffer view in slot `index`
+    /// (zeros for anything else), for shaders: a size query of a structured
+    /// buffer of some strides crashes the AMD driver's compiler.
+    fn set_stride_count(&self, index: u32, stride: u32, count: u32) {
         if let Some(t) = &self.strides
             && index < t.len
         {
-            // SAFETY: `t.ptr` points to a live mapped UPLOAD buffer of `t.len` dwords.
-            unsafe { *(t.ptr as *mut u32).add(index as usize) = stride };
+            // SAFETY: `t.ptr` points to a live mapped UPLOAD buffer of
+            // `COUNTS_AT + t.len` dwords.
+            unsafe {
+                *(t.ptr as *mut u32).add(index as usize) = stride;
+                *(t.ptr as *mut u32).add((COUNTS_AT + index) as usize) = count;
+            }
         }
     }
 
@@ -1056,7 +1076,7 @@ impl HostHeap {
                 self.keep_with_view(index, kept.flatten(), &view);
                 // The stride is the title view's, however and whenever the
                 // host view is made.
-                self.set_stride(index, view_stride(&view));
+                self.set_stride_count(index, view_stride(&view), view_count(&view));
             }
         }
         if !self.sampler {
@@ -2075,6 +2095,34 @@ fn view_stride(view: &View) -> u32 {
         _ => 0,
     };
     u32::try_from(bytes).unwrap_or(0)
+}
+
+/// The elements of the title's buffer view `view` (0 for other views).
+fn view_count(view: &View) -> u32 {
+    let srv = |w: &[u32; 10]| {
+        let desc = srv_desc(w);
+        // SAFETY: a buffer view's union member.
+        (desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER)
+            .then(|| unsafe { desc.Anonymous.Buffer }.NumElements)
+    };
+    let uav = |w: &[u32; 10]| {
+        let desc = uav_desc(w);
+        // SAFETY: a buffer view's union member.
+        (desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
+            .then(|| unsafe { desc.Anonymous.Buffer }.NumElements)
+    };
+    match view {
+        View::Shader(_, Some(desc)) => srv(desc),
+        View::Placed(false, resource, desc) if resource[0] == 1 => {
+            desc[..10].try_into().ok().and_then(srv)
+        }
+        View::Unordered(_, _, Some(desc)) => uav(desc),
+        View::Placed(true, resource, desc) if resource[0] == 1 => {
+            desc[..10].try_into().ok().and_then(uav)
+        }
+        _ => None,
+    }
+    .unwrap_or(0)
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
