@@ -53,6 +53,9 @@ pub const DEVICE_IID: Guid = Guid::new(
 
 /// The documented "no such user" error.
 pub const USER_NOT_FOUND: HRESULT = 0x8924_5104_u32 as i32;
+/// `HRESULT_FROM_WIN32(ERROR_NOT_FOUND)`: what `XUserFindUserByLocalId`
+/// documents for a local id that has no user.
+pub const NOT_FOUND: HRESULT = 0x8007_0490_u32 as i32;
 
 pub const XUID: u64 = 0x0009_0000_0000_0001;
 pub const LOCAL_ID: u64 = 1;
@@ -139,7 +142,11 @@ extern "system" fn get_local_id(_: This, _: Handle, out: *mut u64) -> HRESULT {
     put(out, LOCAL_ID)
 }
 extern "system" fn find_by_local_id(_: This, id: u64, out: *mut Handle) -> HRESULT {
-    found(id == LOCAL_ID, out)
+    if id == LOCAL_ID {
+        put(out, user())
+    } else {
+        NOT_FOUND
+    }
 }
 extern "system" fn get_id(_: This, _: Handle, out: *mut u64) -> HRESULT {
     put(out, XUID)
@@ -421,5 +428,23 @@ mod tests {
             xasync::XAsyncGetStatus(&mut block, true),
             FAILED_TO_GET_TOKEN
         );
+    }
+
+    #[test]
+    fn an_unknown_local_id_is_not_found() {
+        type Find = extern "system" fn(This, u64, *mut Handle) -> HRESULT;
+        let this: This = &OBJECT;
+        let by_local_id = slot::<Find>(&OBJECT, 0x50);
+        let mut handle = std::ptr::null();
+        assert_eq!(by_local_id(this, LOCAL_ID, &mut handle), S_OK);
+        assert_eq!(handle, user());
+
+        let mut handle = std::ptr::null();
+        assert_eq!(by_local_id(this, LOCAL_ID + 1, &mut handle), NOT_FOUND);
+        assert!(handle.is_null());
+        // XUserFindUserById names no error; it keeps the XUser one.
+        let by_id = slot::<Find>(&OBJECT, 0x60);
+        assert_eq!(by_id(this, XUID + 1, &mut handle), USER_NOT_FOUND);
+        assert!(handle.is_null());
     }
 }
