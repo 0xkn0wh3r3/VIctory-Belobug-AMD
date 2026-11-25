@@ -3597,6 +3597,41 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
                 }
             }
         }
+        // The records a skinning program takes its views from: those whose
+        // slot holds no buffer.
+        #[cfg(feature = "diagnostics")]
+        if shown <= 3 && marker.contains("CSComputeSkinning") {
+            let number = |key: &str, radix: u32, end: char| {
+                marker
+                    .split_once(key)
+                    .and_then(|(_, v)| u64::from_str_radix(v.split(end).next()?, radix).ok())
+            };
+            let list = marker.split_once("Srv s1+16: placed").and_then(|(_, t)| {
+                u64::from_str_radix(t.split_once(" at 0x")?.1.split('"').next()?, 16).ok()
+            });
+            if let (Some(list), Some(first), Some(count)) =
+                (list, number(" u6=0x", 16, ' '), number(" u7=0x", 16, ' '))
+            {
+                text.push_str(&format!(" RECORDS {first}+{count} of {list:#x}"));
+                for k in 0..count.min(64) {
+                    let at = list + 192 + (first + k) * 176;
+                    let words = crate::shadow::words_text(at, 128);
+                    let w: Vec<u32> = words
+                        .split(['[', ',', ']'])
+                        .filter_map(|w| u32::from_str_radix(w.trim(), 16).ok())
+                        .collect();
+                    if w.len() < 32 {
+                        text.push_str(&format!(" REC {k} unreadable"));
+                        continue;
+                    }
+                    let slots = [w[18], w[15] & 0xff_ffff, w[19] & 0xff_ffff];
+                    let what = crate::draw::report_slots(&slots);
+                    if k < 1 || what.contains("null") || what.contains("Shader(") || what.contains("DIRTY") {
+                        text.push_str(&format!(" REC {k} {w:x?}{what}"));
+                    }
+                }
+            }
+        }
         // What an indirect command got, as the title's memory has it now.
         if let Some(at) = marker
             .strip_prefix("indirect kind ")

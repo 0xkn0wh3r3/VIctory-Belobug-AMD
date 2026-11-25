@@ -163,6 +163,9 @@ struct Bindless {
     bounce_chunks: Vec<(ID3D12Resource, usize, u64, u64)>,
     /// Slots written since the plan was made: only they are made again.
     dirty: BTreeSet<u32>,
+    /// Slots of `dirty` in the order the title wrote them (some may be made
+    /// since): the last ones are the tables of the work being submitted.
+    recent: Vec<u32>,
     /// What each slot made for bindless access needs at submission.
     uses: BTreeMap<u32, SlotUse>,
     /// Of them, those with work at each submission.
@@ -211,6 +214,8 @@ struct Bindless {
 const SLOT_BUDGET_US: u64 = 20_000;
 /// Slots taken to make at once (the rest wait without being looked at).
 const SLOT_CHUNK: usize = 512;
+/// Slots made at each submission whatever time they take.
+const URGENT: usize = 2048;
 
 impl Bindless {
     /// The slot-making budget, refilled for the time passed since.
@@ -1060,6 +1065,7 @@ impl HostHeap {
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
         if b.slots.insert(index, entry) != Some(entry) {
             b.dirty.insert(index);
+            b.recent.push(index);
             if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
                 bounce.active = false;
             }
@@ -1079,6 +1085,7 @@ impl HostHeap {
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
         if b.slots.remove(&index).is_some() {
             b.dirty.insert(index);
+            b.recent.push(index);
             if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
                 bounce.active = false;
             }
@@ -1548,7 +1555,7 @@ impl HostHeap {
             b.checked.1 != epochs.1 && b.looked[0] != frame
         };
         let live = evictions.then(crate::resource::placed_live);
-        let (mut todo, check, remade) = {
+        let (mut todo, check, remade, exempt) = {
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
             let b = &mut *b;
             // Released views, evicted textures, and remapped memory are looked for once a frame.
@@ -1563,6 +1570,7 @@ impl HostHeap {
             }
             if !look
                 && !remake
+                && b.recent.is_empty()
                 && b.budget()[0] == 0
                 && let Some(plan) = &b.plan
             {
@@ -1584,6 +1592,21 @@ impl HostHeap {
             };
             let mut remade: Vec<u32> = Vec::new();
             let mut dirty = BTreeSet::new();
+            // What the title wrote last comes first and is made whatever it
+            // takes: shaders run with a table not made read zeros as indices
+            // of other slots, and a texture's slot read as a buffer's stops
+            // the host GPU.
+            let mut urgent = Vec::new();
+            while urgent.len() < URGENT
+                && let Some(i) = b.recent.pop()
+            {
+                if b.dirty.remove(&i) {
+                    urgent.push(i);
+                }
+            }
+            if b.dirty.is_empty() {
+                b.recent.clear();
+            }
             while dirty.len() < 4 * SLOT_CHUNK
                 && let Some(i) = b.dirty.pop_first()
             {
@@ -1626,11 +1649,16 @@ impl HostHeap {
             } else {
                 Vec::new()
             };
-            let todo: Vec<(u32, Option<(u32, u32)>)> = dirty
+            for i in &urgent {
+                dirty.remove(i);
+            }
+            let exempt = urgent.len();
+            let todo: Vec<(u32, Option<(u32, u32)>)> = urgent
                 .into_iter()
+                .chain(dirty)
                 .map(|i| (i, b.slots.get(&i).copied()))
                 .collect();
-            (todo, check, remade)
+            (todo, check, remade, exempt)
         };
         if !remade.is_empty() {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -1649,7 +1677,7 @@ impl HostHeap {
         let mut todo = todo.into_iter();
         let mut count = 0usize;
         for (index, entry) in todo.by_ref() {
-            if (count & 15) == 0 && started.elapsed().as_micros() as u64 > left {
+            if count >= exempt && (count & 15) == 0 && started.elapsed().as_micros() as u64 > left {
                 // Over budget: the rest waits for the next submission.
                 over = Some(index);
                 break;

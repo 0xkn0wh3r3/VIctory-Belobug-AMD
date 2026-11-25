@@ -372,20 +372,32 @@ impl Shader {
         nonuniform: bool,
         props: (u32, u32),
     ) -> V {
+        // An index past the heap is a fault that stops the host GPU.
+        let index = if !sampler && super::limits_indices() {
+            let last = self.m.i32(super::OWN_SLOTS - 1);
+            let i32t = self.t.i32;
+            self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last])
+        } else {
+            index
+        };
+        self.handle_at(block, index, sampler, nonuniform, props)
+    }
+
+    /// A handle of the heap slot at `index`, which is known to be in it.
+    pub fn handle_at(
+        &mut self,
+        block: usize,
+        index: V,
+        sampler: bool,
+        nonuniform: bool,
+        props: (u32, u32),
+    ) -> V {
         self.flags |= if sampler {
             flags::SAMPLER_HEAP
         } else {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
-        // An index past the heap is a fault that stops the host GPU.
-        let index = if !sampler && super::limits_indices() {
-            let last = self.m.i32(super::last_slot());
-            let i32t = self.t.i32;
-            self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last])
-        } else {
-            index
-        };
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,

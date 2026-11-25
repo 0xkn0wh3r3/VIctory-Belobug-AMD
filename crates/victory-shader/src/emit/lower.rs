@@ -2571,7 +2571,7 @@ impl<'a> Lower<'a> {
     fn memory(&mut self, lo: V, hi: V, nonuniform: bool) -> (V, V) {
         let c = self.cur;
         let first = self.memory_base();
-        let map = self.s.heap_handle(c, first, false, false, (11, 0));
+        let map = self.s.handle_at(c, first, false, false, (11, 0));
         let k = |l: &mut Self, x: u32| l.s.m.i32(x);
         let (k255, k12, k20, k3, low) =
             (k(self, 255), k(self, 12), k(self, 20), k(self, 3), k(self, 0xF_FFFF));
@@ -2593,6 +2593,9 @@ impl<'a> Lower<'a> {
         let view = self.as_int(view);
         let start = self.s.m.extract(c, r, 1);
         let start = self.as_int(start);
+        // Never past the views of ours, whatever the map holds.
+        let (i32t, most) = (self.s.t.i32, self.s.m.i32(super::VIEW_SLOTS - super::OWN_SLOTS - 1));
+        let view = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[view, most]);
         let index = self.s.m.bin(c, Bin::Add, first, view);
         // Builders read what other groups of the dispatch wrote.
         let p = self.x.p;
@@ -2603,7 +2606,7 @@ impl<'a> Lower<'a> {
             })
         });
         let shared = if shared { 0x4000 } else { 0 };
-        let handle = self.s.heap_handle(c, index, false, nonuniform, (11 | 0x1000 | shared, 0));
+        let handle = self.s.handle_at(c, index, false, nonuniform, (11 | 0x1000 | shared, 0));
         let within = self.s.m.bin(c, Bin::And, lo, low);
         (handle, self.s.m.bin(c, Bin::Add, start, within))
     }

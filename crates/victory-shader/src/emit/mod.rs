@@ -174,9 +174,6 @@ pub const VIEW_SLOTS: u32 = 1_770_496;
 /// such views stay below.
 pub const OWN_SLOTS: u32 = VIEW_SLOTS - 1024;
 
-fn last_slot() -> u32 {
-    if rays() { VIEW_SLOTS - 1 } else { OWN_SLOTS - 1 }
-}
 
 /// Whether heap indices are kept below [`VIEW_SLOTS`]: skinning programs
 /// take them from title data, and one past the heap stops the host GPU.
