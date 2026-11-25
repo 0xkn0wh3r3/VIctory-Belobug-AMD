@@ -711,6 +711,54 @@ fn timing() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
 }
 
+/// Notes how long the host GPU took for a submission: how many took how
+/// long, and of those of 3 ms and more which pipelines they ran.
+#[cfg(feature = "diagnostics")]
+fn gpu_waits(gpu: std::time::Duration, runs: &[&HostList]) {
+    let mut waits = GPU_WAITS.lock().unwrap_or_else(|e| e.into_inner());
+    let us = gpu.as_micros() as u64;
+    let bucket = [200, 1000, 3000, 10_000, 30_000].iter().position(|&m| us < m).unwrap_or(5);
+    waits.0[bucket].0 += 1;
+    waits.0[bucket].1 += us;
+    if us >= 3000 {
+        let mut pipelines: Vec<String> = runs
+            .iter()
+            .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .collect();
+        pipelines.sort_unstable();
+        pipelines.dedup();
+        let mut key = format!("{} lists {} pipelines:", runs.len(), pipelines.len());
+        for p in pipelines.iter().take(12) {
+            key.push(' ');
+            key.push_str(p.trim_start_matches("[compute ").trim_end_matches(']'));
+        }
+        let e = waits.1.entry(key).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += us;
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+#[allow(clippy::type_complexity)]
+static GPU_WAITS: Mutex<([(u32, u64); 6], std::collections::BTreeMap<String, (u32, u64)>)> =
+    Mutex::new(([(0, 0); 6], std::collections::BTreeMap::new()));
+
+/// Logs and forgets what [`gpu_waits`] noted.
+#[cfg(feature = "diagnostics")]
+fn log_gpu_waits() {
+    let (buckets, slow) = std::mem::take(&mut *GPU_WAITS.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut text = String::new();
+    for (name, (n, us)) in ["<0.2", "<1", "<3", "<10", "<30", "more"].iter().zip(buckets) {
+        text.push_str(&format!(" {name} ms: {n} x, {:.0} ms;", us as f64 / 1e3));
+    }
+    tracing::info!("GPU waits since:{text}");
+    let mut slow: Vec<_> = slow.into_iter().collect();
+    slow.sort_unstable_by_key(|(_, (_, us))| std::cmp::Reverse(*us));
+    for (key, (n, us)) in slow.into_iter().take(8) {
+        tracing::info!("GPU wait {:.0} ms in {n} x: {key}", us as f64 / 1e3);
+    }
+}
+
 /// Whether each noted command waits for those before it (`VICTORY_GPU_STEP`,
 /// diagnostics builds), so that a list stops at the command at fault.
 #[cfg(feature = "diagnostics")]
@@ -1069,6 +1117,8 @@ impl Host {
     /// bottom-of-pipe writes require GPU completion, or returns asynchronously
     /// so CPU recording overlaps GPU execution.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        #[cfg(feature = "diagnostics")]
+        let _inside = crate::profile::here();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1283,6 +1333,8 @@ impl Host {
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        gpu_waits(gpu, runs);
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
             let pipelines: std::collections::BTreeSet<String> = runs
@@ -3179,6 +3231,10 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            tracing::info!("sparse writes since: {}", crate::shadow::sparse_writes_text());
+            #[cfg(feature = "diagnostics")]
+            log_gpu_waits();
             tracing::info!(
                 "[{} {}] {fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB, bindless plans \

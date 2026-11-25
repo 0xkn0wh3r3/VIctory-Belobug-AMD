@@ -130,6 +130,46 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
+/// Snapshot memory of one tile each, kept for reuse: a world frame takes
+/// thousands, and the pool above keeps 8 (the rest was allocated and freed
+/// each time, a tenth of the submitting thread's time).
+static TILE_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+/// Tile snapshots kept at most (512 MiB).
+const TILE_POOL_MOST: usize = 8192;
+
+/// An empty buffer with room for a tile.
+fn pooled_tile() -> Vec<u8> {
+    let kept = TILE_POOL.lock().unwrap_or_else(|e| e.into_inner()).pop();
+    let mut v = kept.unwrap_or_else(|| Vec::with_capacity(PAGE));
+    v.clear();
+    v
+}
+
+/// Returns tile snapshots to their pool.
+fn give_back_tiles(all: impl Iterator<Item = Vec<u8>>) {
+    let mut pool = TILE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    for v in all {
+        if pool.len() < TILE_POOL_MOST && v.capacity() >= PAGE {
+            pool.push(v);
+        }
+    }
+}
+
+/// Of sparse copies shaders write: bytes declared, bytes of snapshots taken,
+/// bytes compared after and bytes of those that differed.
+#[cfg(feature = "diagnostics")]
+static SPARSE_WRITES: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Logs and resets the counts above.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn sparse_writes_text() -> String {
+    let [declared, taken, compared, differed] =
+        [0, 1, 2, 3].map(|i| SPARSE_WRITES[i].swap(0, Ordering::Relaxed) as f64 / 1e6);
+    format!("declared {declared:.1} MB, snapshots {taken:.1} MB, compared {compared:.1} MB, differed {differed:.1} MB")
+}
+
 /// Bytes of the snapshot memory kept for reuse.
 pub(crate) fn pool_bytes() -> u64 {
     let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
@@ -1822,11 +1862,15 @@ impl Shadow {
             .push((address, address + len));
         let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
         let start = self.start as usize;
+        #[cfg(feature = "diagnostics")]
+        SPARSE_WRITES[0].fetch_add(len as u64, Ordering::Relaxed);
         self.each_tile(s, address, address + len, |at, data, _| {
             let tile = ((at - start) / PAGE) as u32;
             before.entry(tile).or_insert_with(|| {
+                #[cfg(feature = "diagnostics")]
+                SPARSE_WRITES[1].fetch_add(PAGE as u64, Ordering::Relaxed);
                 let whole = data as usize & !(PAGE - 1);
-                let mut buf = pooled(PAGE);
+                let mut buf = pooled_tile();
                 // SAFETY: the tile's mapping.
                 buf.extend_from_slice(unsafe { std::slice::from_raw_parts(whole as *const u8, PAGE) });
                 buf
@@ -1847,9 +1891,13 @@ impl Shadow {
             let old = &mut old[at % PAGE..at % PAGE + n];
             // SAFETY: the tile's mapping; only this thread writes it.
             let host = unsafe { std::slice::from_raw_parts_mut(data, n) };
+            #[cfg(feature = "diagnostics")]
+            SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
             if host == old {
                 return;
             }
+            #[cfg(feature = "diagnostics")]
+            SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
             let buf = title.get_or_insert_with(|| {
                 let mut v = pooled(PAGE);
                 v.resize(PAGE, 0);
@@ -1877,9 +1925,7 @@ impl Shadow {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
         if pending.is_empty() {
-            for (_, buf) in before.drain() {
-                give_back(buf);
-            }
+            give_back_tiles(before.drain().map(|(_, buf)| buf));
         }
         written
     }
