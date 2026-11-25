@@ -492,6 +492,19 @@ pub fn title_memory_committed(at: usize, len: usize) {
 pub fn title_memory_written(at: usize, len: usize) {
     if len != 0 {
         bump_region_epochs(at, at.saturating_add(len));
+        // The runtime writes through a view of its own, which neither the
+        // kernel's write watch nor our guards see: the pages are noted
+        // written here, or host copies of buffers made before the file
+        // arrived kept what the memory held then for good (meshes read as
+        // zeros: walls, floors and bodies missing, others each launch).
+        {
+            let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+            j.asked += 1;
+            let now = j.asked;
+            for page in at / PAGE..(at + len).div_ceil(PAGE) {
+                j.written.insert(page, now);
+            }
+        }
         crate::resource::textures_rewritten(at as u64, (at + len) as u64);
     }
 }
