@@ -798,6 +798,15 @@ impl HostHeap {
             return None;
         };
         taken[first..first + n].fill(true);
+        #[cfg(feature = "diagnostics")]
+        if !self.sampler {
+            static MADE: AtomicU64 = AtomicU64::new(0);
+            let before = MADE.fetch_add(n as u64, Ordering::Relaxed);
+            if before >> 20 != (before + n as u64) >> 20 {
+                let used = taken.iter().filter(|t| **t).count();
+                tracing::info!(used, spare, "dynamic descriptor slots");
+            }
+        }
         *next = ((first + n) % spare) as u32;
         Some(self.count + first as u32)
     }

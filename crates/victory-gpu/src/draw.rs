@@ -92,6 +92,9 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    /// Of them, large ones by table: the records it was made from and the
+    /// first dynamic slot. A shader that reads less of one takes the same.
+    large_tables: std::collections::HashMap<u64, Vec<(Vec<[u32; 3]>, u32)>>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -205,6 +208,20 @@ fn root_view(list: &HostList, address: u64, kind: u8) -> Option<u64> {
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
     Some(gpu)
+}
+
+/// Tables from this many entries on are made once for every length shaders
+/// read them to.
+const LARGE: u32 = 64;
+
+/// The longest `table` of `heap` was asked for, now for `n` entries.
+fn longest(heap: &crate::descriptor::Heap, table: u64, n: u32) -> u32 {
+    static LONGEST: std::sync::Mutex<Option<std::collections::HashMap<u64, u32>>> =
+        std::sync::Mutex::new(None);
+    let mut all = LONGEST.lock().unwrap_or_else(|e| e.into_inner());
+    let most = all.get_or_insert_default().entry(table).or_insert(n);
+    *most = (*most).max(n);
+    if heap.index(table + u64::from(*most - 1) * 32).is_some() { *most } else { n }
 }
 
 /// The last byte of the root view at `address` four dwords can be read from:
@@ -329,6 +346,7 @@ impl State {
         self.host_heaps = [0; 2];
         // Making one refreshes what it names, which is each list's own work.
         self.fresh_tables.clear();
+        self.large_tables.clear();
         if self.topology != 0 {
             self.set_topology(list, self.topology);
         }
@@ -1116,10 +1134,46 @@ impl State {
                 .max()
                 .unwrap_or(1);
             let last = table + u64::from(n - 1) * 32;
+            // Shaders read such a table to many lengths, and a copy for each
+            // ran out of slots: the longest seen serves all.
+            let n = if n >= LARGE { longest(heap, table, n) } else { n };
             if heap.index(last).is_none() {
                 for u in entries {
                     self.table_entry(list, u, compute);
                 }
+                continue;
+            }
+            let records: Vec<[u32; 3]> = if n >= LARGE {
+                (0..n)
+                    // SAFETY: descriptor slots in title memory.
+                    .map(|k| unsafe {
+                        ((table + u64::from(k) * 32) as *const [u32; 3]).read_unaligned()
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let needed = entries
+                .iter()
+                .map(|u| u.table_offset_dwords as usize / 8 + 1)
+                .max()
+                .unwrap_or(1);
+            let same = self.large_tables.get(&table).and_then(|made| {
+                made.iter()
+                    .find(|(r, _)| r.len() >= needed && r[..needed] == records[..needed.min(records.len())])
+                    .map(|&(_, first)| first)
+            });
+            if n >= LARGE
+                && let Some(first) = same
+            {
+                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                    let handle = table + u64::from(u.table_offset_dwords) * 4;
+                    match crate::descriptor::view(handle) {
+                        Some(view) => readable(list, u, &view),
+                        None => self.null_uav |= u.kind == ResourceType::Uav,
+                    }
+                }
+                made.push((slot, first * 32));
                 continue;
             }
             // The table and what its entries hold (record words).
@@ -1159,6 +1213,9 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, first);
+            if n >= LARGE {
+                self.large_tables.entry(table).or_default().push((records, first));
+            }
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The whole range: a shader may index past the entries its
