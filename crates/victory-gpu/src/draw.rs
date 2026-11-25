@@ -945,8 +945,17 @@ impl State {
             {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
                     let host = crate::shadow::find(*address, 1)
-                        .map(|s| (s.gpu(*address), s.left(*address)));
-                    let _ = write!(text, " root{slot}={address:#x} host {host:#x?}");
+                        .map(|s| {
+                            let kind = if s.is_direct() {
+                                "in place"
+                            } else if s.is_sparse() {
+                                "sparse"
+                            } else {
+                                "copy"
+                            };
+                            format!("{kind} {:#x} left {:#x}", s.gpu(*address), s.left(*address))
+                        });
+                    let _ = write!(text, " root{slot}={address:#x} host {host:?}");
                 }
             }
         }

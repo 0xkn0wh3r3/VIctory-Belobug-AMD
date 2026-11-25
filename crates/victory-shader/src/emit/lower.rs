@@ -567,6 +567,10 @@ struct Lower<'a> {
     one_lane: HashSet<Value>,
     /// Memory by address is written too, for other groups to read.
     coherent: Option<bool>,
+    /// Threads of different groups take turns through atomics (a tree built
+    /// from its leaves up): what they wrote before one must be seen after
+    /// it. The console's program waits for its writes there.
+    ordered: Option<bool>,
     /// Views of buffers accessed by address, by instruction.
     made: HashMap<Site, V>,
     /// The program's constant table (the code from the first byte read
@@ -1350,6 +1354,7 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             one_lane: Default::default(),
             coherent: None,
+            ordered: None,
             made: Default::default(),
             code_table: None,
             scratch: None,
@@ -4867,6 +4872,28 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// See [`Lower::ordered`]: programs that reach memory by address or
+    /// write through root views, which are the builders of ray tracing's
+    /// structures.
+    fn ordered(&mut self) -> bool {
+        let x = self.x;
+        *self.ordered.get_or_insert_with(|| {
+            super::rays()
+                && (x.res.addresses
+                    || x.native.used.iter().any(|u| {
+                        u.root == RootType::Descriptor && u.kind == ResourceType::Uav
+                    }))
+        })
+    }
+
+    /// Writes to buffers made before are seen before those made after, by
+    /// every group.
+    fn uav_fence(&mut self) {
+        let (mode, void) = (self.s.m.i32(2), self.s.t.void);
+        self.s
+            .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
     // ---- instructions ----
 
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
@@ -4903,6 +4930,11 @@ impl<'a> Lower<'a> {
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
+        let fence = (name.starts_with("buffer_atomic") || name.starts_with("global_atomic"))
+            && self.ordered();
+        if fence {
+            self.uav_fence();
+        }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
@@ -4931,6 +4963,9 @@ impl<'a> Lower<'a> {
             // Generic addresses: private, shared or global memory by aperture.
             Fields::Flat { .. } => Err("flat memory"),
         };
+        if fence && r.is_ok() {
+            self.uav_fence();
+        }
         if let Err(w) = &r && std::env::var_os("VICTORY_WHY").is_some() {
             eprintln!("missing {offset:#x} {name} {w}");
         }
@@ -6710,7 +6745,9 @@ impl<'a> Lower<'a> {
                     }
                     (RootType::Descriptor, Some(ResourceType::Uav) | None, 0x100B)
                     | (RootType::Descriptor, Some(ResourceType::Uav), 11) => {
-                        Ok(self.s.root_uav_handle(rp.slot))
+                        // Other groups write what a builder reads.
+                        let shared = self.ordered();
+                        Ok(self.s.root_uav_handle(rp.slot, shared))
                     }
                     _ => Err("a root UAV or typed root view"),
                 }

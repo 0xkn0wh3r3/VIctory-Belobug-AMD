@@ -85,6 +85,8 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// Whether they are globally coherent.
+    pub root_uavs_shared: bool,
     /// Handle of the runtime stride table (`t0`, [`STRIDE_SPACE`]), if read.
     pub stride_table: Option<V>,
     pub flags: u64,
@@ -146,6 +148,7 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            root_uavs_shared: false,
             stride_table: None,
             flags: 0,
             nonuniform_handles: 0,
@@ -271,7 +274,7 @@ impl Shader {
     }
 
     /// The handle of the root UAV (a raw buffer) of root parameter `slot`.
-    pub fn root_uav_handle(&mut self, slot: u8) -> V {
+    pub fn root_uav_handle(&mut self, slot: u8, shared: bool) -> V {
         if let Some(&(_, h)) = self.root_uavs.iter().find(|r| r.0 == slot) {
             return h;
         }
@@ -288,7 +291,9 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        let h = self.annotate(block, h, 0x1000 | 11, 0);
+        self.root_uavs_shared |= shared;
+        let shared = if shared { 0x4000 } else { 0 };
+        let h = self.annotate(block, h, 0x1000 | 11 | shared, 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_uavs.push((slot, h));
         h
@@ -519,6 +524,8 @@ impl Shader {
             }
             let mut uavs = None;
             if !self.root_uavs.is_empty() {
+                let shared = self.m.bool(self.root_uavs_shared);
+                let shared_md = self.m.md_value(shared);
                 let ty = self
                     .m
                     .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
@@ -537,7 +544,7 @@ impl Shader {
                         Some(i32c(&mut self, reg)),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
-                        Some(f_md),
+                        Some(shared_md),
                         Some(f_md),
                         Some(f_md),
                         None,

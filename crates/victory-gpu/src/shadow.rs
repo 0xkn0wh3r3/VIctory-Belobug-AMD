@@ -1997,6 +1997,14 @@ pub(crate) fn near(va: u64) -> String {
             .values()
             .map(|s| (s.gpu, s.start, s.len)),
     );
+    for s in SPARSE.lock().unwrap_or_else(|e| e.into_inner()).values().flatten() {
+        all.push((s.gpu, s.start, s.len));
+        if let Some(sparse) = &s.sparse {
+            let aliases = sparse.aliases.lock().unwrap_or_else(|e| e.into_inner());
+            all.extend(aliases.iter().map(|a| (a.gpu, a.start, a.len)));
+        }
+    }
+    all.extend(windows_of_memory().values().map(|s| (s.gpu, s.start, s.len)));
     let below = all.iter().filter(|c| c.0 <= va).max();
     let above = all.iter().filter(|c| c.0 > va).min();
     let mut text = match below {

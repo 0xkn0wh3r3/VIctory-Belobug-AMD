@@ -3632,6 +3632,22 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
                 }
             }
         }
+        // What its root views start with now.
+        #[cfg(feature = "diagnostics")]
+        if shown <= 6 {
+            for r in marker.split(" root").skip(1).take(10) {
+                if let Some((slot, rest)) = r.split_once("=0x")
+                    && let Ok(at) = u64::from_str_radix(rest.split(' ').next().unwrap_or(""), 16)
+                {
+                    text.push_str(&format!(" ROOT {slot} {at:#x} {}", crate::shadow::words_text(at, 80)));
+                    if let Some(s) = crate::shadow::find(at, 80)
+                        && s.is_sparse()
+                    {
+                        text.push_str(&format!(" {}", crate::shadow::args_text(at)));
+                    }
+                }
+            }
+        }
         // What an indirect command got, as the title's memory has it now.
         if let Some(at) = marker
             .strip_prefix("indirect kind ")
