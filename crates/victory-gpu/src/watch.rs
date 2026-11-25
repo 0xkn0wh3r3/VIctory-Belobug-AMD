@@ -211,6 +211,12 @@ struct Guards {
     /// Blocks whose page was guarded together with its other views (those
     /// views' blocks are in it too): a write to one opens them all.
     aliased: BTreeSet<usize>,
+    /// Blocks the kernel is about to write for the runtime ([`writing`]),
+    /// from, to, and until when they are left writable: a read may be
+    /// asynchronous and land after the call that asked for it returned, and
+    /// the kernel does not fault into our handler, it fails. Until then
+    /// they are not made read-only, and every check reports them written.
+    pins: Vec<(usize, usize, std::time::Instant)>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -218,7 +224,18 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: BTreeSet::new(),
     holes: BTreeSet::new(),
     aliased: BTreeSet::new(),
+    pins: Vec::new(),
 });
+
+/// How long blocks stay writable after [`writing`].
+const PIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl Guards {
+    /// Whether `block` is left writable for a kernel write.
+    fn pinned(&self, block: usize) -> bool {
+        self.pins.iter().any(|&(from, to, _)| from <= block && block < to)
+    }
+}
 
 /// Views of one page past which its views are not guarded together (the
 /// page the title shows wherever it has nothing has thousands).
@@ -374,6 +391,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let check_each = probe != start;
     install();
     let mut g = guards();
+    if !g.pins.is_empty() {
+        let now = std::time::Instant::now();
+        g.pins.retain(|&(_, _, until)| until > now);
+    }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     for block in first..=last {
@@ -382,7 +403,13 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             && !g.holes.contains(&block)
             && (!check_each || mapped(block * BLOCK));
         if open {
-            if g.protected.contains(&block) {
+            if g.pinned(block) {
+                // The kernel may be writing it: left writable, reported
+                // written at every check until the pin ends.
+                written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                // No range holding it is clean meanwhile (`region_epoch`).
+                bump_region_epochs(block * BLOCK, (block + 1) * BLOCK);
+            } else if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
                 written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
@@ -522,7 +549,7 @@ fn protect(g: &mut Guards, from: usize, to: usize, written: &mut Vec<usize>) {
         for at in shown {
             let alias = at / BLOCK;
             g.aliased.insert(alias);
-            if alias != block && !g.protected.contains(&alias) {
+            if alias != block && !g.protected.contains(&alias) && !g.pinned(alias) {
                 let mut old = 0;
                 // SAFETY: title view memory; only its protection changes.
                 if unsafe { VirtualProtect(at as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
@@ -608,7 +635,31 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
-    open(&mut guards(), at, at + len);
+    if len == 0 {
+        return;
+    }
+    let (first, last) = (at / BLOCK, (at + len).div_ceil(BLOCK));
+    let mut g = guards();
+    let until = std::time::Instant::now() + PIN;
+    g.pins.push((first, last, until));
+    open(&mut g, at, at + len);
+    if !view_guard() {
+        return;
+    }
+    // The same pages at their other views: the write lands in them too, so
+    // their copies must take them again, now and when it has landed.
+    for block in first..last {
+        let shown = aliases(block * BLOCK);
+        if shown.len() < 2 || shown.len() > MANY_VIEWS {
+            continue;
+        }
+        for alias in shown {
+            if alias / BLOCK != block {
+                g.pins.push((alias / BLOCK, alias / BLOCK + 1, until));
+                open_here(&mut g, alias, alias + BLOCK);
+            }
+        }
+    }
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
