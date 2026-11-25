@@ -211,6 +211,15 @@ fn root_view(list: &HostList, address: u64, kind: u8) -> Option<u64> {
     let len = shadow.left(address).min(reach);
     let gpu = shadow.gpu(address);
     if kind != 0 || gpu % 256 == 0 {
+        // The list holds the copy it gives the address of: the title may
+        // release the buffer before it submits the list, and a retired copy
+        // only outlives the submissions started by then and a few frames
+        // (menus present a hundred a second). The structure builders' lists
+        // read and wrote freed copies (page fault in a copy loop of root
+        // views, Radeon GPU Detective, run rt2, 2026-11-25).
+        if kind != 0 && list.first_use(shadow.buffer.as_raw() as usize) {
+            list.keep(&shadow.buffer);
+        }
         shadow.refresh(list, address, len);
         if kind == 2 {
             shadow.gpu_writes(list, address, len);
@@ -567,7 +576,11 @@ impl State {
     /// After a dispatch of `p`: the least indirect light, if it is the
     /// program that resolves that.
     fn ambient(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> bool {
-        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+        let Some(stage) = p
+            .stages
+            .first()
+            .filter(|s| s.shader.resolves_light || s.shader.ends_reflections)
+        else {
             return false;
         };
         let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
@@ -601,6 +614,13 @@ impl State {
                     );
                 }
             });
+        }
+        if !stage.shader.resolves_light {
+            // The reflections, held to the light around.
+            return match view(ResourceType::Uav, crate::ambient::REFLECTIONS) {
+                Some(View::Unordered(r, ..)) if r != 0 => crate::ambient::hold(list, r as This),
+                _ => false,
+            };
         }
         let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
             Some(View::Unordered(r, ..)) => r,
@@ -665,6 +685,11 @@ impl State {
         }
         if !self.bind(list, p, false) {
             return false;
+        }
+        if p.stages.iter().any(|s| s.shader.draws_sky)
+            && let Some(&sky) = self.targets.first()
+        {
+            crate::ambient::sky_drawn(sky);
         }
         let l = &list.list;
         // Vertex buffers the input layout reads.
@@ -1841,7 +1866,8 @@ impl State {
             list.count_write();
             list.count_work();
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
-            if crate::twin::resolve(list) {
+            let lit = self.ambient(list, p);
+            if crate::twin::resolve(list) | lit {
                 self.continue_in(list);
             }
         } else {

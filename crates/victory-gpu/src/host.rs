@@ -128,12 +128,23 @@ static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// the host runs at 1-2 fps).
 const KEEP_FRAMES: u64 = 32;
 
+/// And the time a retired object is kept for at least: in the menus 32
+/// frames are a third of a second, and lists recorded ahead, or descriptors
+/// the title left in a heap, named copies freed by then (with
+/// `VICTORY_RAYS=1`: page faults inside destroyed 4 and 10.78 MiB buffers,
+/// Radeon GPU Detective, runs rt2 and rt6; with nothing freed the run went
+/// on into the world, rt3).
+/// shortcut: a time, not a count of what still names the object.
+const KEEP_TIME: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired {
     /// The submission count it waits for.
     submission: u64,
     /// The presented frame it was retired in.
     frame: u64,
+    /// When.
+    at: std::time::Instant,
     #[allow(dead_code)]
     object: Box<dyn std::any::Any>,
 }
@@ -149,6 +160,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back(Retired {
         submission,
         frame,
+        at: std::time::Instant::now(),
         object: Box::new(object),
     });
 }
@@ -168,7 +180,9 @@ fn bury(finished: u64) {
         let n = retired
             .iter()
             .take_while(|r| {
-                r.submission <= finished && now.saturating_sub(r.frame) >= KEEP_FRAMES
+                r.submission <= finished
+                    && now.saturating_sub(r.frame) >= KEEP_FRAMES
+                    && r.at.elapsed() >= KEEP_TIME
             })
             .count();
         retired.drain(..n).collect()
