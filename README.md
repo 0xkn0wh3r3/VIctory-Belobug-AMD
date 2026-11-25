@@ -21,7 +21,8 @@ profile. Nothing here has been run on an NVIDIA or Intel card.
 | The world | renders lit, with textures, people, vehicles, vegetation, water and sky |
 | Saves | load and store |
 | Frame rate in the world | 3 to 5 fps (4.4 to 4.9 standing still in a heavy scene, about 3 while driving) |
-| Light in shadow | a constant: the game's ray-traced indirect light does not run, so shaded places are flat and rather dark |
+| Light in shadow | a constant, less of it in creases and under objects: the game's ray-traced indirect light does not run. One level does not suit every hour (see the known problems) |
+| Shadows of the sun and of lamps | the game's own, and they work; too much of the constant light drowns them |
 | Distant trees | drawn |
 | Vehicles in motion | whole (they lost and stretched parts until the copies of title memory saw writes through every view of a page) |
 | In-game phone | **broken**: with the phone out the world is unlit (black) and the phone is an empty outline |
@@ -37,6 +38,14 @@ Picture:
   passes do not run. What the game's resolve pass left instead was bright
   magenta on leaves, cloth and paper, and blocks of colours indoors
   (`VICTORY_AMBIENT=<level>`, 0.6 by default; `off` keeps the game's output).
+  Its colour can be set (`VICTORY_AMBIENT_TINT=r,g,b`), and less of it
+  reaches creases, corners and the underside of things, worked out from the
+  scene's depth alone (`VICTORY_AMBIENT_SHADE=strength,radius`; grainy, it is
+  not blurred yet). In diagnostics builds all of it can be tuned in a running
+  game from a file (`VICTORY_AMBIENT_FILE`).
+- Blending is off on integer render targets in host pipelines: the console
+  ignores it there, D3D12 refuses the pipeline. One world pipeline the driver
+  refused at every launch is made now (pull request #45, pgm1207 and Arvi23).
 - In pixel shaders every read of another pixel of the same 2x2 quad goes
   through quad reads, helper pixels included. Wave reads return 0 from helper
   pixels on AMD, which showed as lines along every triangle on car paint,
@@ -52,6 +61,13 @@ Speed:
   list that draws, and run one after another (`VICTORY_HOIST_CLAMPS`, 7 by
   default, 0 for each before its draw): 225 to about 80 ms of GPU time per
   frame in a scene of 9,000 draws.
+- The snapshots and the copy-back of the tiles shaders write are taken on
+  several threads (pull request #18, PikPakPik): copying back went from
+  about 43 to about 33 ms a frame here. The frame rate did not move.
+- The title's submissions can return before the host GPU is done, with what
+  they owe finished at the next wait (`VICTORY_ASYNC_SUBMIT=1`, off by
+  default): stable here, and no faster, because the frame is bound by the
+  processor's work, not by the wait.
 - Shader cache entries of another build can be reused
   (`VICTORY_SHADER_BUILD_OF=<executable>`, diagnostics).
 
@@ -98,9 +114,23 @@ The first launch after a build translates every shader and builds about
   drive (the title's own 7 GB, 8 GB of textures on the card, copies of its
   buffers, and the system's backing of video memory).
 - No ray-traced light; the constant that stands in for it is the same
-  everywhere.
+  everywhere and at every hour. The default of 0.6 is too much at night (it
+  fills the shadows the game's lamps cast and the picture goes flat) and too
+  little at noon (what the sun does not reach is nearly black). Levels that
+  looked right on this machine: 0.07 bluish at night, 0.3 warm at dusk and
+  dawn, 1.4 sky blue at noon. Making it follow the game's sky is being
+  worked on.
 - Some compute programs do not translate (ray-tracing structure builders,
-  wind volumes, a few others) and their passes are dropped.
+  wind volumes, a few others) and their passes are dropped. With
+  `VICTORY_RAYS=1` the builders translate and run, and the GPU stops
+  answering about 25 seconds later (device removed): do not expect light
+  from it.
+- About 380 draws of a frame are dropped in the world for want of a host
+  pipeline: programs that do not translate, and six pipelines the AMD driver
+  refuses (two compute, four mesh). Which of the two costs most is not
+  measured.
+- One test fails on this machine, before and after this update:
+  `list::tests::lists_are_cut_at_waits_that_follow_work`.
 - `crates/victory-shader/src/emit/lower.rs` is larger than the size limit of
   `cargo xtask policy`; it is source code, not an asset.
 - Many changes are specific to this title and this GPU, and some are marked
@@ -112,6 +142,10 @@ The first launch after a build translates every shader and builds about
   contributors is the base of everything here. Licensed GPL-3.0-or-later; so
   is this fork. Upstream's history and the authors of the pull requests
   carried here are kept in the commit history.
+- Pull requests merged into this fork, read line by line and run in the
+  world before merging: #45 (pgm1207, sent by Arvi23) and #18 (PikPakPik).
+  The others are still to be read; thank you for them and for the test
+  reports.
 - [fxceless/victory-fork](https://github.com/fxceless/victory-fork) and
   [myokex/victory-amd](https://github.com/myokex/victory-amd) were read for
   comparison; no code of theirs is in this fork.
