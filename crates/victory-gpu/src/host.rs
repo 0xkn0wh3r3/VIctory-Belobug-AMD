@@ -60,10 +60,14 @@ struct Finish {
 unsafe impl Send for Finish {}
 
 /// Whether the title's submissions may return before the host GPU is done
-/// (`VICTORY_ASYNC_SUBMIT=1`; off by default).
+/// (`VICTORY_ASYNC_SUBMIT=0` turns it off). At the stilt house with 8,400
+/// draws a frame it is 150-186 ms a frame against 200-238 (run as5 against
+/// rw1, 2026-11-25): the wait for the host GPU goes from 78-95 to 4-17 ms.
+/// It gained nothing while the title's recording threads took turns on the
+/// views table's mutex.
 fn async_submit() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_SUBMIT").is_none_or(|v| v != "0"))
 }
 
 /// Microseconds spent bringing buffer copies up to date while the

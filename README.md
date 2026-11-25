@@ -11,7 +11,7 @@ developer or publisher.
 
 ## State of this fork (2026-11-25)
 
-**Not playable yet: 3 to 5 frames per second.** Tested on one machine only:
+**Not playable yet: 5 to 7 frames per second.** Tested on one machine only:
 Windows 11, AMD Radeon RX 9070 XT 16 GB, Ryzen 7 9800X3D, 64 GB RAM, Series X
 profile. Nothing here has been run on an NVIDIA or Intel card.
 
@@ -20,7 +20,7 @@ profile. Nothing here has been run on an NVIDIA or Intel card.
 | Boot, menus | work, 30 fps (as upstream) |
 | The world | renders lit, with textures, people, vehicles, vegetation, water and sky |
 | Saves | load and store |
-| Frame rate in the world | 3 to 5 fps (4.4 to 4.9 standing still in a heavy scene, about 3 while driving) |
+| Frame rate in the world | 5 to 7 fps (5.4 to 6.7 standing still in a scene of 8,400 draws; less while driving) |
 | Light in shadow | a constant, less of it in creases and under objects: the game's ray-traced indirect light does not run. One level does not suit every hour (see the known problems) |
 | Reflections | the game's, held down: without rays every glossy surface reflected the open sky, indoors too, and floors looked whitewashed |
 | Shadows of the sun and of lamps | the game's own, and they work; too much of the constant light drowns them |
@@ -68,10 +68,26 @@ Speed:
 - The snapshots and the copy-back of the tiles shaders write are taken on
   several threads (pull request #18, PikPakPik): copying back went from
   about 43 to about 33 ms a frame here. The frame rate did not move.
-- The title's submissions can return before the host GPU is done, with what
-  they owe finished at the next wait (`VICTORY_ASYNC_SUBMIT=1`, off by
-  default): stable here, and no faster, because the frame is bound by the
-  processor's work, not by the wait.
+- The title's submissions return before the host GPU is done, with what
+  they owe finished at the next wait (`VICTORY_ASYNC_SUBMIT=0` turns it
+  off): 200-238 to 150-186 ms a frame in the same place. It gained nothing
+  until the next two changes were in.
+- Title memory the game shows one 64 KiB view at a time is used in place:
+  its pages follow one another in their section, so the stretch is mapped
+  once more at an address of ours and the host heap opened there
+  (`VICTORY_STRETCH=0` turns it off). Copying back went from 36 to 12 ms a
+  frame. Ranges made of several stretches are still copied.
+- The table of descriptor views is a read-write lock. A PIX timing capture
+  showed the game's five recording threads taking turns on it as a mutex,
+  6,600 context switches a second each.
+- Thin LTO and one codegen unit for the release profile (pull request #96,
+  Key-rs), and eight changes by romainhedouin that take repeated work out
+  of the draw path (#24, #25, #27, #28, #29, #30, #33, #34). None of the
+  eight moved the frame time measurably here; nothing broke.
+- What a frame still waits for, from the same capture: the thread that
+  submits, which prepares each batch while the host GPU is idle (the plan
+  of directly indexed descriptors walks every slot, `bindless_plan`), and
+  copies of title memory, about 100 MB a frame.
 - Shader cache entries of another build can be reused
   (`VICTORY_SHADER_BUILD_OF=<executable>`, diagnostics).
 
@@ -145,8 +161,9 @@ The first launch after a build translates every shader and builds about
 - Windows 10 is reported not to get past start-up without a newer D3D12
   runtime (issue #9, pull request #44, not merged or tried here yet); this
   fork has only been run on Windows 11.
-- One test fails on this machine, before and after this update:
-  `list::tests::lists_are_cut_at_waits_that_follow_work`.
+- Tests that fail on this machine, before and after this update:
+  `list::tests::lists_are_cut_at_waits_that_follow_work` in `victory-gpu`
+  and five `xmem` tests in `victory-hle` (issues #2 and #8).
 - `crates/victory-shader/src/emit/lower.rs` is larger than the size limit of
   `cargo xtask policy`; it is source code, not an asset.
 - Many changes are specific to this title and this GPU, and some are marked
@@ -159,9 +176,12 @@ The first launch after a build translates every shader and builds about
   is this fork. Upstream's history and the authors of the pull requests
   carried here are kept in the commit history.
 - Pull requests merged into this fork, read line by line and run in the
-  world before merging: #45 (pgm1207, sent by Arvi23) and #18 (PikPakPik).
-  The others are still to be read; thank you for them and for the test
-  reports.
+  world before merging: #45 (pgm1207, sent by Arvi23), #18 (PikPakPik),
+  #96 (Key-rs), and #24, #25, #27, #28, #29, #30, #33, #34 (romainhedouin).
+  About ninety others are still to be read, the larger speed changes
+  first; thank you for them, for the test reports, and for the advice to
+  take a PIX timing capture, which found more in an hour than a day of
+  our own counters.
 - [fxceless/victory-fork](https://github.com/fxceless/victory-fork) and
   [myokex/victory-amd](https://github.com/myokex/victory-amd) were read for
   comparison; no code of theirs is in this fork.
