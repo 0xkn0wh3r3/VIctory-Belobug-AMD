@@ -6209,7 +6209,8 @@ impl<'a> Lower<'a> {
         // query of a structured buffer from the heap (stride 60, nine
         // compute programs of the world) and takes minutes over hundreds of
         // a typed one's; the table holds the title's own count.
-        if image.is_none() && (records.is_some() || matches!(props.0 & 0xfff, 10 | 12)) {
+        // (A structured buffer the host views raw keeps the query, of bytes.)
+        if image.is_none() && records.is_none() && matches!(props.0 & 0xfff, 10 | 12) {
             let slot = if load == site {
                 self.heap_slot(&src, false)?
             } else {
