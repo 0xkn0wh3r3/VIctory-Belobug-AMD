@@ -22,8 +22,9 @@ profile. Nothing here has been run on an NVIDIA or Intel card.
 | Saves | load and store |
 | Frame rate in the world | 3 to 5 fps (4.4 to 4.9 standing still in a heavy scene, about 3 while driving) |
 | Light in shadow | a constant: the game's ray-traced indirect light does not run, so shaded places are flat and rather dark |
-| Distant trees | not drawn (see below) |
-| Vehicles in motion | **broken**: parts of moving vehicles are left behind or stretched across the screen; under investigation |
+| Distant trees | drawn |
+| Vehicles in motion | whole (they lost and stretched parts until the copies of title memory saw writes through every view of a page) |
+| In-game phone | **broken**: with the phone out the world is unlit (black) and the phone is an empty outline |
 | Memory | about 22 GB of RAM and more video memory than a 16 GB card has |
 
 A driver timeout (Windows resets the display driver, every monitor goes black
@@ -54,6 +55,14 @@ Speed:
 - Shader cache entries of another build can be reused
   (`VICTORY_SHADER_BUILD_OF=<executable>`, diagnostics).
 
+Memory the title shows at several addresses:
+- Every view of a guarded physical page is guarded with it, so a write of
+  the title's through another address is seen (the idea of victory-fork
+  #115 and victory-amd, written anew here); blocks the kernel is about to
+  write stay writable for two seconds. Before this, parts of moving
+  vehicles were left behind; the distant trees' quads that crossed the
+  screen have not come back since either (cause not proven).
+
 AMD:
 - Shaders that crash or never leave the AMD driver's compiler cost only
   their pipeline, not the run.
@@ -74,21 +83,22 @@ diagnostics`), with:
 ```
 VICTORY_PRESENT_TARGET=1x1:1
 VICTORY_HAIR=1
-VICTORY_SKIP_PIPELINES=4e35b816f2f91d68,b3ba0ef9ee352720,5d627391703fcb4c,ec6e4c363cf9ef2b,c89489afd89ee7f0,45f081396c2c59ba,63083c777948927a,0bd4d80ad23b106b
 victory run <game_scarlett_master.exe> --execute --console series-x
 ```
 
-The skipped pipelines are the distant trees' imposters: their wind variants
-read volumes nothing fills yet and throw their quads across the screen.
 The first launch after a build translates every shader and builds about
 2,500 pipelines; the loading screen can stay frozen, with sound, for minutes.
 
 ### Known problems
 
-- Moving vehicles lose or stretch parts (see the table).
+- With the in-game phone out the world is unlit (see the table).
+- The per-draw descriptor slots are few for the heaviest places: when they
+  run out, some draws of a frame are dropped.
+- Memory: the process commits about 33 GB after a quarter of an hour's
+  drive (the title's own 7 GB, 8 GB of textures on the card, copies of its
+  buffers, and the system's backing of video memory).
 - No ray-traced light; the constant that stands in for it is the same
   everywhere.
-- No distant trees.
 - Some compute programs do not translate (ray-tracing structure builders,
   wind volumes, a few others) and their passes are dropped.
 - `crates/victory-shader/src/emit/lower.rs` is larger than the size limit of
