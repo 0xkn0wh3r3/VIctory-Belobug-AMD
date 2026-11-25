@@ -1531,23 +1531,35 @@ fn new_tile() -> Option<Tile> {
     })
 }
 
-/// Whether tiles are given back (`VICTORY_SWEEP_TILES=1`).
-// shortcut: off, for the copies' memory only grows; what still uses a tile
-// does not always say so, and the host GPU stopped about when the first
-// tiles of the world were given back (120 frames in).
-fn sweeps() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| cfg!(test) || std::env::var("VICTORY_SWEEP_TILES").is_ok_and(|v| v == "1"))
+/// Which tiles are given back (`VICTORY_SWEEP_TILES`): 0 none, 1 those
+/// nothing has asked about for 120 frames, 2 those nothing has asked about
+/// for 600 frames AND whose title memory is no longer there.
+// shortcut: 0 by default, so the copies' memory only grows (3.8 GB of tiles
+// after a quarter of an hour's drive, 2026-11-25). With 1 the host GPU
+// stopped about when the first tiles of the world were given back: what
+// still uses a tile does not always say so. 2 gives back only what the
+// title itself has unmapped, which nothing of its own may read any more.
+fn sweeps() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        if cfg!(test) {
+            return 1;
+        }
+        std::env::var("VICTORY_SWEEP_TILES").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    })
 }
 
 /// Gives back the tiles nothing has asked about for some frames: what
 /// viewed them is gone. At the present of `frame`.
 pub(crate) fn sweep(frame: u64) {
     const EVERY: u64 = 32;
-    const KEEP: u64 = 120;
-    if !frame.is_multiple_of(EVERY) || !sweeps() {
+    let mode = sweeps();
+    if !frame.is_multiple_of(EVERY) || mode == 0 {
         return;
     }
+    let gone_only = mode >= 2;
+    let keep: u64 = if gone_only { 600 } else { 120 };
+    let mut given = 0u64;
     let all: Vec<Arc<Shadow>> = SPARSE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1565,7 +1577,10 @@ pub(crate) fn sweep(frame: u64) {
             let kept = s.kept.lock().unwrap_or_else(|e| e.into_inner());
             let old: Vec<(u32, Tile)> = tiles
                 .iter()
-                .filter(|(at, t)| t.used + KEEP < frame && !kept.contains(at))
+                .filter(|(at, t)| t.used + keep < frame && !kept.contains(at))
+                .filter(|(at, _)| {
+                    !gone_only || unmapped(shadow.start as usize + **at as usize * PAGE).is_some()
+                })
                 .map(|(&at, &t)| (at, t))
                 .collect();
             for (at, _) in &old {
@@ -1576,6 +1591,7 @@ pub(crate) fn sweep(frame: u64) {
         if old.is_empty() {
             continue;
         }
+        given += old.len() as u64;
         {
             let mut looks = s.looks.lock().unwrap_or_else(|e| e.into_inner());
             for (at, _) in &old {
@@ -1611,6 +1627,9 @@ pub(crate) fn sweep(frame: u64) {
             .unwrap_or_else(|e| e.into_inner())
             .free
             .extend(old.into_iter().map(|o| o.1));
+    }
+    if given > 0 {
+        tracing::info!(tiles = given, megabytes = given * PAGE as u64 >> 20, frame, "tiles given back");
     }
 }
 
