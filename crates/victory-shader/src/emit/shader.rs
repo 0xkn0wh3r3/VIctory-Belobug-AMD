@@ -83,6 +83,8 @@ pub(crate) struct Shader {
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
+    /// Where reads through a handle (a root view's) may start at most.
+    pub limits: Vec<(V, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     /// Whether they are globally coherent.
@@ -147,6 +149,7 @@ impl Shader {
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            limits: Vec::new(),
             root_uavs: Vec::new(),
             root_uavs_shared: false,
             stride_table: None,
@@ -182,6 +185,29 @@ impl Shader {
 
     /// Calls `dx.op.<name>` (class and overload) with `opcode` and `args`.
     pub fn op(
+        &mut self,
+        block: usize,
+        name: &str,
+        attr: Attr,
+        ret: Ty,
+        opcode: u32,
+        args: &[V],
+    ) -> V {
+        // A raw buffer load through a limited handle.
+        const RAW_LOAD: u32 = 139;
+        if opcode == RAW_LOAD
+            && let Some(&(_, limit)) = self.limits.iter().find(|l| l.0 == args[0])
+        {
+            let i32t = self.t.i32;
+            let at = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[args[1], limit]);
+            let mut args = args.to_vec();
+            args[1] = at;
+            return self.op_as_is(block, name, attr, ret, opcode, &args);
+        }
+        self.op_as_is(block, name, attr, ret, opcode, args)
+    }
+
+    fn op_as_is(
         &mut self,
         block: usize,
         name: &str,

@@ -207,6 +207,18 @@ fn root_view(list: &HostList, address: u64, kind: u8) -> Option<u64> {
     Some(gpu)
 }
 
+/// The last byte of the root view at `address` four dwords can be read from:
+/// to the end of its host copy ([`root_view`]).
+fn root_limit(address: u64) -> u32 {
+    const REACH: u64 = 1 << 20;
+    crate::shadow::find_reaching(address, REACH).map_or(0, |s| {
+        s.left(address)
+            .saturating_sub(16)
+            .min(u64::from(u32::MAX) - 16) as u32
+            & !3
+    })
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -705,6 +717,14 @@ impl State {
                         continue;
                     }
                     if u.root == RootType::GROUPS {
+                        continue;
+                    }
+                    if u.root == RootType::LIMIT {
+                        values[u.index as usize] =
+                            match self.roots_ref(compute).get(u.dword as usize) {
+                                Some(Root::View(address)) => root_limit(*address),
+                                _ => 0,
+                            };
                         continue;
                     }
                     values[u.index as usize] = match fresh {

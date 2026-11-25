@@ -6741,7 +6741,18 @@ impl<'a> Lower<'a> {
                         Ok(self.s.root_cbv_handle(rp.slot))
                     }
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
-                        Ok(self.s.root_srv_handle(rp.slot))
+                        let h = self.s.root_srv_handle(rp.slot);
+                        // A draw with wild vertex numbers must not read past
+                        // the memory behind the view (a page fault).
+                        if super::limits_indices()
+                            && (self.s.threads.is_none() || self.s.mesh.is_some())
+                            && !self.s.limits.iter().any(|l| l.0 == h)
+                        {
+                            let nth = 1 + self.s.limits.len() as u32;
+                            let limit = self.host_data(nth, RootType::LIMIT, rp.slot.into());
+                            self.s.limits.push((h, limit));
+                        }
+                        Ok(h)
                     }
                     (RootType::Descriptor, Some(ResourceType::Uav) | None, 0x100B)
                     | (RootType::Descriptor, Some(ResourceType::Uav), 11) => {
@@ -7066,6 +7077,13 @@ impl<'a> Lower<'a> {
             .map_err(|_| "a structured buffer of unknown stride")?;
         let c = self.cur;
         let table = self.s.stride_table_handle();
+        // A root view has no bounds: a wild index would read past the table.
+        let slot = if super::limits_indices() {
+            let (i32t, last) = (self.s.t.i32, self.s.m.i32(super::OWN_SLOTS - 1));
+            self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last])
+        } else {
+            slot
+        };
         let four = self.s.m.i32(4);
         let addr = self.s.m.bin(c, Bin::Mul, slot, four);
         let iu = self.s.m.undef(self.s.t.i32);

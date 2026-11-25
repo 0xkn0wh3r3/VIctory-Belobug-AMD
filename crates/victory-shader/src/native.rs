@@ -369,6 +369,10 @@ impl RootType {
     /// Not the title's: the threads in x that run, as user data; its
     /// `dword` is the threads of a group in x.
     pub const THREADS: RootType = RootType::Other(0x5448_5244);
+    /// Not the title's: the last byte reads of a root view may start at, as
+    /// user data (root views have no bounds); its `dword` is the view's root
+    /// parameter.
+    pub const LIMIT: RootType = RootType::Other(0x4C49_4D54);
 
     fn from_raw(raw: u32) -> Self {
         match raw {
