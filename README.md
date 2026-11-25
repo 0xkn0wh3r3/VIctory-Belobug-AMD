@@ -22,6 +22,7 @@ profile. Nothing here has been run on an NVIDIA or Intel card.
 | Saves | load and store |
 | Frame rate in the world | 3 to 5 fps (4.4 to 4.9 standing still in a heavy scene, about 3 while driving) |
 | Light in shadow | a constant, less of it in creases and under objects: the game's ray-traced indirect light does not run. One level does not suit every hour (see the known problems) |
+| Reflections | the game's, held down: without rays every glossy surface reflected the open sky, indoors too, and floors looked whitewashed |
 | Shadows of the sun and of lamps | the game's own, and they work; too much of the constant light drowns them |
 | Distant trees | drawn |
 | Vehicles in motion | whole (they lost and stretched parts until the copies of title memory saw writes through every view of a page) |
@@ -43,6 +44,9 @@ Picture:
   scene's depth alone (`VICTORY_AMBIENT_SHADE=strength,radius`; grainy, it is
   not blurred yet). In diagnostics builds all of it can be tuned in a running
   game from a file (`VICTORY_AMBIENT_FILE`).
+- The game's reflections are held to a part of that constant light after
+  its last reflection pass (`VICTORY_AMBIENT_REFLECT`, 0.5 by default, 0
+  leaves them alone). Without rays they are the sky's, unoccluded.
 - Blending is off on integer render targets in host pipelines: the console
   ignores it there, D3D12 refuses the pipeline. One world pipeline the driver
   refused at every launch is made now (pull request #45, pgm1207 and Arvi23).
@@ -85,7 +89,14 @@ AMD:
 - Buffer element counts come from the host's own table, not a size query the
   driver's compiler crashes on.
 
-Diagnostics (diagnostics builds): `VICTORY_SHADER_PATCH` changes one word of a
+Lifetimes: a list keeps the copies of title memory whose addresses it gives
+as root views, and objects the title let go of are kept eight seconds at
+least (32 presented frames were a third of a second in the menus).
+
+Diagnostics: every translated shader is logged with its DXIL hash, the one
+[Radeon GPU Detective](https://gpuopen.com/radeon-gpu-detective/) names a
+shader in flight by, so its crash reports can be matched to the game's
+programs. Diagnostics builds: `VICTORY_SHADER_PATCH` changes one word of a
 shader's machine code before translation, `VICTORY_SHADER_SWAP` replaces
 shader containers by files, `VICTORY_ALWAYS_COPY=1` refreshes every copy of
 title memory each frame, `VICTORY_GPU_TIMING=1` logs GPU time per pipeline.
@@ -122,9 +133,11 @@ The first launch after a build translates every shader and builds about
   worked on.
 - Some compute programs do not translate (ray-tracing structure builders,
   wind volumes, a few others) and their passes are dropped. With
-  `VICTORY_RAYS=1` the builders translate and run, and the GPU stops
-  answering about 25 seconds later (device removed): do not expect light
-  from it.
+  `VICTORY_RAYS=1` the builders translate and run, and the device is
+  removed a minute and a half later: do not expect light from it. Two
+  causes found with AMD's Radeon GPU Detective are fixed (lists and
+  descriptors named copies of title memory that were already destroyed);
+  the run now ends on a read at an address no resource ever had.
 - About 380 draws of a frame are dropped in the world for want of a host
   pipeline: programs that do not translate, and six pipelines the AMD driver
   refuses (two compute, four mesh). Which of the two costs most is not
