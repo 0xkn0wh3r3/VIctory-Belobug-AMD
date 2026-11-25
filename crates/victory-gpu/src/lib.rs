@@ -56,6 +56,8 @@ pub mod shader_cache;
 mod shadow;
 pub mod signature;
 #[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
 mod compose;
 #[cfg(windows)]
 mod twin;

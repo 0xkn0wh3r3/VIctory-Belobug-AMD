@@ -891,6 +891,34 @@ fn target_at(address: u64, d: &ResourceDesc) -> Option<This> {
         })
 }
 
+/// Every texture the host GPU writes, by title address (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn targets_text() -> String {
+    let targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut text = String::new();
+    for (at, list) in targets.iter() {
+        for &r in list {
+            let o = &resource(r as This).desc;
+            let written = resource(r as This)
+                .host
+                .as_ref()
+                .map_or(0, |h| h.written.load(std::sync::atomic::Ordering::Relaxed));
+            text.push_str(&format!(
+                "target {at:#x} {r:#x} {}x{}x{} mips {} f{} flags {:#x} layout {:#x} written {written}
+",
+                o.width, o.height, o.depth_or_array_size, o.mip_levels, o.format, o.flags, o.layout
+            ));
+        }
+    }
+    text
+}
+
+/// Where the title has the texture `r`, and the host resource object (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn data_of(r: This) -> u64 {
+    resource(r).data() as u64
+}
+
 /// A list moves `texture` to `state`.
 #[cfg(windows)]
 pub(crate) fn note_written(resource_: This, state: u32) {

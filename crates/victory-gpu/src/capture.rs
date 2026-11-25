@@ -462,6 +462,7 @@ pub(crate) fn dump_targets(frame: u64) {
                 ));
             }
         }
+        args.push_str(&crate::resource::targets_text());
         let _ = std::fs::write(folder.join("args.txt"), args);
         let _ = std::fs::write(folder.join("passes.txt"), text.join("
 "));

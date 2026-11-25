@@ -64,6 +64,9 @@ pub(crate) struct Shader {
     /// It animates or draws hair strands ([`hair_strands`]).
     #[cfg(windows)]
     hair: bool,
+    /// Its result gets the least indirect light ([`crate::ambient`]).
+    #[cfg(windows)]
+    pub(crate) resolves_light: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -151,6 +154,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 hair: hair_strands(bytes),
+                #[cfg(windows)]
+                resolves_light: bytes
+                    .windows(crate::ambient::PROGRAM.len())
+                    .any(|w| w == crate::ambient::PROGRAM),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
