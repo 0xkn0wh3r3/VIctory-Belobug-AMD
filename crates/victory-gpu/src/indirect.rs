@@ -335,7 +335,10 @@ fn record_clamp(
 /// To find faults: 3 as 1 for mesh dispatches only, 4 as 1 for draws only,
 /// 5 as 1 with a new list for the clamps always, 6 the lists cut as for 1
 /// with each clamp before its draw all the same.
-/// 7 as 1 with the clamps run one after another (a barrier between them).
+/// 7 as 1 with the clamps run one after another (a barrier between them):
+/// the default. Without it whole mesh objects flickered (leaves, chairs,
+/// clothes: seen by the user, 2026-11-25), as records past the list's budget
+/// were not the same ones from frame to frame.
 /// `VICTORY_HOIST_CLAMPS=<n>` sets it; diagnostics builds read it again
 /// every half second from the file `VICTORY_HOIST_FILE` names, if any.
 pub(crate) fn hoist_mode() -> u8 {
@@ -343,7 +346,7 @@ pub(crate) fn hoist_mode() -> u8 {
     static MODE: AtomicU8 = AtomicU8::new(u8::MAX);
     let mode = MODE.load(Ordering::Relaxed);
     if mode == u8::MAX {
-        let set = std::env::var("VICTORY_HOIST_CLAMPS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let set = std::env::var("VICTORY_HOIST_CLAMPS").ok().and_then(|v| v.parse().ok()).unwrap_or(7);
         MODE.store(set, Ordering::Relaxed);
         if cfg!(feature = "diagnostics")
             && let Some(file) = std::env::var_os("VICTORY_HOIST_FILE")
