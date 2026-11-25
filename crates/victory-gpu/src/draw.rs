@@ -1003,8 +1003,20 @@ impl State {
                             format!("{kind} {:#x} left {:#x}", s.gpu(*address), s.left(*address))
                         });
                     let _ = write!(text, " root{slot}={address:#x} host {host:?}");
+                    let _ = write!(text, " holds {}", title_words(*address, 24));
                 }
             }
+        }
+        if !compute && self.index.size != 0 {
+            let v = self.index;
+            let _ = write!(
+                text,
+                " index {:#x}+{:#x} f{} holds {}",
+                v.address,
+                v.size,
+                v.format,
+                title_words(v.address, 24)
+            );
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
         if !compute {
@@ -1685,7 +1697,11 @@ impl State {
         #[cfg(feature = "diagnostics")]
         crate::capture::pass(list, self.targets.first().copied().unwrap_or(0), || {
             self.op_text(
-                format!("indirect kind {kind} max {max} at {arguments:#x} args {}", crate::shadow::args_text(arguments)),
+                format!(
+                    "indirect kind {kind} max {max} stride {stride} at {arguments:#x} args {} all {}",
+                    crate::shadow::args_text(arguments),
+                    title_words(arguments, 8)
+                ),
                 kind == DISPATCH,
                 true,
             )
@@ -1720,6 +1736,18 @@ impl State {
 
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
+/// `n` dwords of title memory at `address` (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn title_words(address: u64, n: usize) -> String {
+    let mut words = vec![0u32; n];
+    // SAFETY: plain words.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), 4 * n) };
+    if !crate::host::read_into(address as *const u8, bytes) {
+        return "unreadable".into();
+    }
+    format!("{words:x?}")
+}
+
 /// once.
 fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
