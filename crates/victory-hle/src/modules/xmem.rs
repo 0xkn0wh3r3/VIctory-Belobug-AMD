@@ -884,7 +884,8 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         };
         // A view must start on a page of the run to show its slice.
         if !offset.is_multiple_of(PAGE) || !map_view(at, next - at, &part) {
-            for &(view, _, _) in &made {
+            for &(view, len, _) in &made {
+                victory_gpu::title_memory_view_gone(view, len);
                 let view = MEMORY_MAPPED_VIEW_ADDRESS {
                     Value: view as *mut c_void,
                 };
@@ -936,6 +937,8 @@ fn map_view(base: usize, len: usize, slice: &Slice) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
+    // The GPU side guards every view of a page together.
+    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
     true
 }
 
@@ -1053,6 +1056,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             continue;
         };
         victory_gpu::title_memory_remapped(at, size);
+        victory_gpu::title_memory_view_gone(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(

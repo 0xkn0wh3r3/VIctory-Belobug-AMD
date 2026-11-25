@@ -697,13 +697,21 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize, lazy: bool) -> usize {
-        // Diagnostics (`VICTORY_ALWAYS_COPY=1`): no write watch and no
-        // guard, every copy taken again once a frame. Slow; it tells a
-        // picture fault that comes from a stale copy from one that does not.
-        static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let always = *ALWAYS.get_or_init(|| std::env::var_os("VICTORY_ALWAYS_COPY").is_some_and(|v| v == "1"));
-        let mode = if always { NOT_WATCHED } else { self.watched.load(Ordering::Relaxed) };
-        let lazy = lazy && !always;
+        // Diagnostics (`VICTORY_ALWAYS_COPY`): 1 no write watch and no
+        // guard, every copy taken again once a frame, every tile looked at
+        // (slow); 2 only every tile looked at (no waiting 2 to 16 frames for
+        // one that had not changed); 3 only guarded memory taken again each
+        // frame (a guard does not see a write through another view of the
+        // page). They tell which of these leaves a copy stale.
+        static ALWAYS: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let always = *ALWAYS
+            .get_or_init(|| std::env::var("VICTORY_ALWAYS_COPY").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+        let mut mode = self.watched.load(Ordering::Relaxed);
+        let forced = always == 1 || always == 3 && mode == WATCHED_GUARDED;
+        if forced {
+            mode = NOT_WATCHED;
+        }
+        let lazy = lazy && !forced && always != 2;
         if mode == WATCHED_GUARDED {
             let ge = crate::watch::region_epoch(from, to);
             {

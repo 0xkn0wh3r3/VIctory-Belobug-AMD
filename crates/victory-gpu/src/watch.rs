@@ -12,11 +12,22 @@
 //! write access back. The runtime tells us when it maps or unmaps views
 //! ([`title_memory_remapped`]), which resets their protection.
 //!
-//! shortcut: writes into physical pages through another view (xmem's
-//! `write_physical`, DirectStorage's page destinations) are not seen at
-//! the guarded addresses; they go to the texture pool, whose textures are
-//! hashed, not guarded. A system call writing into a guarded block fails
-//! (none is known to).
+//! The title shows one physical page at several addresses. A write of its
+//! own through any of them is seen: the runtime tells us the views it maps
+//! ([`title_memory_view`]), guarding a block makes every other view of its
+//! page read-only too, and a fault at one of them opens them all. Without
+//! this a copy taken at one address stayed as it was for the rest of the
+//! run when the title wrote through another (parts of moving vehicles left
+//! behind and stretched across the screen, 2026-11-25). The idea is
+//! victory-fork #115's (Spexivus, joroyt) as carried by victory-amd; the
+//! code here is written anew. `VICTORY_VIEW_GUARD=0` turns it off.
+//!
+//! shortcut: the runtime's own writes into physical pages through a view of
+//! its own (xmem's `write_physical`, DirectStorage's page destinations) are
+//! told by address ([`title_memory_written`]), not through this. A page
+//! shown at more than [`MANY_VIEWS`] addresses is guarded one view at a
+//! time. A system call writing into a guarded block fails (none is known
+//! to).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -197,13 +208,126 @@ struct Guards {
     /// Unmapped blocks (`VirtualProtect` failed) within guarded ranges;
     /// cleared by [`title_memory_remapped`] when the runtime maps them.
     holes: BTreeSet<usize>,
+    /// Blocks whose page was guarded together with its other views (those
+    /// views' blocks are in it too): a write to one opens them all.
+    aliased: BTreeSet<usize>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     holes: BTreeSet::new(),
+    aliased: BTreeSet::new(),
 });
+
+/// Views of one page past which its views are not guarded together (the
+/// page the title shows wherever it has nothing has thousands).
+pub(crate) const MANY_VIEWS: usize = 64;
+
+/// The views of physical pages the runtime mapped: by address (length,
+/// section, offset in it), and the addresses each page of a section is
+/// shown at.
+#[derive(Default)]
+struct Views {
+    by_addr: BTreeMap<usize, (usize, usize, u64)>,
+    pages: std::collections::HashMap<(usize, u64), Vec<usize>>,
+}
+
+static VIEWS: Mutex<Option<Views>> = Mutex::new(None);
+
+/// Whether all the views of a guarded page are guarded together.
+fn view_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_GUARD").is_none_or(|v| v != "0"))
+}
+
+impl Views {
+    /// Forgets the views overlapping `[at, at + len)`, whole.
+    fn forget(&mut self, at: usize, len: usize) {
+        let end = at.saturating_add(len);
+        let first = self
+            .by_addr
+            .range(..=at)
+            .next_back()
+            .filter(|(a, (n, _, _))| *a + n > at)
+            .map(|(a, _)| *a);
+        let hit: Vec<usize> = first
+            .into_iter()
+            .chain(self.by_addr.range(at.saturating_add(1)..end).map(|(a, _)| *a))
+            .collect();
+        for a in hit {
+            let Some((n, section, offset)) = self.by_addr.remove(&a) else {
+                continue;
+            };
+            for k in 0..n / BLOCK {
+                let key = (section, offset / BLOCK as u64 + k as u64);
+                if let Some(shown) = self.pages.get_mut(&key) {
+                    shown.retain(|&x| x != a + k * BLOCK);
+                    if shown.is_empty() {
+                        self.pages.remove(&key);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every address the page shown at `at` (a block's start) is shown at,
+    /// `at` included; empty if `at` is in no view we were told of.
+    fn shown(&self, at: usize) -> &[usize] {
+        let Some((&base, &(n, section, offset))) = self.by_addr.range(..=at).next_back() else {
+            return &[];
+        };
+        if at >= base + n {
+            return &[];
+        }
+        let key = (section, offset / BLOCK as u64 + ((at - base) / BLOCK) as u64);
+        self.pages.get(&key).map_or(&[], Vec::as_slice)
+    }
+}
+
+/// Every address the page of the block at `at` is shown at (see
+/// [`Views::shown`]).
+fn aliases(at: usize) -> Vec<usize> {
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    views.as_ref().map_or(Vec::new(), |v| v.shown(at - at % BLOCK).to_vec())
+}
+
+/// The runtime mapped a view at `[at, at + len)` of the bytes from `offset`
+/// on of the physical-page section `section`. The view is writable, so the
+/// same pages guarded at another view are opened: their copies check them
+/// again, which also guards the new view with them.
+pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
+    if !view_guard() || len == 0 || !at.is_multiple_of(BLOCK) || !offset.is_multiple_of(BLOCK as u64) {
+        return;
+    }
+    let mut others = Vec::new();
+    {
+        let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        let views = views.get_or_insert_with(Views::default);
+        views.forget(at, len);
+        views.by_addr.insert(at, (len, section, offset));
+        for k in 0..len / BLOCK {
+            let shown = views.pages.entry((section, offset / BLOCK as u64 + k as u64)).or_default();
+            if shown.len() < MANY_VIEWS {
+                others.extend_from_slice(shown);
+            }
+            shown.push(at + k * BLOCK);
+        }
+    }
+    if !others.is_empty() {
+        let mut g = guards();
+        for a in others {
+            open_here(&mut g, a, a + BLOCK);
+        }
+    }
+}
+
+/// The runtime unmapped the views in `[at, at + len)`.
+pub fn title_memory_view_gone(at: usize, len: usize) {
+    if let Some(views) = VIEWS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        views.forget(at, len);
+    }
+}
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
@@ -371,20 +495,67 @@ fn protect(g: &mut Guards, from: usize, to: usize, written: &mut Vec<usize>) {
     };
     if set(from, to) {
         note(g, written, from, to);
+    } else {
+        for block in from..to {
+            if set(block, block + 1) {
+                note(g, written, block, block + 1);
+            } else {
+                g.holes.insert(block);
+            }
+        }
+    }
+    if !view_guard() {
         return;
     }
+    // The same pages at their other views: read-only too, so that a write
+    // through one of those faults. They are not noted clean: the copies
+    // taken at those views have not taken the pages, and their next check
+    // must report them (a block read-only and not clean is reported).
     for block in from..to {
-        if set(block, block + 1) {
-            note(g, written, block, block + 1);
-        } else {
-            g.holes.insert(block);
+        if !g.protected.contains(&block) {
+            continue;
+        }
+        let shown = aliases(block * BLOCK);
+        if shown.len() < 2 || shown.len() > MANY_VIEWS {
+            continue;
+        }
+        for at in shown {
+            let alias = at / BLOCK;
+            g.aliased.insert(alias);
+            if alias != block && !g.protected.contains(&alias) {
+                let mut old = 0;
+                // SAFETY: title view memory; only its protection changes.
+                if unsafe { VirtualProtect(at as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
+                    g.protected.insert(alias);
+                }
+            }
         }
     }
 }
 
 /// Gives write access back to the guarded blocks of `[start, end)` and
-/// notes them written; true if any was guarded.
+/// notes them written; true if any was guarded. The same pages at their
+/// other views are opened too: every guard over them must copy them again.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
+    let any = open_here(g, start, end);
+    if start >= end || g.aliased.is_empty() {
+        return any;
+    }
+    let aliased: Vec<usize> = g.aliased.range(start / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+    for block in aliased {
+        g.aliased.remove(&block);
+        for at in aliases(block * BLOCK) {
+            if at / BLOCK != block {
+                open_here(g, at, at + BLOCK);
+            }
+            g.aliased.remove(&(at / BLOCK));
+        }
+    }
+    any
+}
+
+/// [`open`] for one range, without the other views of its pages.
+fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let blocks: Vec<usize> = g
         .protected
@@ -469,6 +640,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         for block in blocks {
             g.protected.remove(&block);
             g.clean.remove(&block);
+        }
+        let aliased: Vec<usize> = g.aliased.range(at / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+        for block in aliased {
+            g.aliased.remove(&block);
         }
         if changed {
             bump_region_epochs(at, end);
@@ -573,6 +748,112 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// Two views of the same two physical pages, told as the runtime tells
+    /// them: the two addresses.
+    fn two_views() -> (usize, usize) {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        // SAFETY: a pagefile section of two blocks, mapped read-write twice.
+        unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let one = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize;
+            let two = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize;
+            assert!(one != 0 && two != 0);
+            title_memory_view(one, 2 * BLOCK, section as usize, 0);
+            title_memory_view(two, 2 * BLOCK, section as usize, 0);
+            (one, two)
+        }
+    }
+
+    fn drop_views(views: &[usize]) {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        for &view in views {
+            title_memory_remapped(view, 2 * BLOCK);
+            title_memory_view_gone(view, 2 * BLOCK);
+            // SAFETY: our view.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        }
+    }
+
+    /// The title writes the pages of a guarded copy through another view of
+    /// them: the guarded view's next check reports the page written.
+    #[test]
+    fn a_write_through_another_view_is_reported_at_the_guarded_one() {
+        let (guarded, other) = two_views();
+        let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
+        assert_eq!(guard(guarded, guarded + 2 * BLOCK), Some(vec![pages(0), pages(1)]));
+        assert_eq!(guard(guarded, guarded + 2 * BLOCK), Some(Vec::new()), "nothing written yet");
+        // SAFETY: the second view; the handler opens it on the fault.
+        unsafe { ((other + BLOCK + 8) as *mut u8).write(1) };
+        assert_eq!(guard(guarded, guarded + 2 * BLOCK), Some(vec![pages(1)]));
+        assert_eq!(guard(guarded, guarded + 2 * BLOCK), Some(Vec::new()));
+        drop_views(&[guarded, other]);
+    }
+
+    /// Both views have copies: a write through either is reported at both.
+    #[test]
+    fn a_write_is_reported_at_every_checked_view() {
+        let (one, two) = two_views();
+        let pages = |view: usize, block: usize| (view + block * BLOCK) / PAGE;
+        assert_eq!(guard(one, one + 2 * BLOCK), Some(vec![pages(one, 0), pages(one, 1)]));
+        // The other view was made read-only with the first, not noted clean.
+        assert_eq!(guard(two, two + 2 * BLOCK), Some(vec![pages(two, 0), pages(two, 1)]));
+        assert_eq!(guard(one, one + 2 * BLOCK), Some(Vec::new()));
+        assert_eq!(guard(two, two + 2 * BLOCK), Some(Vec::new()));
+        // SAFETY: the first view; the handler opens it on the fault.
+        unsafe { ((one + 16) as *mut u8).write(7) };
+        assert_eq!(guard(two, two + 2 * BLOCK), Some(vec![pages(two, 0)]));
+        assert_eq!(guard(one, one + 2 * BLOCK), Some(vec![pages(one, 0)]));
+        // SAFETY: the same byte through the other view.
+        assert_eq!(unsafe { ((two + 16) as *const u8).read() }, 7);
+        drop_views(&[one, two]);
+    }
+
+    /// A view mapped beside a guarded one is writable: the guarded view
+    /// checks its pages again.
+    #[test]
+    fn a_view_mapped_beside_a_guarded_one_makes_it_check_again() {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let (section, guarded) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            (section, MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize)
+        };
+        title_memory_view(guarded, 2 * BLOCK, section as usize, 0);
+        let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
+        assert_eq!(guard(guarded, guarded + 2 * BLOCK), Some(vec![pages(0), pages(1)]));
+        assert_eq!(guard(guarded, guarded + 2 * BLOCK), Some(Vec::new()));
+        // SAFETY: a second view of the second page only.
+        let other = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, BLOCK as u32, BLOCK).Value as usize };
+        assert_ne!(other, 0);
+        title_memory_view(other, BLOCK, section as usize, BLOCK as u64);
+        assert_eq!(guard(guarded, guarded + 2 * BLOCK), Some(vec![pages(1)]));
+        title_memory_remapped(other, BLOCK);
+        title_memory_view_gone(other, BLOCK);
+        // SAFETY: our view.
+        unsafe {
+            windows_sys::Win32::System::Memory::UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: other as *mut _ },
+            )
+        };
+        drop_views(&[guarded]);
+    }
 
     #[test]
     fn allocation_query_recognizes_file_views_and_rejects_nonviews() {
