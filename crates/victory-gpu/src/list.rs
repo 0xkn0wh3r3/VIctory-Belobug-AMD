@@ -198,12 +198,56 @@ fn cut(this: This) {
         (&mut *list.host.get(), &mut *list.parts.get(), &list.state)
     };
     let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    state.end_hoist();
     if let Some(old) = host.replace(next) {
         old.close();
         parts.push(old);
     }
     if let Some(next) = host {
         state.continue_in(next);
+    }
+}
+
+/// Before an indirect draw (`crate::indirect::hoisting`): unless the clamps
+/// of the list's draws already go to a list before it and nothing since may
+/// have written arguments, the recording is cut here; a list for the clamps
+/// of the draws to come follows what was recorded, and the recording goes
+/// on in another list after it, with the state the title set.
+#[cfg(windows)]
+fn hoist(this: This) {
+    if !crate::indirect::hoisting() {
+        return;
+    }
+    // SAFETY: one of our lists; the title uses it on one thread at a time,
+    // and no reference to the host list is in use here.
+    let (host, parts, state) = unsafe {
+        let list = &*this.cast::<List>();
+        (&mut *list.host.get(), &mut *list.parts.get(), &list.state)
+    };
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(current) = host.as_ref() else { return };
+    if state.hoists_into(current) {
+        return;
+    }
+    state.end_hoist();
+    let Some(next) = spare() else { return };
+    // What was recorded keeps its place; with no work in it, it holds the
+    // clamps itself (the state set in it does them no harm).
+    let clamps = if current.worked() {
+        let Some(clamps) = spare() else { return };
+        if let Some(old) = host.replace(next) {
+            old.close();
+            parts.push(old);
+        }
+        clamps
+    } else {
+        let Some(old) = host.replace(next) else { return };
+        old
+    };
+    parts.push(clamps.clone());
+    if let Some(next) = host {
+        state.continue_in(next);
+        state.hoist(clamps, next);
     }
 }
 
@@ -368,6 +412,9 @@ extern "system" fn list_type(this: This) -> u32 {
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
+        // SAFETY: the title passes one of our lists.
+        let state = unsafe { &(*this.cast::<List>()).state };
+        state.lock().unwrap_or_else(|e| e.into_inner()).end_hoist();
         host.close();
     }
     S_OK
@@ -387,6 +434,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
             (&mut *list.host.get(), &list.state)
         };
         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+        state.end_hoist();
         // SAFETY: as above.
         let parts = unsafe { &mut *(*this.cast::<List>()).parts.get() };
         {
@@ -568,6 +616,7 @@ extern "system" fn copy_buffer_region(
 ) {
     #[cfg(windows)]
     if let Some(list) = host_list(this) {
+        list.count_write();
         list.count_work();
     }
     #[cfg(windows)]
@@ -584,6 +633,7 @@ extern "system" fn copy_buffer_region(
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     if let Some(list) = host_list(this) {
+        list.count_write();
         list.count_work();
     }
     #[cfg(windows)]
@@ -1125,6 +1175,7 @@ extern "system" fn clear_dsv(
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
     if let Some(list) = host_list(this) {
+        list.count_write();
         list.count_work();
     }
     #[cfg(windows)]
@@ -1587,6 +1638,7 @@ mod state {
         }
         let mut ran = false;
         if super::indirect_on() {
+            super::hoist(this);
             with_state(this, |list, s| {
                 ran = s.execute_indirect(list, (MESH, STRIDE, 1), indirect, None);
             });
@@ -1693,6 +1745,9 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        if kind != DISPATCH {
+            hoist(this);
+        }
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });

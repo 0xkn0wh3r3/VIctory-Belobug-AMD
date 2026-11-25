@@ -42,7 +42,16 @@ pub(crate) fn counts() -> (u64, u64) {
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
+        // Diagnostics (`VICTORY_SHADER_BUILD_OF=<executable>`): the entries
+        // of another build, for a build whose translation is the same (a
+        // change elsewhere), which then need not be made again.
+        let other = std::env::var_os("VICTORY_SHADER_BUILD_OF")
+            .filter(|_| cfg!(feature = "diagnostics"))
+            .map(std::path::PathBuf::from);
+        if let Some(other) = &other {
+            tracing::warn!(of = %other.display(), "shader cache entries of another build are used");
+        }
+        let exe = other.map_or_else(std::env::current_exe, Ok).and_then(std::fs::read);
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(

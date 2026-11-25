@@ -64,9 +64,21 @@ struct Fixed {
 // SAFETY: the views only name title resources.
 unsafe impl Send for Fixed {}
 
+/// Where the clamps of a run of indirect draws go: the list `clamps`, open,
+/// that runs before the host list at `into`, as long as that one has
+/// `writes` dispatches and copies (a later one may write the arguments).
+pub(crate) struct Hoist {
+    pub(crate) clamps: std::sync::Arc<HostList>,
+    pub(crate) into: usize,
+    pub(crate) writes: u64,
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
+    /// The list before the host list recorded into that holds the clamps of
+    /// its indirect draws (`crate::indirect::hoisting`), still open.
+    hoist: Option<Hoist>,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -346,6 +358,34 @@ impl State {
 
     pub(crate) fn set_index_buffer(&mut self, view: Option<&IndexView>) {
         self.index = view.copied().unwrap_or_default();
+    }
+
+    /// Whether the clamps of indirect draws recorded in `list` now go to
+    /// the list before it.
+    pub(crate) fn hoists_into(&self, list: &HostList) -> bool {
+        self.hoist
+            .as_ref()
+            .is_some_and(|h| h.into == std::ptr::from_ref(list) as usize && h.writes == list.writes())
+    }
+
+    /// From here on the clamps of `into`'s indirect draws go to `clamps`.
+    pub(crate) fn hoist(&mut self, clamps: std::sync::Arc<HostList>, into: &HostList) {
+        self.end_hoist();
+        // The clamped arguments live as long as the list that reads them.
+        into.keep_until_run(Box::new(clamps.clone()));
+        self.hoist = Some(Hoist {
+            clamps,
+            into: std::ptr::from_ref(into) as usize,
+            writes: into.writes(),
+        });
+    }
+
+    /// Ends and closes the list of hoisted clamps, if any.
+    pub(crate) fn end_hoist(&mut self) {
+        if let Some(h) = self.hoist.take() {
+            h.clamps.clamp_end();
+            h.clamps.close();
+        }
     }
 
     /// Goes on in another host list, open: gives it the state set so far.
@@ -907,6 +947,7 @@ impl State {
                 at += MAX_GROUPS;
             }
         }
+        list.count_write();
         list.count_work();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         // Depth textures it wrote as images get what it wrote; then the
@@ -1603,21 +1644,52 @@ impl State {
             why("no host signature");
             return false;
         };
-        args.refresh(list, arguments, len);
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        // Bounded first: the clamp binds a compute pipeline of its own and
-        // copies clamped active records into a scratch buffer at offset 0.
         let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
-        let Some(bounded) = crate::indirect::bound(
-            list,
-            (&args.buffer, args.offset(arguments)),
-            count_arg,
-            (kind, stride, max),
-        ) else {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
-            return false;
+        // Draws of a run: clamped in the list before, which the run's first
+        // draw opened (`crate::list`), so that nothing of ours comes between
+        // the draws.
+        let before = (kind != DISPATCH
+            && !(matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES)
+            && self.hoists_into(list))
+        .then(|| self.hoist.as_ref().map(|h| h.clamps.clone()))
+        .flatten()
+        .and_then(|clamps| {
+            args.refresh(&clamps, arguments, len);
+            if let Some((s, at)) = &counter {
+                s.refresh(&clamps, *at, 4);
+            }
+            #[cfg(feature = "diagnostics")]
+            clamps.note_op(|| format!("hoisted clamp of kind {kind}"));
+            crate::indirect::bound_before(
+                &clamps,
+                (&args.buffer, args.offset(arguments)),
+                count_arg,
+                (kind, stride, max),
+            )
+        });
+        let inline = before.is_none();
+        let (bounded, bounded_at) = match before {
+            Some(b) => b,
+            None => {
+                args.refresh(list, arguments, len);
+                // Bounded first: the clamp binds a compute pipeline of its own and
+                // copies clamped active records into a scratch buffer at offset 0.
+                #[cfg(feature = "diagnostics")]
+                list.note_op(|| format!("clamp of kind {kind}"));
+                let Some(bounded) = crate::indirect::bound(
+                    list,
+                    (&args.buffer, args.offset(arguments)),
+                    count_arg,
+                    (kind, stride, max),
+                ) else {
+                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                    return false;
+                };
+                (bounded, 0)
+            }
         };
         // Rectangle lists: their vertices expanded and the records rewritten
         // on the GPU, before the draw's own pipeline is bound.
@@ -1636,8 +1708,10 @@ impl State {
                 }
             }
         }
-        self.host_pipeline = 0;
-        self.host_roots[1] = 0;
+        if inline {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
         let ran = match kind {
             DRAW if rect_args.is_some() => {
                 let ok = self.prepare(list, false);
@@ -1672,7 +1746,9 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
+            if inline {
+                crate::indirect::done(list, &bounded);
+            }
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1714,13 +1790,16 @@ impl State {
                 &signature,
                 max,
                 arg_buffer,
-                0,
+                bounded_at,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &bounded);
+        if inline {
+            crate::indirect::done(list, &bounded);
+        }
         if kind == DISPATCH {
+            list.count_write();
             list.count_work();
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
             if crate::twin::resolve(list) {

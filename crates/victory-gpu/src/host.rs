@@ -644,6 +644,12 @@ pub(crate) struct HostList {
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// Host fence value signalled by the last submission that ran this list.
     last_fence: std::sync::atomic::AtomicU64,
+    /// Dispatches and buffer copies recorded since the reset: what may have
+    /// written indirect arguments (`crate::indirect` clamps hoisted before).
+    writes: std::sync::atomic::AtomicU64,
+    /// Buffers for clamped indirect arguments when this list holds the
+    /// clamps of the list after it (`clamp_room`).
+    clamp_chunks: Mutex<ClampChunks>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -659,9 +665,20 @@ pub(crate) fn warn_depth_bounds() {
     ONCE.call_once(|| tracing::warn!("the host GPU has no depth bounds test; depth bounds are ignored"));
 }
 
+/// A list's buffers for hoisted clamped indirect arguments with their
+/// states, how many are in use since the reset, the bytes taken of the last
+/// of those, and whether the list has the barrier that precedes the clamps.
+#[derive(Default)]
+struct ClampChunks {
+    all: Vec<(ID3D12Resource, D3D12_RESOURCE_STATES)>,
+    used: usize,
+    at: u64,
+    barrier: bool,
+}
+
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
-const STAMPS: u32 = 4096;
+const STAMPS: u32 = 16384;
 
 impl Drop for HostList {
     fn drop(&mut self) {
@@ -756,6 +773,29 @@ fn log_gpu_waits() {
     slow.sort_unstable_by_key(|(_, (_, us))| std::cmp::Reverse(*us));
     for (key, (n, us)) in slow.into_iter().take(8) {
         tracing::info!("GPU wait {:.0} ms in {n} x: {key}", us as f64 / 1e3);
+    }
+}
+
+/// With `VICTORY_GPU_TIMING`: GPU milliseconds and commands by what ran
+/// (kind and pipeline), and the frames presented meanwhile.
+#[cfg(feature = "diagnostics")]
+static GPU_TIMES: Mutex<Option<std::collections::HashMap<String, (u32, f64)>>> = Mutex::new(None);
+#[cfg(feature = "diagnostics")]
+static TIMED_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Logs and forgets the GPU time per kind of command, per frame.
+#[cfg(feature = "diagnostics")]
+fn log_gpu_times() {
+    let frames = f64::from(TIMED_FRAMES.swap(0, Ordering::Relaxed).max(1));
+    let Some(times) = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    let total: f64 = times.iter().filter(|(k, _)| k.starts_with("all: ")).map(|(_, t)| t.1).sum();
+    let mut all: Vec<_> = times.into_iter().collect();
+    all.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
+    tracing::info!("GPU time: {:.1} ms/frame in {} kinds of commands", total / frames, all.len());
+    for (key, (n, ms)) in all.into_iter().take(45) {
+        tracing::info!("GPU time {:7.2} ms/frame, {:7.1} x: {key}", ms / frames, f64::from(n) / frames);
     }
 }
 
@@ -1013,6 +1053,8 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 kept: Mutex::default(),
                 work: Mutex::default(),
+                writes: Default::default(),
+                clamp_chunks: Mutex::default(),
                 pipelines: Mutex::default(),
                 queries: Mutex::default(),
                 budget: OnceLock::new(),
@@ -1284,6 +1326,12 @@ impl Host {
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
+            }
+            #[cfg(feature = "diagnostics")]
+            if each {
+                // SAFETY: a plain query.
+                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                runs[i].add_times(frequency);
             }
             #[cfg(feature = "diagnostics")]
             if each && started.elapsed() > std::time::Duration::from_millis(50) {
@@ -1744,6 +1792,46 @@ impl HostList {
         times
     }
 
+    /// Adds the GPU time of each noted command to the totals by kind
+    /// (diagnostics, timing on, after the list ran).
+    #[cfg(feature = "diagnostics")]
+    fn add_times(&self, frequency: u64) {
+        let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
+            return;
+        };
+        if count == 0 {
+            return;
+        }
+        let mut data = std::ptr::null_mut();
+        let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
+        // SAFETY: a read-back buffer the finished list resolved into.
+        let stamps: Vec<u64> = unsafe {
+            if back.Map(0, Some(&range), Some(&mut data)).is_err() {
+                return;
+            }
+            let s = std::slice::from_raw_parts(data.cast::<u64>(), count + 1).to_vec();
+            back.Unmap(0, None);
+            s
+        };
+        let mut times = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner());
+        let times = times.get_or_insert_with(Default::default);
+        for i in 0..count {
+            let ms = stamps[i + 1].saturating_sub(stamps[i]) as f64 * 1e3 / frequency.max(1) as f64;
+            // The kind without its counts: "dispatch [compute ...]".
+            let text = &notes[i].0;
+            let kind = text.split(' ').next().unwrap_or("");
+            let rest = text.find('[').map_or("", |at| &text[at..]);
+            let key: String = format!("{kind} {rest}").chars().take(150).collect();
+            let k = times.entry(format!("all: {kind}")).or_insert((0, 0.0));
+            k.0 += 1;
+            k.1 += ms;
+            let e = times.entry(key).or_insert((0, 0.0));
+            e.0 += 1;
+            e.1 += ms;
+        }
+    }
+
     pub(crate) fn close(&self) {
         // The host closes no list with queries running; their title ends,
         // in a later list, are dropped (`end_query`).
@@ -1788,6 +1876,13 @@ impl HostList {
         self.release_kept();
         *self.deferred() = Deferred::default();
         *self.work.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        self.writes.store(0, Ordering::Relaxed);
+        {
+            let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+            chunks.used = 0;
+            chunks.at = 0;
+            chunks.barrier = false;
+        }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.queries.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2109,6 +2204,85 @@ impl HostList {
     /// Whether the list has work: draws, dispatches, clears or copies.
     pub(crate) fn worked(&self) -> bool {
         *self.work.lock().unwrap_or_else(|e| e.into_inner()) > 0
+    }
+
+    /// Counts a dispatch or a copy: what may write indirect arguments.
+    pub(crate) fn count_write(&self) {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Dispatches and copies since the reset.
+    pub(crate) fn writes(&self) -> u64 {
+        self.writes.load(Ordering::Relaxed)
+    }
+
+    /// Room for `bytes` of clamped indirect arguments in this list's
+    /// buffers, writable by shaders from here on in the list: the buffer and
+    /// the offset. None for more than a buffer holds.
+    pub(crate) fn clamp_room(&self, bytes: u64) -> Option<(ID3D12Resource, u64)> {
+        const CHUNK: u64 = 256 << 10;
+        let bytes = bytes.next_multiple_of(16);
+        if bytes > CHUNK {
+            return None;
+        }
+        let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+        if chunks.used > 0 && chunks.at + bytes <= CHUNK {
+            let at = chunks.at;
+            chunks.at += bytes;
+            return Some((chunks.all[chunks.used - 1].0.clone(), at));
+        }
+        // The next buffer, writable.
+        if chunks.used == chunks.all.len() {
+            let buffer = host()?.uav_buffer(CHUNK)?;
+            name(&buffer, || "hoisted indirect arguments".to_string());
+            chunks.all.push((buffer, D3D12_RESOURCE_STATE_COMMON));
+        }
+        let i = chunks.used;
+        chunks.used += 1;
+        chunks.at = bytes;
+        let mut barriers = Vec::new();
+        if !chunks.barrier {
+            // What earlier lists' shaders wrote first.
+            chunks.barrier = true;
+            barriers.push(D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                ..Default::default()
+            });
+        }
+        let (buffer, state) = &mut chunks.all[i];
+        if *state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
+            barriers.push(transition(buffer, *state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+            *state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        }
+        let buffer = buffer.clone();
+        if !barriers.is_empty() {
+            // SAFETY: an open list and live buffers.
+            unsafe { self.list.ResourceBarrier(&barriers) };
+        }
+        Some((buffer, 0))
+    }
+
+    /// The clamped arguments written so far become readable as indirect
+    /// arguments by the lists after this one.
+    pub(crate) fn clamp_end(&self) {
+        let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+        let used = chunks.used;
+        let barriers: Vec<_> = chunks.all[..used]
+            .iter_mut()
+            .filter(|(_, state)| *state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+            .map(|(buffer, state)| {
+                *state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+                transition(
+                    buffer,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                )
+            })
+            .collect();
+        if !barriers.is_empty() {
+            // SAFETY: an open list and live buffers.
+            unsafe { self.list.ResourceBarrier(&barriers) };
+        }
     }
 
     /// Counts a draw, dispatch, clear or copy.
@@ -3201,6 +3375,8 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
+        #[cfg(feature = "diagnostics")]
+        TIMED_FRAMES.fetch_add(1, Ordering::Relaxed);
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
@@ -3235,6 +3411,8 @@ impl Meter {
             tracing::info!("sparse writes since: {}", crate::shadow::sparse_writes_text());
             #[cfg(feature = "diagnostics")]
             log_gpu_waits();
+            #[cfg(feature = "diagnostics")]
+            log_gpu_times();
             tracing::info!(
                 "[{} {}] {fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB, bindless plans \
