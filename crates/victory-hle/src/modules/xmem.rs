@@ -2065,7 +2065,20 @@ mod tests {
         for (field, align) in [(0, 16usize), (0xc, 4096), (0x10, 64 * 1024)] {
             let attributes = field << ALIGNMENT_SHIFT;
             let p = XMemAllocDefault(1000, attributes);
+            assert!(!p.is_null(), "align {align}: allocated");
             assert_eq!(p as usize % align, 0);
+            // The whole payload is the caller's: its first and last bytes
+            // take writes and read back.
+            // SAFETY: (both) the 1000 bytes just allocated.
+            unsafe {
+                let bytes = p.cast::<u8>();
+                bytes.write_volatile(0x5a);
+                bytes.add(999).write_volatile(0xa5);
+                assert_eq!(
+                    (bytes.read_volatile(), bytes.add(999).read_volatile()),
+                    (0x5a, 0xa5)
+                );
+            }
             // SAFETY: (both) the header below the block we just made.
             let [size, offset] = unsafe { p.cast::<u8>().sub(HEADER).cast::<[usize; 2]>().read() };
             assert_eq!(size, 1000 + align);
