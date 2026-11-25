@@ -6213,6 +6213,26 @@ impl<'a> Lower<'a> {
             let index = self.heap_index_at(site, skew.wrapping_neg(), false)?;
             self.s.heap_handle(self.cur, index, false, false, props)
         };
+        // The size words are asked of the host only when the program reads
+        // one as data: most loads take the descriptor whole for an image or
+        // buffer instruction, and hundreds of size queries of heap handles
+        // in one program stop the AMD driver's compiler (minutes, then
+        // E_FAIL: nine compute programs of the world).
+        let sized = if image.is_some() { 1..=4 } else { 2..=2 };
+        let wanted = (0..count).any(|k| {
+            sized.contains(&(k as i32).wrapping_add(skew))
+                && inst
+                    .write(Reg::S(code + k as u8))
+                    .is_some_and(|v| self.read_as_data(v))
+        });
+        if !wanted {
+            for k in 0..count {
+                if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                    self.vals.insert(v, Val::Missing(OTHER));
+                }
+            }
+            return Ok(());
+        }
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
