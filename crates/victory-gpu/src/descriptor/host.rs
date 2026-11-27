@@ -6287,6 +6287,61 @@ mod tests {
         }
     }
 
+    /// On a host that refuses a view heap of every index shaders take
+    /// (NVIDIA), view heaps are paged: a heap of the title's size keeps all
+    /// its slots, the dynamic slots' pages are placed at once, a slot of a
+    /// page never written has its handle in the null page, and a title
+    /// slot's page is placed when the slot is first written, entered in the
+    /// page table, its handle in that page.
+    #[test]
+    fn a_heap_of_the_titles_size_is_paged_where_the_host_caps_view_heaps() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        if std::env::var_os("VICTORY_VIEW_PAGES").is_some() {
+            return; // paging forced on or off
+        }
+        // SAFETY: plain heap creation; the heap is dropped at once.
+        let capped = unsafe {
+            host.device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: UNCAPPED_VIEWS,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+        }
+        .is_err();
+        assert_eq!(view_pages(), capped, "paged exactly where the host caps view heaps");
+        if !capped {
+            return;
+        }
+        let count = 1_245_184;
+        let heap = HostHeap::new(false, count).expect("a paged view heap");
+        assert_eq!((heap.count, heap.dynamic), (count, DYNAMIC), "every title slot kept");
+        let pages = heap.pages.as_ref().expect("paged");
+        let table = heap.page_table.as_ref().expect("a page table").2 as *const u32;
+        // SAFETY: dwords of the mapped page table, one per page.
+        let entry = |page: u32| unsafe { table.add(page as usize).read_volatile() };
+        for index in [count, count + DYNAMIC - 1] {
+            assert_ne!(entry(index / PAGE), NULL_PAGE, "dynamic slot {index}'s page placed at once");
+        }
+        // SAFETY: a live shader-visible heap.
+        let start = unsafe { heap.heap.GetGPUDescriptorHandleForHeapStart().ptr };
+        let step = u64::from(heap.step);
+        // Past where the capped heap ended.
+        let far = 1_100_000;
+        assert_eq!(entry(far / PAGE), NULL_PAGE, "never written: no place");
+        assert_eq!(heap.gpu_handle(far).ptr, start + u64::from(far % PAGE) * step, "the null page");
+        null_view(heap.cpu(far));
+        let placed = entry(far / PAGE);
+        assert!(placed > SCRATCH_PAGE, "placed when written");
+        assert_eq!(pages.host_of(far / PAGE), placed);
+        assert_eq!(heap.gpu_handle(far).ptr, start + u64::from(placed * PAGE + far % PAGE) * step);
+        // Dynamic slots taken together are together in the host heap.
+        let first = heap.dynamic(3).expect("dynamic slots");
+        assert_eq!(heap.gpu_handle(first + 2).ptr - heap.gpu_handle(first).ptr, 2 * step);
+    }
+
     /// A constant buffer view larger than the host takes is cut to what it
     /// takes: the device, which such a view removes, stays.
     #[test]
