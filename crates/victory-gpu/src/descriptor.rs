@@ -12,6 +12,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+mod pages;
 
 thread_local! {
     /// Set while this thread runs the pass over textures picked by index
@@ -214,6 +216,38 @@ fn mirror(handle: u64) {
             }
         }
     }
+}
+
+/// Each title view heap's host heap, with where its records start and
+/// their size: for paged host heaps ([`host::view_pages`]).
+#[cfg(windows)]
+fn each_paged_heap(f: impl Fn(&host::HostHeap, u64, u64)) {
+    if !host::view_pages() {
+        return;
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(start, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped, under the
+        // lock held here).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let (Some(Some(host)), VIEWS_KIND, Some(step)) = (heap.host.get(), heap.desc.kind, increment(heap.desc.kind)) {
+            f(host, start, u64::from(step));
+        }
+    }
+}
+
+/// While no submission is on the card: paged view heaps turn their pages
+/// (`host::HostHeap::turn_pages`).
+#[cfg(windows)]
+pub(crate) fn turn_pages() {
+    each_paged_heap(|host, start, step| host.turn_pages(start, step));
+}
+
+/// Before a submission: the pages of paged view heaps placed again since
+/// have their slots made (`host::HostHeap::remake_pages`).
+#[cfg(windows)]
+pub(crate) fn remake_pages() {
+    each_paged_heap(|host, start, step| host.remake_pages(start, step));
 }
 
 /// Whether [`sync_heaps`] is done (`VICTORY_HEAP_SYNC=0`: not).

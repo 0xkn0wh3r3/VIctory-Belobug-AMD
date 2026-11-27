@@ -6030,6 +6030,8 @@ impl Host {
                 }
             }
         };
+        // Pages of paged view heaps placed again since: their slots made.
+        crate::descriptor::remake_pages();
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
         let runs = match &own {
@@ -6054,6 +6056,8 @@ impl Host {
             if upcheck::on() {
                 upcheck::at_rest(self);
             }
+            // Nothing on the card: paged view heaps turn their pages.
+            crate::descriptor::turn_pages();
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
@@ -6063,6 +6067,7 @@ impl Host {
             if upcheck::on() {
                 upcheck::at_rest(self);
             }
+            crate::descriptor::turn_pages();
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }

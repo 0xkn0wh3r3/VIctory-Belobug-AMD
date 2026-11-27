@@ -304,6 +304,14 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
+    /// Paged view heaps ([`super::shader::SLOT_PAGES`]): the block the
+    /// instruction being lowered began in, the view heap indices of title
+    /// views it took in that block (their pages' read marks are set once it
+    /// is done, [`Lower::mark_page_reads`]), and those whose marks are set
+    /// already in this console block.
+    inst_start: usize,
+    page_reads: Vec<V>,
+    pages_marked: HashSet<V>,
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
@@ -1442,8 +1450,14 @@ fn own_bits_on() -> bool {
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 4] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+pub fn host_settings() -> [u32; 5] {
+    [
+        host_max_wave(),
+        super::shader::view_heap_limit(),
+        super::shader::raw_views(),
+        host_rdna(),
+        u32::from(super::shader::view_pages()),
+    ]
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2048,6 +2062,9 @@ impl<'a> Lower<'a> {
                 m
             },
             handles: HashMap::new(),
+            inst_start: usize::MAX,
+            page_reads: Vec::new(),
+            pages_marked: HashSet::new(),
             strides: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
@@ -2796,18 +2813,25 @@ impl<'a> Lower<'a> {
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0) {
                 self.lds_meeting();
             }
+            // (A mark set in an earlier console block need not be seen here.)
+            self.pages_marked.clear();
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
+                self.inst_start = self.cur;
                 self.inst(b, i)?;
+                self.mark_page_reads();
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
+                        self.inst_start = self.cur;
                         self.section_inst(b, j, i);
+                        self.mark_page_reads();
                     }
                     i = end;
                     continue;
                 }
                 i += 1;
             }
+            self.inst_start = usize::MAX;
             self.mask_ok = self.mask_data == MaskData::Console;
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].1) {
                 self.lds_meeting();
@@ -7991,6 +8015,84 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
+    /// Paged view heaps: view heap index `index` of a title view (not a
+    /// sampler, nor a raw twin: `not`) is read here. Its page's read mark is
+    /// set once the instruction is done ([`Lower::mark_page_reads`]): the
+    /// callers of [`Lower::handle`] go on in the block they were in, so no
+    /// branch can be made here. One taken inside a block of the instruction's
+    /// own (a guarded part) sets its mark there and then, without the test.
+    ///
+    /// Not in pixel programs: a pixel program that writes an unordered view
+    /// runs before the depth test, and that would cost more than the room
+    /// the marks win back. Their table reads are marked by the host when
+    /// the draw makes them (`HostHeap::mirror`); a page read only by pixel
+    /// programs at indices they compute is unmarked (`take_back_pages`).
+    fn page_read(&mut self, index: V, not: bool) {
+        if not || self.s.pixel || !super::shader::view_pages() || self.pages_marked.contains(&index) {
+            return;
+        }
+        if self.cur == self.inst_start {
+            self.pages_marked.insert(index);
+            self.page_reads.push(index);
+        } else {
+            let (word, bit) = self.page_bit(index);
+            self.set_page_bit(word, bit);
+        }
+    }
+
+    /// The byte of the read marks' word that holds the bit of `index`'s
+    /// page, and the bit.
+    fn page_bit(&mut self, index: V) -> (V, V) {
+        use super::shader::{VIEW_PAGE_SLOTS, VIEW_PAGES};
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        // (Inside the marks whatever the index: a root view has no bounds.)
+        let last = self.s.m.i32(VIEW_PAGES - 1);
+        let index = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
+        self.s.m.tag(index, Tag::Clamp);
+        let shift = self.s.m.i32(VIEW_PAGE_SLOTS.trailing_zeros());
+        let page = self.s.m.bin(c, Bin::LShr, index, shift);
+        let k5 = self.s.m.i32(5);
+        let word = self.s.m.bin(c, Bin::LShr, page, k5);
+        let k2 = self.s.m.i32(2);
+        let word = self.s.m.bin(c, Bin::Shl, word, k2);
+        let k31 = self.s.m.i32(31);
+        let at = self.s.m.bin(c, Bin::And, page, k31);
+        let one = self.s.m.i32(1);
+        let bit = self.s.m.bin(c, Bin::Shl, one, at);
+        (word, bit)
+    }
+
+    /// Sets read mark `bit` in the word at byte `word`.
+    fn set_page_bit(&mut self, word: V, bit: V) {
+        let marks = self.s.root_uav_handle(super::shader::SLOT_PAGE_READS);
+        let (i32t, iu) = (self.s.t.i32, self.s.m.undef(self.s.t.i32));
+        let or = self.s.m.i32(2);
+        self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[marks, or, word, iu, iu, bit]);
+    }
+
+    /// The read marks of the pages of the title views the instruction just
+    /// lowered took ([`Lower::page_read`]): each where it is not set yet (the
+    /// marks lie in the PC's memory, and an atomic there from every lane of
+    /// every draw would cost more than the reads it marks).
+    fn mark_page_reads(&mut self) {
+        for index in std::mem::take(&mut self.page_reads) {
+            let (word, bit) = self.page_bit(index);
+            let marks = self.s.root_uav_handle(super::shader::SLOT_PAGE_READS);
+            let c = self.cur;
+            let (iu, mask, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1), self.s.m.i32(4));
+            let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[marks, word, iu, mask, align]);
+            let seen = self.s.m.extract(c, r, 0);
+            let seen = self.as_int(seen);
+            let set = self.s.m.bin(c, Bin::And, seen, bit);
+            let zero = self.s.m.i32(0);
+            let unset = self.s.m.cmp(c, pred::EQ, set, zero);
+            let at = self.begin_guarded(Some(unset));
+            self.set_page_bit(word, bit);
+            self.end_guarded(at, &[]);
+        }
+    }
+
     /// A handle for the descriptor `src` read at `site`.
     fn handle(
         &mut self,
@@ -8007,6 +8109,10 @@ impl<'a> Lower<'a> {
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
                 let (index, bounded) = self.raw_twin(src, index, sampler, props);
+                // (A table's entry at a constant place is the host's to see:
+                // each draw makes what its tables name, `table_entry`.)
+                let seen = self.load_at_constant_place(*load);
+                self.page_read(index, sampler || bounded || seen);
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
@@ -8060,6 +8166,7 @@ impl<'a> Lower<'a> {
                 let _ = site;
                 let phi = self.descriptor_phi(*block, args, sampler, 8)?;
                 let (index, bounded) = self.raw_twin(src, phi, sampler, props);
+                self.page_read(index, sampler || bounded);
                 Ok(self.s.heap_handle_at(self.cur, index, sampler, false, props, bounded))
             }
             Source::Select { scc, args } => {
@@ -8079,6 +8186,7 @@ impl<'a> Lower<'a> {
                 let clear = self.heap_index(b, fb, sampler)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
                 let (index, bounded) = self.raw_twin(src, index, sampler, props);
+                self.page_read(index, sampler || bounded);
                 Ok(self.s.heap_handle_at(self.cur, index, sampler, false, props, bounded))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
@@ -8087,6 +8195,7 @@ impl<'a> Lower<'a> {
                 // index, non-uniform.
                 let index = self.lane_heap_index(src, sampler)?;
                 let (index, bounded) = self.raw_twin(src, index, sampler, props);
+                self.page_read(index, sampler || bounded);
                 Ok(self.s.heap_handle_at(self.cur, index, sampler, true, props, bounded))
             }
         }
@@ -8482,6 +8591,17 @@ impl<'a> Lower<'a> {
 
     /// The heap index of the descriptor at dword `first` of what the scalar
     /// load at `load` reads, computed in the current block.
+    /// Whether the descriptor load at `load` reads a table at a constant
+    /// place (no offset computed in the code): the host knows that entry.
+    fn load_at_constant_place(&self, load: Site) -> bool {
+        let Some(a) = self.scalar.get(&load) else { return false };
+        if self.x.native.layout.get(a.param).map(|p| p.root) != Some(RootType::Table) {
+            return false;
+        }
+        let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
+        matches!(&li.fields, Fields::Smem { soffset: Operand::Scalar { code: NULL, .. }, .. })
+    }
+
     fn heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
         let a = *self
             .scalar

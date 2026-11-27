@@ -4,6 +4,14 @@
 //! order: slot `i` is made from what the title wrote at slot `i`, when it
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
+//!
+//! A host that refuses a view heap of every index shaders take ([`view_pages`];
+//! NVIDIA takes 1,000,000 descriptors, the title's heap has 1,245,184 slots)
+//! keeps that order in a virtual heap of pages of `VIEW_PAGE_SLOTS` slots:
+//! each page the title writes is placed in the host heap where there is
+//! room, and translated shaders find it through the page table
+//! (`victory_shader::emit::SLOT_PAGES`). Pages no shader used lately are
+//! taken back when room runs low (`super::pages`).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+use super::pages::{NULL_PAGE, PAGE, Pages, SCRATCH_PAGE};
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
@@ -235,6 +244,49 @@ pub(crate) struct HostHeap {
     /// another's view made stale stays, which says only "may"): a write of
     /// any other view needs nothing of `placed` ([`spans_quick`]).
     spanned: Slots,
+    /// Paged view heaps ([`view_pages`]): where each page of slots is.
+    pages: Option<Pages>,
+    /// Paged view heaps: the page table shaders read
+    /// (`victory_shader::emit::SLOT_PAGES`) and the pages' read marks they
+    /// set (`SLOT_PAGE_READS`), each a buffer, its GPU address and its
+    /// mapping.
+    page_table: Option<(ID3D12Resource, u64, usize)>,
+    page_reads: Option<(ID3D12Resource, u64, usize)>,
+    /// Paged view heaps: a page of null views (in a heap the card does not
+    /// see), copied over host pages taken back before they are given out
+    /// again; and the host pages taken back at the last turn
+    /// ([`HostHeap::turn_pages`]), given out from the next.
+    page_nulls: Option<ID3D12DescriptorHeap>,
+    cooling: Mutex<Vec<u32>>,
+}
+
+/// For a draw on a paged host with no title view heap bound: a page table
+/// whose pages all read the null page, and read marks nothing reads (their
+/// GPU addresses). They live as long as the process.
+pub(crate) fn null_page_buffers() -> Option<[u64; 2]> {
+    static BUFFERS: std::sync::OnceLock<Option<(ID3D12Resource, ID3D12Resource)>> = std::sync::OnceLock::new();
+    let (table, reads) = BUFFERS
+        .get_or_init(|| {
+            let host = host()?;
+            let bytes = u64::from(victory_shader::emit::VIEW_PAGE_COUNT) * 4;
+            let (table, table_data) = host.upload_buffer(bytes)?;
+            let (reads, reads_data) = host.shared_buffer(bytes / 32)?;
+            // SAFETY: the buffers' whole mappings.
+            unsafe {
+                std::ptr::write_bytes(table_data, 0, bytes as usize);
+                std::ptr::write_bytes(reads_data, 0, bytes as usize / 32);
+            }
+            Some((table, reads))
+        })
+        .as_ref()?;
+    // SAFETY: live buffers.
+    Some(unsafe { [table.GetGPUVirtualAddress(), reads.GetGPUVirtualAddress()] })
+}
+
+/// Whether view heaps are paged ([`probe_view_limit`]).
+pub(crate) fn view_pages() -> bool {
+    probe_view_limit();
+    victory_shader::emit::view_pages()
 }
 
 /// Since the last frame line: writes that left `placed` alone
@@ -1924,21 +1976,32 @@ pub(crate) fn probe_view_limit() {
             };
             made.is_ok()
         };
-        let twins = raw_twins() && fits(2 * RAW_TWINS);
+        // `VICTORY_VIEW_PAGES`: 1 pages on any host (no twins then), 0 on none.
+        let asked = std::env::var("VICTORY_VIEW_PAGES").ok();
+        let (force, never) = (asked.as_deref() == Some("1"), asked.as_deref() == Some("0"));
+        let twins = !force && raw_twins() && fits(2 * RAW_TWINS);
         if twins {
             victory_shader::emit::set_raw_views(RAW_TWINS);
         }
         // (The twins lie past the null slot.)
+        let mut paged = false;
         let views = if twins {
             RAW_TWINS
-        } else if fits(UNCAPPED_VIEWS) {
+        } else if !force && fits(UNCAPPED_VIEWS) {
             UNCAPPED_VIEWS
+        } else if !never && fits(PORTABLE_VIEWS) {
+            // Every index shaders take, as virtual slots in pages
+            // (`victory_shader::emit::SLOT_PAGES`).
+            paged = true;
+            victory_shader::emit::VIEW_PAGES
         } else {
             PORTABLE_VIEWS
         };
+        victory_shader::emit::set_view_pages(paged);
         tracing::info!(
             views,
             raw_twins = twins,
+            paged,
             "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
         );
         victory_shader::emit::set_view_heap_limit(views - 1);
@@ -1978,6 +2041,64 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
     null.saturating_sub(count).min(most).max(DYNAMIC)
 }
 
+/// A paged view heap's parts ([`HostHeap::new`]): its [`Pages`], with the
+/// pages of the dynamic slots (`count..count + extra`, and the title's
+/// slots in the first of them) placed at once, together, past the null and
+/// scratch pages; the page table and the read marks shaders use, each a
+/// buffer, its GPU address and its mapping; and a page of null views. The
+/// host heap has `size` slots.
+#[allow(clippy::type_complexity)]
+fn paged_parts(
+    host: &crate::host::Host,
+    kind: D3D12_DESCRIPTOR_HEAP_TYPE,
+    step: u32,
+    count: u32,
+    extra: u32,
+    size: u32,
+) -> Option<(Pages, (ID3D12Resource, u64, usize), (ID3D12Resource, u64, usize), ID3D12DescriptorHeap)> {
+    let table_bytes = u64::from(victory_shader::emit::VIEW_PAGE_COUNT) * 4;
+    let (table, table_data) = host.upload_buffer(table_bytes)?;
+    let (reads, reads_data) = host.shared_buffer(table_bytes / 32)?;
+    crate::host::name(&table, || "view heap page table".to_owned());
+    crate::host::name(&reads, || "view heap pages read".to_owned());
+    // SAFETY: plain heap creation; live buffers whose whole mappings are
+    // written.
+    let (nulls, table_gpu, reads_gpu) = unsafe {
+        std::ptr::write_bytes(table_data, 0, table_bytes as usize);
+        std::ptr::write_bytes(reads_data, 0, table_bytes as usize / 32);
+        let nulls: ID3D12DescriptorHeap = host
+            .device
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: kind,
+                NumDescriptors: PAGE,
+                ..Default::default()
+            })
+            .ok()?;
+        let start = nulls.GetCPUDescriptorHandleForHeapStart();
+        for k in 0..PAGE {
+            null_view(D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + (k * step) as usize });
+        }
+        (nulls, table.GetGPUVirtualAddress(), reads.GetGPUVirtualAddress())
+    };
+    let mut placed = vec![NULL_PAGE; victory_shader::emit::VIEW_PAGE_COUNT as usize];
+    let mut next = SCRATCH_PAGE + 1;
+    for page in count / PAGE..(count + extra).div_ceil(PAGE) {
+        placed[page as usize] = next;
+        // SAFETY: the mapped table, a dword per page.
+        unsafe { (table_data as *mut u32).add(page as usize).write_volatile(next) };
+        next += 1;
+    }
+    tracing::info!(
+        slots = count,
+        host_slots = size,
+        pages = size / PAGE,
+        fixed = next,
+        "view heap paged: the host caps view heaps, title slots are placed by page"
+    );
+    let pages = Pages::new(placed, next, size / PAGE, table_data as usize, count / PAGE);
+    Some((pages, (table, table_gpu, table_data as usize), (reads, reads_gpu, reads_data as usize), nulls))
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -2010,7 +2131,17 @@ impl HostHeap {
             victory_shader::emit::view_heap_limit()
         };
         let raw = if sampler { 0 } else { victory_shader::emit::raw_views() };
-        let extra = if sampler { 0 } else { dynamic_slots(count, null) };
+        // Paged ([`view_pages`]): `null` is the last virtual slot; the
+        // dynamic slots' pages are placed at once, so they stay at
+        // [`DYNAMIC`] and leave the title the rest.
+        let paged = !sampler && null != 0 && victory_shader::emit::view_pages();
+        let extra = if sampler {
+            0
+        } else if paged {
+            DYNAMIC
+        } else {
+            dynamic_slots(count, null)
+        };
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
@@ -2020,7 +2151,14 @@ impl HostHeap {
                 }
             }
         } else {
-            let size = if raw == 0 { null + 1 } else { 2 * raw };
+            // (A paged heap's own slots: as many as the host takes.)
+            let size = if paged {
+                PORTABLE_VIEWS
+            } else if raw == 0 {
+                null + 1
+            } else {
+                2 * raw
+            };
             let fitted = if count + extra <= null {
                 count
             } else {
@@ -2066,6 +2204,21 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        // Paged: the page table and the read marks, the dynamic slots' pages
+        // placed at once, together, past the null and scratch pages (a table
+        // of them is bound as a range of the host heap), and a page of null
+        // views. Every other page reads the null page until placed. Without
+        // any of them shaders translated for pages would find nothing: no
+        // heap.
+        let (pages, page_table, page_reads, page_nulls) = if paged {
+            let Some((pages, table, reads, nulls)) = paged_parts(host, kind, step, count, extra, size) else {
+                tracing::warn!(count, "no page table for a paged host view heap: no host view heap");
+                return None;
+            };
+            (Some(pages), Some(table), Some(reads), Some(nulls))
+        } else {
+            (None, None, None, None)
+        };
         let marks = std::sync::Arc::new(QueueMarks::new(if sampler { 0 } else { count as usize }));
         let h = HostHeap {
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -2080,7 +2233,13 @@ impl HostHeap {
             raw,
             twins: (0..if raw == 0 { 0 } else { count + extra }).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
             #[cfg(feature = "diagnostics")]
-            written: (0..if sampler || !crate::book::on() { 0 } else { size })
+            written: (0..if sampler || !crate::book::on() {
+                0
+            } else if paged {
+                null + 1
+            } else {
+                size
+            })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
             made: Made::new(count as usize),
@@ -2111,6 +2270,11 @@ impl HostHeap {
                 spans
             },
             spanned: Slots::new((count + extra) as usize),
+            pages,
+            page_table,
+            page_reads,
+            page_nulls,
+            cooling: Mutex::new(Vec::new()),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -2163,7 +2327,7 @@ impl HostHeap {
                 }
                 while done < end {
                     let n = BLOCK.min(end - done);
-                    host.device.CopyDescriptorsSimple(n, self.cpu(done), start, kind);
+                    host.device.CopyDescriptorsSimple(n, self.host_cpu(done), start, kind);
                     done += n;
                 }
             }
@@ -3597,7 +3761,8 @@ impl HostHeap {
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {
             self.null_sampler(index);
-        } else {
+        } else if !self.unplaced(index) {
+            // (A page with no place reads null already: none is taken.)
             null_view(self.at(index));
             self.put(index);
             self.write_stride(index, 0);
@@ -3772,12 +3937,17 @@ impl HostHeap {
         self.keep(index, None);
     }
 
-    /// The shader-visible handle of slot `index`.
+    /// The shader-visible handle of slot `index` (in a paged heap, of the
+    /// null page where its page has no place).
     pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+        let slot = match &self.pages {
+            None => index,
+            Some(p) => p.slot(index, false).unwrap_or(NULL_PAGE * PAGE + index % PAGE),
+        };
         // SAFETY: a live shader-visible heap.
         let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
         D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: start + u64::from(index) * u64::from(self.step),
+            ptr: start + u64::from(slot) * u64::from(self.step),
         }
     }
 
@@ -3869,9 +4039,119 @@ impl HostHeap {
         unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, kind) };
     }
 
+    /// Where slot `index` is written: in a paged heap its page is placed
+    /// first (the scratch page where there is no room left, which nothing
+    /// reads: [`HostHeap::unplaced`]).
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        let slot = match &self.pages {
+            None => index,
+            Some(p) => p.slot(index, true).unwrap_or(SCRATCH_PAGE * PAGE + index % PAGE),
+        };
+        self.host_cpu(slot)
+    }
+
+    /// Host heap slot `slot` (not a title slot in a paged heap).
+    fn host_cpu(&self, slot: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
-            ptr: self.cpu + index as usize * self.step as usize,
+            ptr: self.cpu + slot as usize * self.step as usize,
+        }
+    }
+
+    /// Whether slot `index` of a paged heap has no place (what was made for
+    /// it went to the scratch page).
+    fn unplaced(&self, index: u32) -> bool {
+        self.pages.as_ref().is_some_and(|p| p.host_of(index / PAGE) == NULL_PAGE)
+    }
+
+    /// Paged heaps: the page table's GPU address and buffer, and the read
+    /// marks', for draws to bind (`victory_shader::emit::SLOT_PAGES`).
+    pub(crate) fn page_buffers(&self) -> Option<[(&ID3D12Resource, u64); 2]> {
+        let (table, reads) = (self.page_table.as_ref()?, self.page_reads.as_ref()?);
+        Some([(&table.0, table.1), (&reads.0, reads.1)])
+    }
+
+    /// Paged heaps, while no submission is on the card (the title heap's
+    /// records at `start`, `step` bytes each): the host pages taken back at
+    /// the last turn are made null and given out from now; the pages
+    /// shaders marked read since are in use, and placed again where they
+    /// were taken back; where room runs low, pages no shader or draw used
+    /// lately are taken back (`super::pages`): their slots hold nothing
+    /// from now (what they viewed is let go, their records count as never
+    /// made) and read the null page until a write, a draw or a read mark
+    /// places the page again ([`HostHeap::remake_pages`]).
+    // shortcut: a page read only by pixel programs at indices they compute
+    // carries no read mark (`victory_shader`'s `Lower::page_read`) and may be
+    // taken back while it is read; it reads null until the title writes it
+    // or a draw or another program reads it. `VICTORY_VIEW_PAGES_KEEP=1`
+    // takes no page back.
+    // shortcut: a handle `gpu_handle` gave out for a slot of a page placed
+    // on a write, kept in a list longer than pages are kept unused, reads
+    // what that host page holds by then. Draws take handles at recording.
+    pub(crate) fn turn_pages(&self, start: u64, step: u64) {
+        let (Some(p), Some(reads), Some(nulls), Some(host)) = (&self.pages, &self.page_reads, &self.page_nulls, host()) else {
+            return;
+        };
+        // Taken back a turn ago: no thread still writes there (one that
+        // found the page placed before it was taken back has written by now).
+        let cooled = std::mem::take(&mut *self.cooling.lock().unwrap_or_else(|e| e.into_inner()));
+        for &host_page in &cooled {
+            // SAFETY: a page of our heap; a page of null views.
+            unsafe {
+                host.device.CopyDescriptorsSimple(
+                    PAGE,
+                    self.host_cpu(host_page * PAGE),
+                    nulls.GetCPUDescriptorHandleForHeapStart(),
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                );
+            }
+        }
+        p.give(&cooled);
+        // The marks, taken and cleared (nothing on the card writes them now).
+        let words = (victory_shader::emit::VIEW_PAGE_COUNT / 32) as usize;
+        let mut read = Vec::new();
+        for w in 0..words {
+            // SAFETY: a dword of the mapped marks, which shaders change only
+            // by atomics; as an atomic here.
+            let word = unsafe { &*((reads.2 as *const std::sync::atomic::AtomicU32).add(w)) };
+            let mut x = word.swap(0, std::sync::atomic::Ordering::Relaxed);
+            while x != 0 {
+                read.push(w as u32 * 32 + x.trailing_zeros());
+                x &= x - 1;
+            }
+        }
+        for page in p.read(&read) {
+            p.place(page);
+        }
+        let taken = p.take_back(std::time::Instant::now());
+        for &(page, _) in &taken {
+            for index in page * PAGE..((page + 1) * PAGE).min(self.count) {
+                let held = self.made.lock(index);
+                self.quick_is(index, 0);
+                self.made.set(index, 0);
+                drop(held);
+                self.keep(index, None);
+            }
+        }
+        self.cooling
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(taken.iter().map(|&(_, host_page)| host_page));
+        self.remake_pages(start, step);
+    }
+
+    /// Paged heaps: the pages placed again since the last call (written,
+    /// read or bound by a draw after they were taken back, or after they
+    /// were written with no room) have their slots made from the title's
+    /// records at `start`, `step` bytes each, before a shader reads them;
+    /// a slot made since the page was placed keeps what it holds.
+    pub(crate) fn remake_pages(&self, start: u64, step: u64) {
+        let Some(p) = &self.pages else { return };
+        for page in p.remakes() {
+            for index in page * PAGE..((page + 1) * PAGE).min(self.count) {
+                if self.made.get(index) == Some(0) {
+                    self.mirror(index, start + u64::from(index) * step, false);
+                }
+            }
         }
     }
 
@@ -3961,6 +4241,15 @@ impl HostHeap {
                 );
             }
             return None;
+        }
+        // A draw reads it: its page is in use, and placed again if it was
+        // taken back (its other slots made at the next submission,
+        // [`HostHeap::remake_pages`]).
+        if for_draw && let Some(p) = &self.pages {
+            p.stamp(index);
+            if p.host_of(index / PAGE) == NULL_PAGE {
+                p.place(index / PAGE);
+            }
         }
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
@@ -4101,6 +4390,13 @@ impl HostHeap {
             self.twin_made(index, kept.is_some() && twinned(&view));
             self.keep(index, kept.flatten());
             self.quick_is(index, if later { 0 } else { key });
+            // Made where nothing reads it (no room for its page): made
+            // again once its page is placed.
+            if self.unplaced(index) {
+                self.quick_is(index, 0);
+                self.made.set(index, 0);
+                self.keep(index, None);
+            }
             drop(held);
             self.unmake_stale(index, stale);
         }

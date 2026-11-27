@@ -2043,6 +2043,20 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_PAGES {
+                        // Ours: the bound view heap's page table.
+                        if let Some([table, _]) = self.page_buffers(list) {
+                            // SAFETY: an open list; the list holds the table.
+                            unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, table);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, table);
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
@@ -2124,6 +2138,20 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_PAGE_READS {
+                    // Ours: where shaders mark the view heap pages they read.
+                    if let Some([_, reads]) = self.page_buffers(list) {
+                        // SAFETY: an open list; the list holds the buffer.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootUnorderedAccessView(param, reads);
+                            } else {
+                                l.SetGraphicsRootUnorderedAccessView(param, reads);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {
@@ -2375,6 +2403,30 @@ impl State {
     /// writes through a picked unordered access view stays in the host
     /// copy. A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
+    /// Paged view heaps: the GPU addresses of the bound view heap's page
+    /// table and read marks (`victory_shader::emit::SLOT_PAGES`), which the
+    /// list holds; with no title view heap bound, ones every page of which
+    /// reads null.
+    fn page_buffers(&self, list: &HostList) -> Option<[u64; 2]> {
+        let host = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())
+            .and_then(|h| h.host());
+        let Some(buffers) = host.and_then(|h| h.page_buffers()) else {
+            once!("a shader reads view heap pages with no paged view heap bound: they read null");
+            return crate::descriptor::host::null_page_buffers();
+        };
+        // (The list may outlive the title's heap, which owns them.)
+        if list.first_use(buffers[0].1 as usize | 2) {
+            list.keep(buffers[0].0);
+            list.keep(buffers[1].0);
+        }
+        Some(buffers.map(|(_, gpu)| gpu))
+    }
+
     fn heap_buffers(&self, list: &HostList) -> Option<u64> {
         let heap = self
             .heaps

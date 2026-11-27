@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V};
+use super::bitcode::{Attr, Bin, Cast, Md, Module, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -39,6 +39,53 @@ pub const VIEW_INTEGER: u32 = 1 << 31;
 pub const VIEW_SIGNED: u32 = 1 << 30;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+
+/// Paged view heaps ([`set_view_pages`]): on a host that refuses a view heap
+/// of every index shaders take (NVIDIA takes 1,000,000 descriptors; the
+/// title's heap has 1,245,184 slots, with the dynamic ones some 1,500,000),
+/// view heap indices are virtual. Slots go in pages of [`VIEW_PAGE_SLOTS`],
+/// each placed anywhere in the host's heap, and a shader finds a slot's
+/// page in the page table, the root SRV `t<SLOT_PAGES>` in
+/// [`ROOT_CBV_SPACE`]: a dword per page of [`VIEW_PAGES`] virtual slots, the
+/// host heap's page that holds it (0: a page of null views). It marks the
+/// pages it reads title views in, a bit per page, in the root UAV
+/// `u<SLOT_PAGE_READS>` ([`VIEW_PAGE_COUNT`] bits), so that the host can
+/// give back the room of pages no shader used lately. (After upstream
+/// Marvisak/VIctory#2121.) Not t252, which is [`SLOT_TABLE_STRIDES`].
+pub const SLOT_PAGES: u8 = 250;
+/// See [`SLOT_PAGES`].
+pub const SLOT_PAGE_READS: u8 = 251;
+/// See [`SLOT_PAGES`].
+pub const VIEW_PAGE_SLOTS: u32 = 256;
+/// Virtual view slots of a paged heap: as many as an uncapped host's heap
+/// holds.
+pub const VIEW_PAGES: u32 = 1 << 21;
+/// Pages of [`VIEW_PAGES`] slots: dwords of the [`SLOT_PAGES`] table, and
+/// bits of the [`SLOT_PAGE_READS`] marks.
+pub const VIEW_PAGE_COUNT: u32 = VIEW_PAGES / VIEW_PAGE_SLOTS;
+
+static PAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tells the translator whether the host pages its view heaps ([`SLOT_PAGES`]).
+/// Part of the translation: the shader cache keys on it (`host_settings`).
+pub fn set_view_pages(on: bool) {
+    PAGED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: [`view_pages`].
+    pub(crate) static VIEW_PAGES_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// See [`set_view_pages`].
+pub fn view_pages() -> bool {
+    #[cfg(test)]
+    if let Some(on) = VIEW_PAGES_HERE.get() {
+        return on;
+    }
+    PAGED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -513,6 +560,14 @@ impl Shader {
         } else {
             index
         };
+        // Paged view heaps (`set_view_pages`): the host slot is the slot's
+        // page's place in the host heap, from the page table, and its place
+        // in the page.
+        let index = if !sampler && !bounded && view_pages() {
+            self.paged_index(block, index)
+        } else {
+            index
+        };
         self.flags |= if sampler {
             flags::SAMPLER_HEAP
         } else {
@@ -529,6 +584,25 @@ impl Shader {
             &[index, s, n],
         );
         self.annotate(block, h, props.0, props.1)
+    }
+
+    /// The host heap slot of virtual view slot `index` (below
+    /// [`VIEW_PAGES`]) of a paged view heap: its page's place from the page
+    /// table ([`SLOT_PAGES`]), and its place in the page.
+    fn paged_index(&mut self, block: usize, index: V) -> V {
+        let table = self.root_srv_handle(SLOT_PAGES);
+        let shift = self.m.i32(VIEW_PAGE_SLOTS.trailing_zeros());
+        let page = self.m.bin(block, Bin::LShr, index, shift);
+        let two = self.m.i32(2);
+        let at = self.m.bin(block, Bin::Shl, page, two);
+        let (u, mask, align) = (self.m.undef(self.t.i32), self.m.i8(1), self.m.i32(4));
+        let r = self.op(block, "rawBufferLoad.f32", Attr::ReadOnly, self.t.res_ret, 139, &[table, at, u, mask, align]);
+        let placed = self.m.extract(block, r, 0);
+        let placed = self.m.cast(block, Cast::Bitcast, placed, self.t.i32);
+        let placed = self.m.bin(block, Bin::Shl, placed, shift);
+        let within = self.m.i32(VIEW_PAGE_SLOTS - 1);
+        let within = self.m.bin(block, Bin::And, index, within);
+        self.m.bin(block, Bin::Or, placed, within)
     }
 
     /// The finished container.

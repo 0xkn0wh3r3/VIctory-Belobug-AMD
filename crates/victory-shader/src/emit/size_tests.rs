@@ -369,3 +369,38 @@ fn a_tables_raw_buffer_is_read_at_its_raw_twin() {
         assert_eq!(got[..2], [0, 6], "{label}");
     }
 }
+
+/// Paged view heaps (`shader::SLOT_PAGES`): every view heap index goes
+/// through the page table, and a buffer picked at an index the program
+/// computes marks its page read; a table's entry at a constant place (which
+/// the host's draws see) marks none. Without pages, neither. (Translation
+/// and validation only: no card.)
+#[test]
+fn heap_indices_go_through_the_page_table_where_heaps_are_paged() {
+    use super::shader::{SLOT_PAGE_READS, SLOT_PAGES, VIEW_PAGES_HERE};
+    let picked = [
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xBE8C_03FF, // s_mov_b32 s12, 64
+        64,
+        0xF408_0203, // s_load_dwordx4 s[8:11], s[6:7], s12
+        0x1800_0000,
+        0xE030_0004, // buffer_load_dword v5, off, s[8:11], 0 offset:4
+        0x8002_0500,
+        0x7E0A_0505, // v_readfirstlane_b32 s5, v5
+        0xBE84_0380, // s_mov_b32 s4, 0
+    ];
+    let words = [TABLE, &picked, STORE].concat();
+    let table_only = [TABLE, &[0xBE84_0380, 0xBE85_0380][..], STORE].concat();
+    for paged in [false, true] {
+        VIEW_PAGES_HERE.set(Some(paged));
+        let shader = build(&words, (8, 0));
+        let plain = build(&table_only, (8, 0));
+        VIEW_PAGES_HERE.set(None);
+        let (shader, plain) = (shader.expect("translates"), plain.expect("translates"));
+        assert_eq!(shader.root_srvs.contains(&SLOT_PAGES), paged, "picked: page table");
+        assert_eq!(shader.root_uavs.contains(&SLOT_PAGE_READS), paged, "picked: read marks");
+        assert_eq!(plain.root_srvs.contains(&SLOT_PAGES), paged, "table: page table");
+        assert!(!plain.root_uavs.contains(&SLOT_PAGE_READS), "table: no read marks");
+    }
+}
