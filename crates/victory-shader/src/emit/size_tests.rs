@@ -404,3 +404,69 @@ fn heap_indices_go_through_the_page_table_where_heaps_are_paged() {
         assert!(!plain.root_uavs.contains(&SLOT_PAGE_READS), "table: no read marks");
     }
 }
+
+/// On the card: a program translated for paged view heaps picks the buffer
+/// at virtual slot 257 (page 1) and reads it at host slot 1, where the page
+/// table places page 1; it marks page 1 read (bit 1 of the marks' first
+/// word), and its table's UAV (slot 2, page 0) goes through the table too.
+#[test]
+fn a_picked_buffer_is_read_where_the_page_table_places_its_page() {
+    use super::host::{Dispatch, Host, Root};
+    use super::shader::{VIEW_PAGE_COUNT, VIEW_PAGES_HERE};
+    let words = [
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xBE8C_03FF, // s_mov_b32 s12, 257 * 32
+        257 * 32,
+        0xF408_0203, // s_load_dwordx4 s[8:11], s[6:7], s12
+        0x1800_0000,
+        0xE030_0004, // buffer_load_dword v5, off, s[8:11], 0 offset:4
+        0x8002_0500,
+        0x7E0A_0505, // v_readfirstlane_b32 s5, v5
+        0xBE84_0380, // s_mov_b32 s4, 0
+    ];
+    VIEW_PAGES_HERE.set(Some(true));
+    let shader = build(&[TABLE, &words, STORE].concat(), (8, 0));
+    VIEW_PAGES_HERE.set(None);
+    let shader = shader.expect("translates");
+    // Root parameters: the user data, then by register the page table
+    // (t250), the marks (u251), the strides of picked buffers (t255).
+    assert_eq!((shader.root_uavs.as_slice(), shader.root_srvs.as_slice()), (&[251u8][..], &[250u8, 255][..]));
+    let (texel, data) = ([[0.0; 4]; 1], [1u32, 2, 3, 4]);
+    let views = [
+        View::Texture(1, 1, &texel),
+        View::Buffer { data: &data, stride: Stride::Raw },
+        View::RawUav(2),
+    ];
+    // Pages 0 and 1 both in host page 0; every other page too.
+    let table = vec![0u32; VIEW_PAGE_COUNT as usize];
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for warp in [false, true] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).expect("a pipeline");
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: table.clone() }),
+                        (2, Root::Uav(VIEW_PAGE_COUNT / 32)),
+                        (3, Root::View { srv: true, data: vec![0; 4096] }),
+                    ],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatched");
+        assert_eq!(out[0][..2], [0, 2], "warp {warp}: slot 257 read at host slot 1");
+        assert_eq!(out[1][0], 1 << 1, "warp {warp}: page 1 marked read");
+        assert!(out[1][1..].iter().all(|&w| w == 0), "warp {warp}: no other page");
+        ran += 1;
+    }
+    assert!(ran > 0, "no device");
+}
