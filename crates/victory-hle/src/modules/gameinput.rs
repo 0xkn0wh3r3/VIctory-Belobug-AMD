@@ -314,6 +314,25 @@ fn fallback_for(keys: &[KeyState], gta: bool) -> PadState {
     }
 }
 
+/// The debug overlay (Alt+Z, `victory_gpu::overlay`) shows the pad the
+/// title reads: the merged pad with one pad, else the first connected pad,
+/// else the keyboard and mouse stand-in. The title keeps its input while it
+/// shows.
+fn overlay(read: Option<PadState>) {
+    #[cfg(windows)]
+    {
+        use victory_gpu::overlay::{Pad, show_pad};
+        show_pad(read.map(|read| Pad {
+            buttons: read.buttons,
+            triggers: [read.left_trigger, read.right_trigger],
+            left: [read.left_x, read.left_y],
+            right: [read.right_x, read.right_y],
+        }));
+    }
+    #[cfg(not(windows))]
+    let _ = read;
+}
+
 /// Two pads as one: buttons of both, and of each axis and trigger the one
 /// pushed further.
 fn merged(a: PadState, b: PadState) -> PadState {
@@ -670,11 +689,13 @@ impl State {
         let stand_in = merged(fallback(&keys), mouse);
         if one_pad {
             let pad = pads.into_iter().flatten().fold(stand_in, merged);
+            overlay(Some(pad));
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
         }
         let any_pad = pads.iter().any(Option::is_some);
+        overlay(pads.iter().flatten().next().copied().or(Some(stand_in)));
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
@@ -812,6 +833,9 @@ extern "system" fn current_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
+    // The debug overlay times input to present from the frame's first read.
+    #[cfg(windows)]
+    victory_gpu::overlay::note_input_read();
     let hub = hub(this);
     let state = hub.state();
     let newest = |i: usize| {
