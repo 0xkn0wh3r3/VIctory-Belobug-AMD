@@ -2734,7 +2734,7 @@ impl<'a> Lower<'a> {
             let original = self.s.entry;
             let width = self.s.threads.expect("compute thread count")[0];
             let limit = self.host_word(RootType::Other(super::shader::USER_DISPATCH_THREADS_X), 0, width);
-            let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
+            let Val::I32(group) = self.group_x() else {
                 unreachable!()
             };
             let Val::I32(thread) = self.thread_id(0) else {
@@ -2963,6 +2963,7 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
+            Input::GroupId(0) if self.x.native.stage == HwStage::Cs => return self.group_x(),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
@@ -3026,6 +3027,23 @@ impl<'a> Lower<'a> {
             }
         };
         self.load_input(id, col)
+    }
+
+    /// A compute program's group x. On a host whose widest wave is 32 lanes
+    /// (NVIDIA, Intel), the host's group x plus the first group of the part
+    /// of the dispatch running ([`super::shader::USER_GROUP_BASE`], a
+    /// user-data dword past the console's): such a host is not AMD, and runs
+    /// a dispatch of more than 65,535 groups in x in parts. Elsewhere the
+    /// host's group x alone, as before: AMD runs the console's counts as
+    /// asked. (`host_max_wave` is in the translation's fingerprint.)
+    fn group_x(&mut self) -> Val {
+        let id = self.compute_id("groupId.i32", 94, 0);
+        if host_max_wave() != 32 {
+            return id;
+        }
+        let Val::I32(id) = id else { unreachable!() };
+        let base = self.host_word(RootType::Other(super::shader::USER_GROUP_BASE), 0, 0);
+        Val::I32(self.s.m.bin(self.s.entry, Bin::Add, id, base))
     }
 
     /// A component of a compute thread or group id, read in the entry block.

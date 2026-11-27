@@ -146,6 +146,15 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` code of a user-data dword the host sets itself: the
+/// first group (in x) of the part of a direct compute dispatch it runs, 0 as
+/// bound. The console runs more than 65,535 groups in x in one dispatch,
+/// D3D12 no more (`D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION`), so a
+/// host that is not AMD runs such a dispatch in parts, and a compute
+/// program's group x adds this dword. Asked for only on hosts whose widest
+/// wave is 32 lanes (NVIDIA, Intel; never AMD, which runs the console's
+/// counts as asked), so AMD's translations do not change.
+pub const USER_GROUP_BASE: u32 = 0x107;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

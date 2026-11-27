@@ -737,6 +737,107 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
     }
 }
 
+/// A console wave32 program of 64 threads that adds 1 to counter[its group x] (s6: 6 user
+/// SGPRs, the table in s4, then the group's x), or to counter[0] when `reads_group` is not set.
+fn group_counter(reads_group: bool) -> NativeProgram {
+    let address = if reads_group {
+        [
+            0x7E04_0206, // v_mov_b32 v2, s6
+            0x3402_0482, // v_lshlrev_b32 v1, 2, v2
+        ]
+    } else {
+        [
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7E02_0280, // v_mov_b32 v1, 0
+        ]
+    };
+    let mut body = address.to_vec();
+    body.extend_from_slice(&[
+        0x7E06_0281, // v_mov_b32 v3, 1
+        0xe0c8_1000, 0x8002_0301, // buffer_atomic_add v3, v1, s[8:11], 0 offen
+    ]);
+    let mut native = native_of(&body, false, 64);
+    let StageIo::Cs(cs) = &mut native.io else { unreachable!() };
+    cs.rsrc2 = 6 << 1 | 1 << 7; // 6 user SGPRs, then the group's x (TGID_X_EN)
+    native
+}
+
+/// Where a program's group x reads the first group of the part of the dispatch the host runs
+/// (`USER_GROUP_BASE`), if it does.
+fn group_base(shader: &HostShader) -> Option<&super::UserData> {
+    shader.user_data.iter().find(|u| u.root == RootType::Other(super::USER_GROUP_BASE))
+}
+
+/// A compute program's group x adds the first group of the part of a dispatch the host runs
+/// (`USER_GROUP_BASE`) on a host whose widest wave is 32 lanes, which is not AMD and runs a
+/// dispatch of more than 65,535 groups in x in parts, and only there: on a host of waves of 64
+/// (AMD, which runs such a dispatch as asked) or of an unknown width the translation has no such
+/// dword, as before. A program that does not read its group x has none either.
+#[test]
+fn group_x_adds_the_group_base_only_on_hosts_of_waves_of_32() {
+    for (reads_group, host_wave, counted, has_base) in [
+        (true, 32, false, true),
+        (true, 32, true, true),
+        (false, 32, false, false),
+        (false, 32, true, true), // (a dispatch counted in threads numbers them by its group x)
+        (true, 64, false, false),
+        (true, 64, true, false),
+        (true, 0, false, false),
+        (true, 16, false, false),
+    ] {
+        let native = group_counter(reads_group);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let shader = lowered_counted(&native, &p, &HashSet::new(), host_wave, counted).unwrap();
+        let base = group_base(&shader);
+        let case = format!("reads its group {reads_group}, host wave {host_wave}, counted {counted}");
+        assert_eq!(base.is_some(), has_base, "{case}: {:?}", shader.user_data);
+        if let Some(base) = base.filter(|_| !counted) {
+            // Past the layout's dwords (the constants in 0..3, the table in 4).
+            assert_eq!((base.index, base.slot, base.dword), (5, 0, 0), "{case}");
+        }
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).unwrap_or_else(|e| panic!("{case}: DXIL validation failed: {e:?}"));
+        }
+    }
+}
+
+/// A program's group x adds the first group of the part of a dispatch the host runs
+/// (`USER_GROUP_BASE`): one group run with base 1 counts as group 1, on the hardware adapter and
+/// WARP (after Marvisak/VIctory#3086's `group_x_starts_at_the_dispatch_part`).
+#[test]
+fn group_x_starts_at_the_dispatch_part() {
+    let native = group_counter(true);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let shader = lowered_on(&native, &p, &HashSet::new(), 32).unwrap();
+    let base = group_base(&shader).expect("USER_GROUP_BASE").index as usize;
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for warp in [false, true] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let Ok((root, pso)) = host.compute_pipeline(&shader) else { continue };
+        for first in [0u32, 1, 3] {
+            let mut constants = vec![0; shader.user_data_dwords() as usize];
+            constants[base] = first;
+            let result = host
+                .dispatch(&root, &pso, &Dispatch {
+                    roots: vec![(0, Root::Constants(constants))],
+                    views: &[View::RawUav(16)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                })
+                .unwrap();
+            for (g, &word) in result[0].iter().enumerate().take(4) {
+                let want = if g as u32 == first { 64 } else { 0 };
+                assert_eq!(word, want, "warp {warp}, base {first}, counter {g}");
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no device ran the program");
+}
+
+
 /// The wave size a lowering of `native` at a host of 32-lane waves asks for, and the shader.
 fn lowered_with_wave(
     native: &NativeProgram,

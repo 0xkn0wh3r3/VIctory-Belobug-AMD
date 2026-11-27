@@ -61,6 +61,10 @@ pub(crate) struct Host {
     /// omits a view or sampler heap while using directly-indexed root signatures.
     fallback_view: OnceLock<Option<ID3D12DescriptorHeap>>,
     fallback_sampler: OnceLock<Option<ID3D12DescriptorHeap>>,
+    /// Whether the device is an AMD card's ([`crate::indirect::amd`]): it
+    /// runs direct dispatches of more than 65,535 groups in x as asked, where
+    /// others run them in parts (`State::dispatch`).
+    pub(crate) amd: bool,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -976,6 +980,7 @@ fn create() -> windows::core::Result<Host> {
             );
             tracing::info!(ok = set.is_ok(), "the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=0)");
         }
+        let amd = crate::indirect::amd(&device);
         // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
         // cross-lane code stays in 32-lane halves translated for waves of 32
         let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
@@ -986,7 +991,6 @@ fn create() -> windows::core::Result<Host> {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
             // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
-            let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
         // Every translated shader is SM 6.6: below it each pipeline is refused (E_INVALIDARG),
@@ -1054,6 +1058,7 @@ fn create() -> windows::core::Result<Host> {
             adapter,
             fallback_view: OnceLock::new(),
             fallback_sampler: OnceLock::new(),
+            amd,
         })
     }
 }

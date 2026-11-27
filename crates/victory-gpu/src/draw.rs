@@ -1655,6 +1655,11 @@ impl State {
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
             return 0;
         }
+        // The first part of a dispatch, unless it is run in parts
+        // (`dispatch_parts`).
+        if kind == victory_shader::emit::USER_GROUP_BASE {
+            return 0;
+        }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
             return match self.roots_ref(compute).get(usize::from(slot)) {
                 Some(&Root::View(address)) if kind == USER_ROOT_ADDRESS => address as u32,
@@ -3819,8 +3824,14 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        // An AMD card runs more than 65,535 groups in x as the console does;
+        // others run such a dispatch in parts (`dispatch_parts`).
+        if x <= D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION || crate::host::host().is_none_or(|h| h.amd) {
+            // SAFETY: an open list with everything set.
+            unsafe { list.list.Dispatch(x, y, z) };
+        } else {
+            self.dispatch_in_parts(list, p, [x, y, z]);
+        }
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
@@ -3829,6 +3840,44 @@ impl State {
         {
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
+        }
+    }
+
+    /// Runs a dispatch of more groups in x than D3D12 runs at once
+    /// (`D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION`) on a card that
+    /// is not AMD: in parts of at most that many ([`dispatch_parts`]), y and
+    /// z as asked, the program's group x starting at each part's first group
+    /// (`victory_shader::emit::USER_GROUP_BASE`, 0 as bound, and set back to
+    /// 0 after). A program that does not read its group x (or a host whose
+    /// widest wave is not 32 lanes, whose programs have no such dword) runs
+    /// alike in every part.
+    fn dispatch_in_parts(&self, list: &HostList, p: &HostPipeline, [x, y, z]: [u32; 3]) {
+        const MOST: u32 = D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
+        if y > MOST || z > MOST {
+            once!(x, y, z, "a dispatch of more groups in y or z than the host runs");
+        }
+        let base = compute_word(p, victory_shader::emit::USER_GROUP_BASE);
+        // (Its programs are given the dword only where the widest wave is 32.)
+        if victory_shader::emit::host_settings()[0] != 32 {
+            once!(
+                pipeline = p.name,
+                x,
+                "a dispatch of more groups in x than the host runs, in parts, on a host whose programs                  have no group base: one that reads its group x runs the first part's groups again"
+            );
+        }
+        for (first, count) in dispatch_parts(x) {
+            // SAFETY: an open list with everything set; the parameter and
+            // dword are the pipeline's.
+            unsafe {
+                if let Some((param, word)) = base {
+                    list.list.SetComputeRoot32BitConstant(param, first, word);
+                }
+                list.list.Dispatch(count, y, z);
+            }
+        }
+        if let Some((param, word)) = base {
+            // SAFETY: as above; the next dispatch starts at group 0, as bound.
+            unsafe { list.list.SetComputeRoot32BitConstant(param, 0, word) };
         }
     }
 
@@ -4185,7 +4234,9 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             let _ = write!(text, " | {}:", stage.shader.hash);
-            for u in &t.host.user_data {
+            // The dispatch part's first group is ours, not the title's.
+            let group_base = RootType::Other(victory_shader::emit::USER_GROUP_BASE);
+            for u in t.host.user_data.iter().filter(|u| u.root != group_base) {
                 let v = match u.root {
                     RootType::Other(kind) => self.host_word(compute, kind, u.slot, u.dword, None),
                     _ => self.user_value(compute, u.slot, u.root, u.dword),
@@ -5518,6 +5569,17 @@ fn dispatch_groups(threads: [u32; 3], size: [u32; 3]) -> [u32; 3] {
     std::array::from_fn(|i| threads[i].div_ceil(size[i]))
 }
 
+/// The parts a direct dispatch of `x` groups in x runs in on a host that
+/// runs at most `D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION` at once:
+/// each part's first group and its count; one empty part for none.
+fn dispatch_parts(x: u32) -> impl Iterator<Item = (u32, u32)> {
+    const MOST: u32 = D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
+    (0..x.div_ceil(MOST).max(1)).map(move |i| {
+        let first = i * MOST;
+        (first, (x - first).min(MOST))
+    })
+}
+
 /// Where a compute pipeline's user data has a word the host computes: the
 /// root parameter and the dword in it.
 fn compute_word(p: &HostPipeline, kind: u32) -> Option<(u32, u32)> {
@@ -5537,6 +5599,23 @@ mod thread_tests {
         assert_eq!(dispatch_groups([74, 1, 1], [64, 1, 1]), [2, 1, 1]);
         assert_eq!(dispatch_groups([32, 1, 1], [32, 1, 1]), [1, 1, 1]);
         assert_eq!(dispatch_groups([0, 12, 9], [64, 4, 4]), [0, 3, 3]);
+    }
+
+    /// A dispatch of more groups in x than the host runs at once is run in
+    /// parts of at most 65,535 that together cover each group once.
+    #[test]
+    fn large_dispatches_run_in_parts() {
+        let parts = |x| dispatch_parts(x).collect::<Vec<_>>();
+        assert_eq!(parts(0), [(0, 0)]);
+        assert_eq!(parts(100), [(0, 100)]);
+        assert_eq!(parts(65_535), [(0, 65_535)]);
+        assert_eq!(parts(65_536), [(0, 65_535), (65_535, 1)]);
+        assert_eq!(parts(115_200), [(0, 65_535), (65_535, 49_665)]);
+        let all = parts(u32::MAX);
+        assert!(all.iter().all(|&(_, n)| n <= 65_535));
+        assert!(all.windows(2).all(|w| w[0].0 + w[0].1 == w[1].0));
+        let last = all.last().unwrap();
+        assert_eq!(last.0 + last.1, u32::MAX);
     }
 }
 
