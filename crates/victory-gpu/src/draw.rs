@@ -3862,7 +3862,7 @@ impl State {
             once!(
                 pipeline = p.name,
                 x,
-                "a dispatch of more groups in x than the host runs, in parts, on a host whose programs                  have no group base: one that reads its group x runs the first part's groups again"
+                "a dispatch of more groups in x than the host runs, in parts, on a host whose programs have no group base: one that reads its group x runs the first part's groups again"
             );
         }
         for (first, count) in dispatch_parts(x) {
