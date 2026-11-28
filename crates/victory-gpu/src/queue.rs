@@ -1077,17 +1077,18 @@ fn frame_ends() {
             behind::leave();
         }
     });
-    if let Some(on) = crate::ab::pick("VICTORY_LANE_CORE") {
-        static WAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if WAS.swap(on, std::sync::atomic::Ordering::Relaxed) != on {
-            crate::cores::settle();
+    // Where our threads run follows these switches as they change.
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    static WAS: [AtomicBool; 3] = [const { AtomicBool::new(false) }; 3];
+    let picked = [crate::ab::pick("VICTORY_LANE_CORE"), crate::ab::pick("VICTORY_CACHE_CORES"), crate::ab::pick("VICTORY_CCD_CORES")];
+    let mut changed = false;
+    for (was, on) in WAS.iter().zip(picked) {
+        if let Some(on) = on {
+            changed |= was.swap(on, Relaxed) != on;
         }
     }
-    if let Some(on) = crate::ab::pick("VICTORY_CACHE_CORES") {
-        static WAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if WAS.swap(on, std::sync::atomic::Ordering::Relaxed) != on {
-            crate::cores::settle();
-        }
+    if changed {
+        crate::cores::settle();
     }
 }
 
